@@ -9,12 +9,13 @@ and scripts, prefer `--config /absolute/path`.
 ## `pizarra`
 
 ```text
-pizarra [--config PATH] [--version]
+pizarra [--config PATH] [--migrate-only] [--version]
 ```
 
 | Command | Effect |
 |---|---|
 | `pizarra --config PATH` | Run the hub with an explicit INI file |
+| `pizarra --migrate-only` | Initialize/upgrade/import and verify SQLite, then exit without a listener or watchdog |
 | `pizarra --version` | Print suite version and SQLite availability |
 | `pizarra --help` | Print the compact usage line |
 
@@ -29,6 +30,10 @@ tiza [--config PATH] <command-or-destination> ...
 - Identity always comes from `[pizarra] self` in the selected configuration.
 - A normal `--from` is ignored; use the correct identity file.
 - `TIZA_CONF` selects the configuration when `--config` is absent.
+- Inside a host-daemon-managed tmux session, the session's `@pizarra_conf`
+  option selects its identity file when neither `--config` nor `TIZA_CONF` is
+  present. A missing tagged path fails closed rather than falling back to the
+  host's default identity.
 - `--version`, `--help`, `manual`, and workflow help operate without a hub.
 - Human-readable tables are used on a terminal; redirected output is plain.
 - A command that reaches the hub is still subject to its identity and authority
@@ -174,8 +179,15 @@ tiza tree
 ```
 
 Settable fields are `prompt`, `speciality`, `parent`, `launch`, `session`,
-`user`, `project`, `slave`, and `workdir`. A host address is selected at team
-creation/configuration time and is not mutable through `team set`.
+`user`, `project`, `slave`, `workdir`, `hold_when_blocked`, `host`, `dial`,
+`delegate`, and `secret`. Prefer
+`tiza team set <name> secret --file PATH|-` so credentials do not enter argument
+history. `secret`, `delegate`, `host`, and `dial` require the real `console`
+identity rather than delegated team authority.
+
+All team, group, project, application, manual, and application/project changes
+are committed to the authoritative `org.sqlite` registry. They do not create or
+rewrite registry sections in `pizarra.conf`.
 
 Removing a team does not kill its terminal session and does not erase its task
 history. Referential and open-work checks may refuse removal.
@@ -194,11 +206,19 @@ tiza group onidle <name> off|boss|all|team[,team]
 tiza group onidlemsg <name> [text...]
 tiza group onidlefrom <name> [identity]
 tiza group onidlereply <name> [identity]
+tiza group onblock <name> alarm|log|default
 tiza group header <name> [standing instruction...]
 ```
 
 `group remove <name>` deletes the group; adding team arguments removes only
 those members. `exclude` replaces the complete muted set; no members clears it.
+`onblock log` records detected permission blocks quietly for the group;
+`alarm` selects the loud operator alarm and `default` clears the group override
+back to that normal behavior. A non-excluded membership in any `log` group is
+enough to make that team's block log-only; another group's `alarm` does not
+override it. The real console, a team delegated the `group` family, or that
+group's boss may change this policy; an ordinary member may not. The command
+does not change hold or `auto_enter` policy.
 
 ```text
 tiza project list
@@ -241,9 +261,10 @@ tiza header set <key> <value>
 tiza header note [standing instruction...]
 ```
 
-Supported keys match the `[header]` configuration described in
-[Configuration](configuration.md). These commands affect context delivered to
-the whole fleet and require appropriate authority.
+Supported keys are `mode` plus the `[header]` keys described in
+[Configuration](configuration.md); `mode` selects the `[server] header` value
+(`short` or `full`). These commands affect context delivered to the whole fleet
+and require appropriate authority.
 
 ## Shared files
 
@@ -258,6 +279,10 @@ tiza cat <shared-path>
 - `share` copies through a locally mounted shared directory.
 - `put` uploads over the bus for a host without that mount.
 - `get` and `cat` retrieve over the bus.
+- A local `share` consumer must see the same absolute mount configured as hub
+  `[shared] dir`; pzweb `[web] shared` must name it exactly as well.
+- The shared tree is external exchange data, not `/var/lib/pizarra` state, and
+  is excluded from built-in backup and restore.
 - Transfers are limited to 10 MiB, chunked under the wire cap, and verified by
   SHA-256 before final publication.
 - Destination basenames begin with an alphanumeric character and otherwise use

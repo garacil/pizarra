@@ -17,11 +17,16 @@ The browser application is one document with eight focused views:
 | Transfers | Chunked download/upload with progress and final SHA-256 verification |
 | Workflows | Searchable plans, dependency map, state details, editing, lifecycle operations, and history |
 | Tasks | Filtered work board, cards, notes, assignment, state changes, creation, and guarded deletion |
-| Structure | Teams, groups, projects, and applications, including ownership, relations, manuals, and history |
+| Structure | Teams, groups, projects, and applications, including ownership, group permission-block policy, relations, manuals, and history |
 
 The Activity view receives new durable messages without reloading. History and
 Inbox remain separate because "look at it" and "mark it read" are different
 operations.
+
+The [README gallery](../README.md#screenshots) shows every view rendered by the
+real browser application with synthetic data. It includes separate team, group,
+and application registries plus an animated scroll through a larger workflow
+dependency map.
 
 ## Startup contract
 
@@ -35,7 +40,8 @@ Before binding an HTTP socket, `pzweb` verifies all of the following:
 5. A Basic-authentication username and 64-hex SHA-256 password digest are set.
 6. The static asset tree exists, has no symlink component, and satisfies asset
    size/type limits.
-7. The optional shared-file root exists and has no symlink component.
+7. The optional shared-file root is absolute, exists, and has no symlink
+   component.
 8. The hub answers using the configured identity-bound credential.
 9. That credential cannot impersonate `console`.
 10. The bound team has all administrative families required by the console.
@@ -51,15 +57,14 @@ fails only when a particular operation is selected.
 
 ## Recommended local configuration
 
-Hub team:
+Create the web identity in the hub's authoritative SQLite registry. Do not add a
+`[team:*]` section to `pizarra.conf`:
 
-```ini
-[team:90]
-name = pzweb
-speciality = Private operational web console
-secret = <unique-web-team-secret>
-tmux_session = -
-delegate = team, group, project, app, task, workflow, watch, backup, update, header
+```sh
+tiza team add pzweb "Private operational web console" --session -
+tiza team set pzweb secret --file /secure/pzweb-team.secret
+tiza team set pzweb delegate \
+  "team,group,project,app,task,workflow,watch,backup,update,header"
 ```
 
 Web server:
@@ -77,7 +82,8 @@ port = 7080
 allow_from = 127.0.0.1
 host = 127.0.0.1:7080
 origin = http://127.0.0.1:7080
-static = web/apps
+static = /usr/local/share/pizarra/web/apps
+; shared = /mnt/pizarra-shared
 user = operator
 password_sha256 = <64-lowercase-hex-digest>
 ```
@@ -85,8 +91,8 @@ password_sha256 = <64-lowercase-hex-digest>
 Apply exact permissions and start:
 
 ```sh
-chmod 600 /etc/pzweb/pzweb.conf
-pzweb --config /etc/pzweb/pzweb.conf
+chmod 600 /etc/pizarra/pzweb.conf
+pzweb --config /etc/pizarra/pzweb.conf
 ```
 
 The password digest belongs in the file; the browser login uses the original
@@ -149,6 +155,10 @@ When `[web] shared` is configured, `pzweb` can:
 - publish only after the hub verifies the whole-file digest;
 - delete a named entry through descriptor-anchored, no-follow operations.
 
+Its value must exactly match the hub's `[shared] dir` and expose the same
+external mount. The tree is outside the built-in backup/restore boundary; pzweb
+does not create a second copy. Keep credentials and backup bundles out of it.
+
 Normal deletion of a non-empty directory is rejected with a count. Recursive
 deletion must be explicitly requested and may report a partial outcome if an
 entry changes during the operation. Symlinks are never followed; deleting a
@@ -184,14 +194,24 @@ Static assets are loaded into memory at startup and served with content-derived
 ETags. Security headers include a same-origin Content Security Policy,
 `nosniff`, `no-referrer`, and frame denial.
 
-## Service supervision
+## Registry and service boundaries
 
-An example `systemd/pzweb.service` is included. It deliberately uses a distinct
-`pzweb` account and `/etc/pzweb/` configuration directory; do not run it as the
-hub account. Review every path, address, and permission before enabling it. The
-service account needs:
+Structure, history, task, workflow, and application HTTP handlers construct
+native bus requests and project the hub replies. `pzweb` never opens
+`/var/lib/pizarra/org.sqlite`, reads registry INI sections, or maintains a local
+copy of organization state. Restarting `pzweb` therefore does not reload a
+second registry; current cards always come from `pizarra`.
 
-- read access to `pzweb.conf` and `web/apps`;
+An example `systemd/pzweb.service` is included. Its shipped `root:root` setting
+matches the current consolidated deployment and migration default; it reads
+`/etc/pizarra/pzweb.conf` and assets below
+`/usr/local/share/pizarra/web/apps`. A dedicated `pzweb` account is preferable
+for a new installation, but the file owner, service `User`/`Group`, and
+`PZWEB_OWNER`/`PZWEB_GROUP` migration settings must be changed together. Review
+every path, address, and permission before enabling it. The service account
+needs:
+
+- read access to its mode-`0600` `pzweb.conf` and installed web assets;
 - network access to the hub;
 - optional access to the shared root, granted narrowly with a dedicated group
   or ACL and without access to the hub config or store;

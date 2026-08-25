@@ -869,7 +869,7 @@ begin
       TermWidth - 2));
     FeedBlock(Frame('what not to forget',
       'Plurals work too: /apps /workflows /projects /groups /headers.'#10 +
-      'Pre-1.2 command aliases remain accepted for compatibility.'#10 +
+      'Legacy command aliases remain accepted for compatibility.'#10 +
       'If your header shows an ADMIN (group or project boss), wait for their'#10 +
       'instructions before building anything.'#10 +
       'A group name works bare, like a team name; on a clash the team wins.'#10 +
@@ -1018,20 +1018,17 @@ begin
   end
   else if (T = 'config') or (T = 'configuracion') then
   begin
-    FeedLine('configuration — two INI files (real ones are gitignored, hold the secret):');
-    FeedLine('pizarra.conf (the hub):');
+    FeedLine('configuration — canonical files are under /etc/pizarra (0600):');
+    FeedLine('pizarra.conf is HUB BOOTSTRAP only:');
     FeedLine('  [server]  listen / port (7010) / secret');
-    FeedLine('  [log]     path            [store] dir   (journal + tasks live here)');
+    FeedLine('  [registry] authority=sqlite   [log] path   [store] dir=/var/lib/pizarra');
     FeedLine('  [prompts] global = one-line project prompt   (or global_file = path)');
-    FeedLine('  [team:N]  name / speciality / prompt (or prompt_file) and EITHER:');
-    FeedLine('    local team:  tmux_session + launch   (hub injects and respawns)');
-    FeedLine('    remote team: host = ip[:7011]        (push to that host, /help daemon)');
+    FeedLine('teams, groups, projects, apps, manuals and relations live in org.sqlite;');
+    FeedLine('  inspect/change them with /team /group /project /app (or tiza).');
     FeedLine('tiza.conf (every endpoint):');
     FeedLine('  [pizarra] host / port / secret / self   (self: console, or the team name)');
-    FeedLine('search order: --config, $PIZARRA_CONF|$TIZA_CONF, ~/.config/pizarra/,');
-    FeedLine('  /etc/pizarra/, <repo>/conf/, ./   — hub restart applies changes (lossless)');
-    FeedLine('runtime changes: /team add|remove|set persist straight into pizarra.conf');
-    FeedLine('  (first write keeps a one-time .bak; comments are lost after that)');
+    FeedLine('resolution: explicit --config, strict environment path, then /etc/pizarra/;');
+    FeedLine('  source-tree conf/ and HOME are never implicit runtime authorities.');
   end
   else if (T = 'daemon') or (T = 'demonio') then
   begin
@@ -1144,7 +1141,7 @@ begin
 end;
 
 { Runtime team management: /team add|remove|set|list|show. Legacy aliases remain
-  accepted by the parser. Changes persist to pizarra.conf. }
+  accepted by the parser. Changes persist through the hub to org.sqlite. }
 { /workflow — dependency-tree milestone plans. Bare /workflow lists;
   '/workflow <name>' draws the tree. Legacy subcommand aliases remain accepted. }
 { Remove ONE enclosing quote pair, as a shell would. Without this, the same
@@ -1764,7 +1761,8 @@ begin
     Value := R;
     if (Name = '') or (Field = '') then
     begin
-      FeedLine('usage: /team set <name> prompt|speciality|parent|launch|session <value...>');
+      FeedLine('usage: /team set <name> prompt|speciality|parent|launch|session|user|');
+      FeedLine('       project|slave|workdir|hold_when_blocked|host|dial|delegate|secret <value>');
       Exit;
     end;
     if OneShot(BuildTeamSet(FCfg.Secret, FCfg.SelfId, Name, Field, Value), Reply) then
@@ -1792,7 +1790,8 @@ end;
   '/group <name>' (or '/group show <name>') shows only that group. }
 procedure TChat.CmdGroup(const Rest: string);
 var
-  R, Sub, Name, Members, Reply, Req, Want, Cell, Hdr, OnIdleP: string;
+  R, Sub, Name, Members, Reply, Req, Want, Cell, Hdr, OnIdleP,
+    OnBlockP: string;
   Obj, G: TJSONObject;
   Arr, M, MI, EX: TJSONArray;
   i, j, p, mid: Integer;
@@ -1919,6 +1918,19 @@ begin
     begin FeedLine('usage: /group boss <name> <team>'); Exit; end;
     Req := BuildGroupBoss(FCfg.Secret, FCfg.SelfId, Name, Word1(R));
   end
+  else if (Sub = 'onblock') or (Sub = 'block') then
+  begin
+    Name := Word1(R);
+    Members := LowerCase(Word1(R));
+    if (Name = '') or
+       ((Members <> 'alarm') and (Members <> 'log') and
+        (Members <> 'default')) then
+    begin
+      FeedLine('usage: /group onblock <name> alarm|log|default');
+      Exit;
+    end;
+    Req := BuildGroupOnBlock(FCfg.Secret, FCfg.SelfId, Name, Members);
+  end
   else
   begin
     { anything else is a group name: '/group softphone' shows only it }
@@ -1951,6 +1963,7 @@ begin
       MI := G.Get('member_ids', TJSONArray(nil));
       EX := G.Get('excluded', TJSONArray(nil));
       OnIdleP := LowerCase(Trim(G.Get('on_idle', '')));
+      OnBlockP := LowerCase(Trim(G.Get('on_block', '')));
       AllIdle := G.Get('all_idle', False);
       AnyBlocked := G.Get('any_blocked', False);
 
@@ -2001,6 +2014,10 @@ begin
       else if AnyBlocked then
         Cell := Cell + '   ' + Fg(ALERT_FG, '(a member is BLOCKED on a prompt)');
       FeedLine(Cell);
+      if OnBlockP = 'log' then
+        FeedLine('  on block: log only (operator alarm suppressed)')
+      else
+        FeedLine('  on block: alarm');
     end;
     if (Want <> '') and not Found then
       FeedLine('(no such group: ' + Want + ')')

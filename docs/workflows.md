@@ -205,7 +205,7 @@ Clone a plan into a pristine draft when the executed plan should remain an
 immutable record:
 
 ```sh
-tiza wf clone release-check release-check-next --group release
+tiza wf clone release-check release-check-next release
 ```
 
 The clone retains structure and options but resets state, tasks, timestamps,

@@ -162,7 +162,7 @@ for the actor's single active step. `after` on append is a dependency expression
 characters and proof/error/fix text to 4096 characters.
 
 `milestone` is the canonical English request field. For compatibility with
-clients older than 1.2, these routes also accept the legacy request field
+legacy clients, these routes also accept the established request field
 `hito`, but never both spellings in one body. Hub responses and durable hub
 records retain `hito` as their established wire/storage field; pzweb adapts the
 workflow read model to the documented response schema.
@@ -179,6 +179,7 @@ workflow read model to the documented response schema.
 | `POST /api/group/<name>/boss` | `{boss}` | Replace/clear group administrator |
 | `POST /api/group/<name>/project` | `{project}` | Replace/clear project label |
 | `POST /api/group/<name>/exclude` | `{excluded}` string | Replace complete muted set |
+| `POST /api/group/<name>/onblock` | `onblock` | Set `alarm` or `log`, or use `default` to clear the group override |
 | `POST /api/project/<name>/boss` | `boss` | Create or update project |
 | `POST /api/project/<name>/remove` | `{}` | Remove unused project |
 | `POST /api/app` | `name`, `team`, `{repo,path,purpose,detail}` | Create application |
@@ -213,8 +214,11 @@ after offset and digest verification.
 For shared deletion, `dir` is one team directory or `.` for the exchange root;
 `name` is one entry, never a path. `recursive:true` is explicit and destructive.
 
-The built-in backup omits workflow undo snapshots and legacy manual files; see
-[Operations](operations.md) for the separate retention requirement.
+The built-in backup omits workflow undo snapshots, legacy manual files, the
+canonical endpoint-release tree, and all shared/NFS content. It includes the
+hub configuration and therefore the shared-path reference only; restore never
+restores the external tree. See [Operations](operations.md) for the separate
+retention requirement.
 
 ## Runtime help
 

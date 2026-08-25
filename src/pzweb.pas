@@ -18,7 +18,7 @@ uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, StrUtils, Sockets, BaseUnix, ssockets,
   fphttpserver, httpdefs, httpprotocol, fpjson, jsonparser, base64,
-  pzconfig, pzproto, pznet, pzver, pzsha256;
+  pzconfig, pzlayout, pzproto, pznet, pzver, pzsha256;
 
 const
   { A browser loads the page and several assets over keep-alive connections
@@ -240,7 +240,8 @@ begin
     if Missing <> '' then
       Fail('the hub does not delegate these families to ' + Cfg.Self_ + ': ' +
            Missing + '. This console administers everything or it does not ' +
-           'open: add them to [team:N] delegate= in the hub config. ' +
+           'open: use `tiza team set ' + Cfg.Self_ +
+           ' delegate ...` from the real console. ' +
            'No socket was opened.');
     Writeln('pzweb: the hub delegates all ', Length(DELEGATE_FAMILIES),
             ' families to ', Cfg.Self_);
@@ -304,7 +305,8 @@ begin
   if OkConsole then
     Fail('the configured credential was ACCEPTED as from=console, so it is NOT ' +
          'bound to this team (it looks like the GLOBAL secret). Refusing to ' +
-         'start: no socket is opened. Give pzweb its own [team:N] secret.');
+         'start: no socket is opened. Rotate it with `tiza team set ' +
+         Cfg.Self_ + ' secret --file PATH` from the real console.');
 
   Writeln('pzweb: credential proved bound to team ', Cfg.Self_,
           ' (accepted as itself, refused as console)');
@@ -511,7 +513,8 @@ begin
   Result := True;
 end;
 
-{ allow_from accepts an exact IPv4 address or CIDR such as 192.168.1.0/24. }
+{ allow_from accepts an exact IPv4 address or CIDR such as the documentation
+  range 192.0.2.0/24. }
 function PeerAllowed(const Peer: string): Boolean;
 var
   i, slash, Bits: Integer;
@@ -2388,6 +2391,12 @@ begin
       '`excluded` is the COMPLETE SET and replaces the previous value; empty ' +
       'clears it. Only the group owner or console may change it. Naming a ' +
       'non-member has no effect because broadcasts already skip non-members.') +
+    ',' + E('POST /api/group/<name>/onblock',
+      'Sets permission-block handling for a group.',
+      '`alarm` keeps the normal operator alarm; `log` records blocks quietly; ' +
+      '`default` restores normal alarm behavior.',
+      'Log-only affects non-excluded group members and suppresses the loud ' +
+      'operator alarm; detection and delivery holds remain active.') +
 
     { ---- tasks ---- }
     ',' + E('POST /api/task/<id>/state',
@@ -3735,6 +3744,15 @@ begin
         'groups', 'group', Nm);
       Exit;
     end;
+    if Seg[2] = 'onblock' then
+    begin
+      if not OnlyKeys(Body, ['onblock'], AResp) then Exit;
+      if not Opt('onblock', V) then Exit;
+      MutateThen(BuildGroupOnBlock(Cfg.Secret, Cfg.Self_, Nm, V),
+        BuildGroupList(Cfg.Secret, Cfg.Self_), 'groups', AResp,
+        'groups', 'group', Nm);
+      Exit;
+    end;
   end;
 
   { ---- projects ---- }
@@ -4965,42 +4983,26 @@ var
   i: Integer;
   Sec, Line, Key, Val: string;
   p: Integer;
-  StCfg: Stat;
   BadComp: string;
   ListenV: LongWord;
-  RealPath: string;
   OErr: string;
+  ConfigFd: Integer;
+  ConfigStream: THandleStream;
 begin
-  StCfg := Default(Stat);
-  if not FileExists(Path) then
-    Fail('config not found: ' + Path);
-  { This file contains the team credential. A symbolic link could redirect it
-    after validation, and permissive mode bits let any local user read it. Both
-    cases defeat the credential boundary. }
-  if fpLStat(Path, StCfg) <> 0 then
-    Fail('cannot stat config: ' + Path);
-
-  if not NoSymlinkInPath(Path, BadComp) then
-    Fail('config path is unsafe: ' + BadComp +
-         ' — refusing to start (it holds the credential)');
-  { Apply the same rule to the configuration file: validate and read the SAME
-    normalized path. }
-  RealPath := ExpandFileName(Path);
-  { Require EXACTLY 0600, not merely "no group or other permissions." The old
-    check accepted 0400, 0200, 0700, and even 0000. When the service runs with
-    elevated privileges, 0400 may still be readable and startup appears valid.
-    Comparing every permission bit makes the guard cover its own worst case. }
-  if (StCfg.st_mode and (S_IRWXU or S_IRWXG or S_IRWXO)) <>
-     (S_IRUSR or S_IWUSR) then
-    Fail(Format('config %s must be mode 0600 exactly: it holds the team credential',
-      [Path]));
+  ConfigFd := -1;
+  if not PzOpenPrivateConfig(Path, ConfigFd, BadComp, OErr) then
+    Fail('config is unsafe: ' + OErr +
+      ' — refusing to start because it holds the web team credential');
   Cfg.Port := 7010;
   Cfg.WebPort := 7080;
   Cfg.Listen := '127.0.0.1';
-  Cfg.AppsDir := 'web/apps';
-  Ini := TStringList.Create;
+  Cfg.AppsDir := PZ_WEB_ASSETS_DIR;
+  Ini := nil;
+  ConfigStream := nil;
   try
-    Ini.LoadFromFile(RealPath);
+    Ini := TStringList.Create;
+    ConfigStream := THandleStream.Create(ConfigFd);
+    Ini.LoadFromStream(ConfigStream);
     Sec := '';
     for i := 0 to Ini.Count - 1 do
     begin
@@ -5064,7 +5066,9 @@ begin
       end;
     end;
   finally
-    Ini.Free;
+    FreeAndNil(ConfigStream);
+    FpClose(ConfigFd);
+    FreeAndNil(Ini);
   end;
   if Cfg.Secret = '' then
     Fail('[pizarra] secret is empty: refusing to start');
@@ -5082,12 +5086,25 @@ begin
     discovering that during the first listing is too late. }
   if Cfg.SharedDir <> '' then
   begin
+    { Match the hub loader. ExcludeTrailingPathDelimiter removes only one
+      separator in FPC 3.2.2, so normalize the complete suffix before deciding
+      whether this is the filesystem root. }
+    while (Length(Cfg.SharedDir) > 1) and
+          CharInSet(Cfg.SharedDir[Length(Cfg.SharedDir)],
+            AllowDirectorySeparators) do
+      Delete(Cfg.SharedDir, Length(Cfg.SharedDir), 1);
+    if Cfg.SharedDir[1] <> PathDelim then
+      Fail('[web] shared must be an absolute path; a relative NFS mount ' +
+        'would resolve against the pzweb process working directory');
+    if Cfg.SharedDir = PathDelim then
+      Fail('[web] shared may not be the filesystem root; configure a ' +
+        'dedicated external directory or NFS mount');
     if not NoSymlinkInPath(Cfg.SharedDir, BadComp) then
       Fail('[web] shared dir path is unsafe: ' + BadComp + ' — refusing to start');
     if not DirectoryExists(Cfg.SharedDir) then
       Fail(Format('[web] shared dir %s does not exist: refusing to start',
         [Cfg.SharedDir]));
-    Cfg.SharedDir := ExpandFileName(ExcludeTrailingPathDelimiter(Cfg.SharedDir));
+    Cfg.SharedDir := ExpandFileName(Cfg.SharedDir);
   end;
   if Cfg.Origin = '' then
     Fail('[web] origin is empty: refusing to start');
@@ -5133,7 +5150,7 @@ end;
 
 var
   Srv: TPzWebServer;
-  CfgPath: string;
+  CfgPath, ConfigArg, ConfigReason: string;
 begin
   { Match the hub and tiza: without this setting fpjson converts decoded text
     through the system code page (often LANG=C under systemd/tmux), producing
@@ -5145,9 +5162,23 @@ begin
     Writeln('pzweb ', PizarraVersion);
     Halt(0);
   end;
-  CfgPath := 'conf/pzweb.conf';
-  if (ParamCount >= 2) and (ParamStr(1) = '--config') then
-    CfgPath := ParamStr(2);
+  ConfigArg := '';
+  if (ParamCount >= 1) and (ParamStr(1) = '--config') then
+  begin
+    if ParamCount < 2 then
+      Fail('--config requires a path');
+    ConfigArg := ParamStr(2);
+  end;
+  CfgPath := ResolveConfigStrict(ConfigArg, 'PZWEB_CONF', 'pzweb.conf',
+    ConfigReason);
+  if CfgPath = '' then
+  begin
+    if ConfigReason <> '' then
+      Fail(ConfigReason)
+    else
+      Fail('no config found at /etc/pizarra/pzweb.conf; create it with mode ' +
+        '0600 or use --config PATH');
+  end;
 
   LoadCfg(CfgPath);
   Writeln('pzweb ', PizarraVersion, ' starting');

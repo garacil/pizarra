@@ -5,15 +5,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pizarra
-Group=pizarra
+User=root
+Group=root
 UMask=0077
-ExecStart=/usr/local/bin/pizarra --config /etc/pizarra/pizarra.conf
+ConfigurationDirectory=pizarra
+ConfigurationDirectoryMode=0711
+StateDirectory=pizarra
+StateDirectoryMode=0700
+LogsDirectory=pizarra
+LogsDirectoryMode=0700
+ExecStart=/usr/local/bin/pizarra
 Restart=on-failure
 RestartSec=3
 
 # A hub that manages local tmux sessions must run as the account that owns
-# those sessions. Change User/Group here or host the sessions through tiza.
+# those sessions. The shipped migration preserves the current root-owned tmux
+# deployment. Sites using a dedicated account should change User/Group and run
+# the migrator with the same PIZARRA_OWNER/PIZARRA_GROUP values.
 
 [Install]
 WantedBy=multi-user.target

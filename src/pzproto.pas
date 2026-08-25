@@ -264,6 +264,7 @@ function BuildGroupOnIdleMsg(const Secret, From, Name, Msg: string): string;
 function BuildGroupOnIdleFrom(const Secret, From, Name, Who: string): string;
 function BuildGroupOnIdleReply(const Secret, From, Name, Who: string): string;
 function BuildGroupHeader(const Secret, From, Name, Note: string): string;
+function BuildGroupOnBlock(const Secret, From, Name, Policy: string): string;
 
 { Project registry ops (all cmd=project, selected by op). }
 function BuildProjectBoss(const Secret, From, Name, Boss: string): string;
@@ -1498,6 +1499,13 @@ var O: TJSONObject;
 begin
   O := GroupReq(Secret, From, 'onidlereply', Name);
   try O.Add('onidlereply', Who); Result := O.AsJSON; finally O.Free; end;
+end;
+
+function BuildGroupOnBlock(const Secret, From, Name, Policy: string): string;
+var O: TJSONObject;
+begin
+  O := GroupReq(Secret, From, 'onblock', Name);
+  try O.Add('onblock', Policy); Result := O.AsJSON; finally O.Free; end;
 end;
 
 function BuildProjectBoss(const Secret, From, Name, Boss: string): string;

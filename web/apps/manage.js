@@ -602,6 +602,8 @@
       } else {
         facts.appendChild(node('span', '', 'when idle: nothing'));
       }
+      facts.appendChild(node('span', '', (item.on_block || '').toLowerCase() === 'log' ?
+        'when blocked: log only' : 'when blocked: alarm'));
       // live "all stopped" alarm indicator (all members idle right now).
       if (item.all_idle) {
         facts.appendChild(node('span', 'registry-card__alarm',
@@ -930,7 +932,7 @@
     } else if (kind === 'groups') {
       openDialog({title: 'Edit group @' + name, help: 'Choose one operation. Add and remove receive exact lists, never interpreted text.',
         fields: [{name: 'operation', label: 'Operation', type: 'select', options: [
-          {value: 'add', label: 'Add members'}, {value: 'remove', label: 'Remove members'}, {value: 'boss', label: 'Change owner'}, {value: 'project', label: 'Change project'}, {value: 'exclude', label: 'Mute from @group'}]},
+          {value: 'add', label: 'Add members'}, {value: 'remove', label: 'Remove members'}, {value: 'boss', label: 'Change owner'}, {value: 'project', label: 'Change project'}, {value: 'exclude', label: 'Mute from @group'}, {value: 'onblock', label: 'Permission-block handling'}]},
           {name: 'value', label: 'Value', placeholder: 'Comma-separated members, team, or project'}],
         action: function (v) {
           if (v.operation === 'add') { return mutate('/api/group', {name: name, members: splitMembers(v.value)}, loadRegistries, registryUi.notice); }
@@ -963,6 +965,13 @@
           spec.label = 'Muted members (replaces the set; empty clears it)';
           spec.value = (item.excluded || []).join(', ');
           spec.placeholder = item.members.join(', ');
+        } else if (selected === 'onblock') {
+          setDialogHelp('POST /api/group/<name>/onblock', 'Choose whether blocked members raise the normal operator alarm or are recorded only in the log. Default restores alarm behavior.');
+          spec.label = 'When a member is blocked';
+          spec.type = 'select';
+          spec.value = item.on_block || 'default';
+          spec.options = [{value: 'default', label: 'Default (alarm)'},
+            {value: 'alarm', label: 'Alarm'}, {value: 'log', label: 'Log only'}];
         } else {
           setDialogHelp('POST /api/group/<name>/project', 'Change the project associated with the group.');
           spec.label = 'Current / new project';

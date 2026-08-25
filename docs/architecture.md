@@ -14,6 +14,11 @@ Delivery endpoints may run beside the hub or on remote hosts.
 | `tiza daemon` | Remote delivery, terminal-session watchdog, deduplication, reverse-dial connection, activity reporting, self-update | Per-team last-injected sequence state |
 | `pzweb` | Static browser application, authenticated JSON API, strict hub response projection, SSE bridge | No copy of hub state; assets are loaded at startup |
 
+`pzweb` is an authenticated adapter, not another registry reader. Every
+organization card and mutation shown in the browser comes from a native bus
+request to `pizarra`; the web process never opens `org.sqlite`, registry INI
+sections, or the hub's JSON stores.
+
 ## Topology
 
 ```mermaid
@@ -92,6 +97,12 @@ The endpoint daemon persists the last injected sequence for each team. If its
 acknowledgement is lost, a retry is accepted without a second terminal paste.
 This gives durable at-least-once transport with deduplicated terminal delivery.
 
+When the daemon manages a tmux session, it tags that session with its team and,
+when the reviewed launch command declares `TIZA_CONF=...`, with the protected
+identity-file path. A bare `tiza` inside the session can therefore recover the
+right identity without inferring it from the session name or silently using the
+host's default console file.
+
 Broadcasts are expanded into one durable message per destination. A partial
 fan-out is reported rather than represented as an all-or-nothing operation.
 
@@ -132,27 +143,58 @@ The web console uses a bound team credential and requires all administrative
 families. It proves both the credential binding and capability set before it
 starts listening.
 
-## Durable state
+## Canonical layout and durable state
 
-All paths below are relative to `[store] dir`.
+Installed bootstrap configuration lives in `/etc/pizarra`, mutable hub state in
+`/var/lib/pizarra`, logs in `/var/log/pizarra`, and installed web assets in
+`/usr/local/share/pizarra/web/apps`. The only implicit configuration files are
+`/etc/pizarra/pizarra.conf`, `/etc/pizarra/tiza.conf`, and
+`/etc/pizarra/pzweb.conf`; runtime discovery does not search a checkout, home
+directory, or current directory.
+
+The optional shared exchange is deliberately outside this state tree and may
+be an NFS mount. Hub `[shared] dir` and pzweb `[web] shared` must identify the
+same absolute mount. It is coordination data, not SQLite authority or local hub
+state. Those operations preserve its configuration reference, but the external
+tree itself is outside built-in migration, backup, restore, and repository
+retirement.
+
+`pizarra.conf` holds static/bootstrap settings such as the listener, master
+credential, store/log paths, prompts, and delivery-header presentation. All
+paths below are relative to its `[store] dir`, canonically
+`/var/lib/pizarra`.
 
 | Path | Role |
 |---|---|
+| `.pizarra-hub.lock` | Persistent mode-`0600` inode whose exclusive lifetime lock prevents two hubs, or a hub and restore, from opening the same store |
 | `messages.jsonl` | Append-only live message journal |
 | `state.json` | Next sequence, delivery high-water marks, inbox cursors |
 | `tareas.json` | Authoritative task cards and notes |
 | `workflows.json` | Authoritative workflows and their durable notification outbox |
 | `wfhistory/*.json` | Automatic pre-change workflow snapshots; newest 30 per workflow |
 | `appdocs/*.md` | Legacy application-manual migration input, if retained |
-| `org.sqlite` | Teams, groups, projects, applications, relations, and audit history |
-| `work.sqlite` | Task registry projection and history |
-| `apps.sqlite` | Compatibility/migration database retained by the implementation |
+| `org.sqlite` | Authoritative teams, groups, memberships, policies, projects, applications, manuals, app/project relations, and audit history |
+| `work.sqlite` | Task projection and history |
+| `apps.sqlite` | Legacy compatibility/migration database retained for rollback; not current app authority |
 | `backups/` | Default destination for built-in backup sets |
+| `releases/` | Canonical private endpoint-artifact root; operational release state, not registry authority and not part of the built-in backup |
 
-The INI configuration remains the declarative startup source for organization
-records. Runtime mutations persist back to that file and are mirrored into
-SQLite with history. If SQLite cannot be loaded, message delivery, tasks, and
-workflows continue, while registry mutations become read-only.
+The lock file is metadata, not a PID file or a stale-lock marker. Its pathname
+remains present while the unlocked/locked state belongs to an open descriptor;
+do not delete or replace it during cleanup. `CLOEXEC` prevents managed tmux
+children from accidentally keeping the hub's lock after the hub exits.
+
+`org.sqlite` is the only live organization authority. Registry mutations commit
+to it before a new in-memory projection is published; `pizarra.conf` is not
+rewritten with teams, groups, projects, or applications. If SQLite is missing,
+cannot be opened, cannot be upgraded, or cannot be loaded completely, the hub
+refuses startup instead of resurrecting a partial INI view.
+
+Legacy registry sections are accepted only during the guarded first cutover.
+The hub reconciles and verifies them, preserves an owner-only INI backup,
+removes those sections atomically, and writes the SQLite authority marker last.
+Thereafter an INI registry is neither read as authority nor maintained as a
+mirror.
 
 ## Task and workflow relationship
 

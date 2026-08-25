@@ -16,9 +16,17 @@ program pizarra;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, ssockets, SyncObjs, BaseUnix, Types, StrUtils, fpjson, base64,
+  SysUtils, Classes, IniFiles, ssockets, SyncObjs, BaseUnix,
+  Unix{$IFDEF LINUX}, Linux{$ENDIF}, Types, StrUtils,
+  fpjson, base64,
   pzproto, pzconfig, pzlog, pzstore, pztasks, pzworkflow, pztmux, pznet,
-  pzmanual, pzshare, pzver, pzsha256, pzdb, pzansi;
+  pzmanual, pzshare, pzver, pzsha256, pzdb, pzansi, pzlayout;
+
+{ BaseUnix 3.2.2 exposes chmod(path) but no fchmod(fd) wrapper. Linux/glibc
+  declares int fchmod(int, mode_t) in sys/stat.h; use it so a pathname swap
+  cannot redirect permission changes after a directory has been opened. }
+function C_FChmod(Fd: LongInt; Mode: TMode): LongInt; cdecl;
+  external name 'fchmod';
 
 var
   { watchdog tick in seconds; PIZARRA_TICK env overrides (min 1) so the
@@ -140,8 +148,8 @@ type
     FStore: TPzStore;
     FTasks: TTaskStore;
     FWf:    TWorkflowStore;
-    FDb:    TPzDb;              { SQLite registries; may be unavailable }
-    FRegistryRO: Boolean;       { True when registries are read-only }
+    FDb:    TPzDb;              { authoritative SQLite registries }
+    FHubStoreLock: Integer;     { lifetime flock: hub/restore mutual exclusion }
     FLock:  TCriticalSection;   { serialises local tmux delivery }
     FServer: TPzServer;
     FWatchers: TThreadList;     { of TWatcher }
@@ -150,7 +158,6 @@ type
     FActivity: array of TActState; { team -> live pane-activity (CMD_ACTIVITY) }
     FGrpIdle: array of TGrpIdleState; { per-group quiescence (watchdog-only) }
     procedure OpenRegistryDb;   { opens, creates schemas, and migrates once }
-    procedure FillAppHasDoc;    { records which applications have manuals }
     procedure HandleConnect(Stream: TSocketStream);
     { Ident is 'proven' for a team-bound credential and 'claimed' when a
       global credential supplied a team identity. }
@@ -164,17 +171,15 @@ type
     procedure HandleUpdate(Obj: TJSONObject; const From: string;
       Data: TSocketStream);
     procedure HandleApp(Obj: TJSONObject; const From: string; Data: TSocketStream);
-    { Refresh the INI mirror and the LIVE config after an assignment changes.
-      The relation lives in the database, which rules after load, but the
-      delivery header is built in pzconfig - where there is no database - so
-      without this mirror no header could name a single project. }
+    { Refresh the in-memory projection after an assignment changes. The
+      relation lives only in SQLite, while the delivery-header builder consumes
+      a config snapshot and intentionally has no database dependency. }
     procedure MirrorAppProjects(const AppName: string);
     procedure HandleBackup(Obj: TJSONObject; const From: string;
       Data: TSocketStream);
     procedure DialEnqueue(const Team, Envelope: string; Seq: Int64);
     procedure HandleTask(Obj: TJSONObject; const From: string; Data: TSocketStream);
     procedure HandleWorkflow(Obj: TJSONObject; const From: string; Data: TSocketStream);
-    procedure LogDbDivergence(const What, Err: string);
     procedure HandleTeam(Obj: TJSONObject; const From: string; Data: TSocketStream);
     function ConsoleFor(const From, Family: string): Boolean;
     procedure HandleGroup(Obj: TJSONObject; const From: string; Data: TSocketStream);
@@ -598,20 +603,24 @@ end;
 { ---------- TPizarra ---------- }
 
 
-function ReadAppDoc(const C: TPizarraConfig; const Name: string): string; forward;
+function ReadLegacyAppDoc(const C: TPizarraConfig; const Name: string;
+  out Present: Boolean; out Body, Err: string): Boolean; forward;
 
-{ Simple binary copy used to preserve the real INI before migration. }
-procedure CopyFileTo(const Src, Dst: string);
+{ Credential-safe durable binary copy used by the backup artifact. }
+function CopyFileTo(const Src, Dst: string; out Err: string): Boolean;
 var
   A, B: TFileStream;
+  H, ErrNo: Integer;
 begin
+  Result := False;
+  Err := '';
   try
     { Open for shared reads. On Unix FileOpen always applies flock and the share
       bits select its mode; the default fmShareCompat would take LOCK_EX and
       make concurrent configuration reads fail. }
     A := TFileStream.Create(Src, fmOpenRead or fmShareDenyNone);
     try
-      B := TFileStream.Create(Dst, fmCreate);
+      B := TFileStream.Create(Dst, fmCreate, &600);
       try
         B.CopyFrom(A, 0);
       finally
@@ -620,190 +629,489 @@ begin
     finally
       A.Free;
     end;
-  except
-    { A best-effort safety copy must not prevent startup. }
-  end;
-end;
-
-function NowStampDb: string;
-begin
-  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', Now);
-end;
-
-
-{ Registry state is mirrored between the declarative INI and SQLite. }
-
-{ Mark applications that have a manual. Manuals live in a database TEXT
-  column, so this is the only application attribute unavailable from the INI. }
-procedure TPizarra.FillAppHasDoc;
-var
-  R: TStringList;
-  F: TPzDbFile;
-  i, k: Integer;
-begin
-  if (FDb = nil) or (not FDb.Available) then
-    Exit;
-  F := FDb.AppsDb;
-  R := FDb.Rows(F, 'SELECT app FROM app_doc WHERE bytes>0');
-  try
-    for i := 0 to High(FCfg.Apps) do
+    if FpChmod(Dst, &600) <> 0 then
     begin
-      FCfg.Apps[i].HasDoc := False;
-      for k := 0 to R.Count - 1 do
-        if SameText(R[k], FCfg.Apps[i].Name) then
-          FCfg.Apps[i].HasDoc := True;
+      ErrNo := fpgeterrno;
+      Err := 'cannot protect ' + Dst + ': ' + SysErrorMessage(ErrNo);
+      DeleteFile(Dst);
+      Exit;
     end;
-  finally
-    R.Free;
+    H := FpOpen(Dst, O_RDONLY);
+    if H < 0 then
+    begin
+      Err := 'cannot reopen ' + Dst + ' for fsync';
+      DeleteFile(Dst);
+      Exit;
+    end;
+    try
+      if PzFsync(H) <> 0 then
+      begin
+        Err := 'cannot fsync ' + Dst + ': ' + SysErrorMessage(fpgeterrno);
+        DeleteFile(Dst);
+        Exit;
+      end;
+    finally
+      FpClose(H);
+    end;
+    Result := True;
+  except
+    on E: Exception do
+    begin
+      Err := E.Message;
+      DeleteFile(Dst);
+    end;
   end;
 end;
 
-{ Open all three databases, create their schemas, and perform the one-time
-  import. Missing SQLite support is nonfatal: the bus remains operational and
-  registry operations become read-only. }
+{ Registry state lives in org.sqlite; pizarra.conf is bootstrap plus one-time
+  legacy migration input. }
+
+{ Open the databases, upgrade their schemas, import legacy INI declarations
+  exactly once, and then replace the registry arrays from org.sqlite. SQLite
+  failure is fatal: falling back to a partial INI after the cutover could
+  resurrect deleted identities and discard database-only manuals/relations. }
 { Defined later but needed during startup. }
 function TeamRowDb(const T: TTeam): string; forward;
 
 procedure TPizarra.OpenRegistryDb;
 var
-  Err, Doc, Row: string;
-  Names, Teams, Repos, Paths, Purposes, Details, Docs: TStringList;
+  Err, Doc, Row, Sec, Key, Role, ConfigBackup, PrecutoverDir,
+    AuthorityMarker,
+    CutoverLockPath: string;
+  Names, Teams, Repos, Paths, Purposes, Details, Docs, DocPresent: TStringList;
   TeamRows, GroupRows, ProjectRows, TaskRows, NoteRows: TStringList;
+  Keys, Relations: TStringList;
   Tasks: TTaskArray;
+  Parts: TStringArray;
+  Ini: TIniFile;
+  LoadedCfg, ExistingCfg: TPizarraConfig;
   F: TPzDbFile;
-  i, j, N, NDocs, NTk, NNo, NImp: Integer;
-  First: Boolean;
+  i, j, N, NDocs, NTk, NNo, NImp, CutoverLockFd: Integer;
+  FirstRegistry, FirstTasks, HasExistingDb, ExistingPair, HasLegacyDoc: Boolean;
 
   function Fld(const S: string): string;
   begin
-    { Field separator #1 cannot occur in INI or JSON input. }
-    Result := StringReplace(StringReplace(S, #1, ' ', [rfReplaceAll]),
-      #10, ' ', [rfReplaceAll]);
+    Result := RowFieldEncode(S);
+  end;
+
+  function Csv(const Values: TStringArray): string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    for k := 0 to High(Values) do
+    begin
+      if Result <> '' then
+        Result := Result + ',';
+      Result := Result + Values[k];
+    end;
+  end;
+
+  function SameList(const A, B: TStringArray): Boolean;
+  var
+    k: Integer;
+  begin
+    if Length(A) <> Length(B) then
+      Exit(False);
+    for k := 0 to High(A) do
+      if A[k] <> B[k] then
+        Exit(False);
+    Result := True;
+  end;
+
+  { A marker-less database may already contain valuable rows. Reconciliation
+    is allowed only when every overlapping legacy value agrees. New columns
+    added for this cutover may still hold their schema default and are then
+    filled from the INI. Database-only rows are retained; an ID collision is
+    never guessed to be a rename. }
+  function CutoverCompatible(const Legacy, DbCfg: TPizarraConfig;
+    RequireNewFields: Boolean; out Why: string): Boolean;
+  var
+    a, b: Integer;
+    Found: Boolean;
+    LT, DT: TTeam;
+    LG, DG: TGroup;
+  begin
+    Result := False;
+    Why := '';
+    for a := 0 to High(Legacy.Teams) do
+    begin
+      Found := False;
+      LT := Legacy.Teams[a];
+      for b := 0 to High(DbCfg.Teams) do
+        if SameText(LT.Name, DbCfg.Teams[b].Name) then
+        begin
+          Found := True;
+          DT := DbCfg.Teams[b];
+          if (LT.Id <> DT.Id) or (LT.Speciality <> DT.Speciality) or
+             (LT.Prompt <> DT.Prompt) or (LT.Parent <> DT.Parent) or
+             (LT.Project <> DT.Project) or (LT.Secret <> DT.Secret) or
+             (LT.Host <> DT.Host) or (LT.Port <> DT.Port) or
+             (LT.Dial <> DT.Dial) or (LT.TmuxSession <> DT.TmuxSession) or
+             (LT.Launch <> DT.Launch) or (LT.User <> DT.User) or
+             (LT.Slave <> DT.Slave) or (LT.Workdir <> DT.Workdir) then
+          begin
+            Why := 'team "' + LT.Name + '" differs between INI and SQLite';
+            Exit;
+          end;
+          if RequireNewFields then
+          begin
+            if (LT.Delegate <> DT.Delegate) or
+               (LT.HoldBlocked <> DT.HoldBlocked) then
+            begin
+              Why := 'team "' + LT.Name +
+                '" lost delegate/hold policy during verification';
+              Exit;
+            end;
+          end
+          else if ((DT.Delegate <> '') and (DT.Delegate <> LT.Delegate)) or
+                  (DT.HoldBlocked and (not LT.HoldBlocked)) then
+          begin
+            Why := 'team "' + LT.Name +
+              '" has conflicting SQLite-only delegate/hold policy';
+            Exit;
+          end;
+          Break;
+        end;
+      if not Found then
+      begin
+        for b := 0 to High(DbCfg.Teams) do
+          if LT.Id = DbCfg.Teams[b].Id then
+          begin
+            Why := Format('team id %d is "%s" in INI but "%s" in SQLite; ' +
+              'refusing to guess a rename',
+              [LT.Id, LT.Name, DbCfg.Teams[b].Name]);
+            Exit;
+          end;
+        if RequireNewFields then
+        begin
+          Why := 'team "' + LT.Name + '" is missing after migration';
+          Exit;
+        end;
+      end;
+    end;
+    for a := 0 to High(Legacy.Groups) do
+    begin
+      Found := False;
+      LG := Legacy.Groups[a];
+      for b := 0 to High(DbCfg.Groups) do
+        if SameText(LG.Name, DbCfg.Groups[b].Name) then
+        begin
+          Found := True;
+          DG := DbCfg.Groups[b];
+          if (LG.Project <> DG.Project) or (LG.Boss <> DG.Boss) or
+             (not SameList(LG.Members, DG.Members)) or
+             (not SameList(LG.Excluded, DG.Excluded)) then
+          begin
+            Why := 'group "' + LG.Name +
+              '" differs between INI and SQLite';
+            Exit;
+          end;
+          if RequireNewFields then
+          begin
+            if (LG.OnIdle <> DG.OnIdle) or (LG.OnIdleMsg <> DG.OnIdleMsg) or
+               (LG.OnIdleFrom <> DG.OnIdleFrom) or
+               (LG.OnIdleReply <> DG.OnIdleReply) or
+               (LG.HdrNote <> DG.HdrNote) or (LG.OnBlock <> DG.OnBlock) then
+            begin
+              Why := 'group "' + LG.Name +
+                '" lost a policy field during verification';
+              Exit;
+            end;
+          end
+          else if ((DG.OnIdle <> '') and (DG.OnIdle <> LG.OnIdle)) or
+                  ((DG.OnIdleMsg <> '') and (DG.OnIdleMsg <> LG.OnIdleMsg)) or
+                  ((DG.OnIdleFrom <> '') and (DG.OnIdleFrom <> LG.OnIdleFrom)) or
+                  ((DG.OnIdleReply <> '') and (DG.OnIdleReply <> LG.OnIdleReply)) or
+                  ((DG.HdrNote <> '') and (DG.HdrNote <> LG.HdrNote)) or
+                  ((DG.OnBlock <> '') and (DG.OnBlock <> LG.OnBlock)) then
+          begin
+            Why := 'group "' + LG.Name +
+              '" has conflicting SQLite-only policy fields';
+            Exit;
+          end;
+          Break;
+        end;
+      if RequireNewFields and (not Found) then
+      begin
+        Why := 'group "' + LG.Name + '" is missing after migration';
+        Exit;
+      end;
+    end;
+    for a := 0 to High(Legacy.Projects) do
+    begin
+      Found := False;
+      for b := 0 to High(DbCfg.Projects) do
+        if SameText(Legacy.Projects[a].Name, DbCfg.Projects[b].Name) then
+        begin
+          Found := True;
+          if Legacy.Projects[a].Boss <> DbCfg.Projects[b].Boss then
+          begin
+            Why := 'project "' + Legacy.Projects[a].Name +
+              '" differs between INI and SQLite';
+            Exit;
+          end;
+          Break;
+        end;
+      if RequireNewFields and (not Found) then
+      begin
+        Why := 'project "' + Legacy.Projects[a].Name +
+          '" is missing after migration';
+        Exit;
+      end;
+    end;
+    for a := 0 to High(Legacy.Apps) do
+    begin
+      Found := False;
+      for b := 0 to High(DbCfg.Apps) do
+        if SameText(Legacy.Apps[a].Name, DbCfg.Apps[b].Name) then
+        begin
+          Found := True;
+          if (Legacy.Apps[a].Team <> DbCfg.Apps[b].Team) or
+             (Legacy.Apps[a].Repo <> DbCfg.Apps[b].Repo) or
+             (Legacy.Apps[a].Path <> DbCfg.Apps[b].Path) or
+             (Legacy.Apps[a].Purpose <> DbCfg.Apps[b].Purpose) or
+             (Legacy.Apps[a].Detail <> DbCfg.Apps[b].Detail) then
+          begin
+            Why := 'application "' + Legacy.Apps[a].Name +
+              '" differs between INI and SQLite';
+            Exit;
+          end;
+          Break;
+        end;
+      if RequireNewFields and (not Found) then
+      begin
+        Why := 'application "' + Legacy.Apps[a].Name +
+          '" is missing after migration';
+        Exit;
+      end;
+    end;
+    Result := True;
   end;
 
 begin
-  FRegistryRO := False;
+  if not SameText(FCfg.RegistryAuthority, 'sqlite') then
+    raise Exception.Create('[registry] authority must be sqlite; the INI is ' +
+      'migration input only, never a second live registry');
   FDb := TPzDb.Create(FCfg.StoreDir);
   if not FDb.Available then
+    raise Exception.Create('SQLite registry unavailable: ' + FDb.Unavailable);
+  { Determine authority before schema upgrades. A populated pre-cutover store
+    gets an online physical snapshot before any ALTER/copy/reconciliation. }
+  F := FDb.OrgDb;
+  AuthorityMarker := FDb.MetaGet(F, 'registry_authority');
+  FirstRegistry := AuthorityMarker = '';
+  if (not FirstRegistry) and (AuthorityMarker <> 'sqlite-v1') then
+    raise Exception.Create('unsupported SQLite registry authority marker: ' +
+      AuthorityMarker + ' (expected sqlite-v1)');
+  CutoverLockPath := '';
+  if FirstRegistry then
   begin
-    FRegistryRO := True;
-    FLog.Info('SQLite unavailable (' + FDb.Unavailable +
-      '): registries are READ-ONLY; the bus remains operational');
-    Writeln(StdErr, 'pizarra: WARNING - ', FDb.Unavailable,
-      ' -> registries are read-only');
-    Exit;
+    CutoverLockPath := IncludeTrailingPathDelimiter(FCfg.StoreDir) +
+      '.registry-cutover.lock';
+    CutoverLockFd := FpOpen(CutoverLockPath,
+      O_WRONLY or O_CREAT or O_EXCL or O_NOFOLLOW, &600);
+    if CutoverLockFd < 0 then
+      raise Exception.Create('cannot acquire exclusive SQLite cutover lock ' +
+        CutoverLockPath + ': ' + SysErrorMessage(fpgeterrno) +
+        '. Stop every other hub/migrator; remove a stale lock only after ' +
+        'confirming no cutover is running.');
+    FpClose(CutoverLockFd);
+  end;
+  try
+  HasExistingDb := FDb.QueryInt(F,
+    'SELECT COUNT(*) FROM sqlite_master WHERE type=''table'';') > 0;
+  F := FDb.AppsDb;
+  HasExistingDb := HasExistingDb or (FDb.QueryInt(F,
+    'SELECT COUNT(*) FROM sqlite_master WHERE type=''table'';') > 0);
+  F := FDb.WorkDb;
+  HasExistingDb := HasExistingDb or (FDb.QueryInt(F,
+    'SELECT COUNT(*) FROM sqlite_master WHERE type=''table'';') > 0);
+  if FirstRegistry and HasExistingDb then
+  begin
+    PrecutoverDir := IncludeTrailingPathDelimiter(FCfg.StoreDir) +
+      'backups/pre-registry-sqlite-' +
+      FormatDateTime('yyyymmdd-hhnnss', Now) + '-' + IntToStr(FpGetpid);
+    if not FDb.BackupTo(PrecutoverDir, Err) then
+      raise Exception.Create('could not create mandatory pre-cutover SQLite ' +
+        'backup: ' + Err);
+    FLog.Info('mandatory pre-cutover SQLite backup: ' + PrecutoverDir);
   end;
   if not FDb.EnsureSchema(Err) then
-  begin
-    FRegistryRO := True;
-    FLog.Info('SQLite: could not create schema (' + Err +
-      '); registries are read-only');
-    Exit;
-  end;
+    raise Exception.Create('SQLite registry schema failed: ' + Err);
   FLog.Info('SQLite ' + FDb.LibVersion + ': registries in ' + FDb.Dir);
-  F := FDb.AppsDb;
-  First := FDb.MetaGet(F, 'ini_migrated') = '';
+  F := FDb.WorkDb;
+  FirstTasks := FDb.MetaGet(F, 'ini_migrated') = '';
+  N := 0; NDocs := 0; NTk := 0; NNo := 0; NImp := 0;
 
   Names := TStringList.Create; Teams := TStringList.Create;
   Repos := TStringList.Create; Paths := TStringList.Create;
   Purposes := TStringList.Create; Details := TStringList.Create;
-  Docs := TStringList.Create; TeamRows := TStringList.Create;
+  Docs := TStringList.Create; DocPresent := TStringList.Create;
+  TeamRows := TStringList.Create;
   GroupRows := TStringList.Create; ProjectRows := TStringList.Create;
   TaskRows := TStringList.Create; NoteRows := TStringList.Create;
+  Keys := TStringList.Create; Relations := TStringList.Create;
+  Ini := nil;
   try
-    for i := 0 to High(FCfg.Apps) do
+    if FirstRegistry then
     begin
-      Names.Add(FCfg.Apps[i].Name);
-      Teams.Add(FCfg.Apps[i].Team);
-      Repos.Add(Fld(FCfg.Apps[i].Repo));
-      Paths.Add(Fld(FCfg.Apps[i].Path));
-      Purposes.Add(Fld(FCfg.Apps[i].Purpose));
-      Details.Add(Fld(FCfg.Apps[i].Detail));
-      Doc := ReadAppDoc(FCfg, FCfg.Apps[i].Name);
-      Docs.Add(Doc);
-    end;
-    for i := 0 to High(FCfg.Teams) do
-      TeamRows.Add(TeamRowDb(FCfg.Teams[i]));
-    for i := 0 to High(FCfg.Groups) do
-    begin
-      Row := '';
-      for j := 0 to High(FCfg.Groups[i].Members) do
+      ExistingCfg := FCfg;
+      if not FDb.LoadRegistry(ExistingCfg, Err) then
+        raise Exception.Create('could not inspect existing SQLite registry ' +
+          'before cutover: ' + Err);
+      if not CutoverCompatible(FCfg, ExistingCfg, False, Err) then
+        raise Exception.Create('SQLite cutover conflict: ' + Err +
+          '. No legacy values were applied; reconcile the two sources ' +
+          'explicitly instead of allowing an automatic overwrite.');
+      for i := 0 to High(FCfg.Apps) do
       begin
-        if Row <> '' then
-          Row := Row + ',';
-        Row := Row + FCfg.Groups[i].Members[j];
+        Names.Add(FCfg.Apps[i].Name);
+        Teams.Add(FCfg.Apps[i].Team);
+        Repos.Add(FCfg.Apps[i].Repo);
+        Paths.Add(FCfg.Apps[i].Path);
+        Purposes.Add(FCfg.Apps[i].Purpose);
+        Details.Add(FCfg.Apps[i].Detail);
+        if not ReadLegacyAppDoc(FCfg, FCfg.Apps[i].Name, HasLegacyDoc,
+          Doc, Err) then
+          raise Exception.Create('cannot preserve legacy manual for app "' +
+            FCfg.Apps[i].Name + '": ' + Err);
+        Docs.Add(Doc);
+        DocPresent.Add(BoolToStr(HasLegacyDoc, '1', '0'));
       end;
-      GroupRows.Add(FCfg.Groups[i].Name + #1 + FCfg.Groups[i].Project + #1 +
-        FCfg.Groups[i].Boss + #1 + Row);
-    end;
-    for i := 0 to High(FCfg.Projects) do
-      ProjectRows.Add(FCfg.Projects[i].Name + #1 + FCfg.Projects[i].Boss);
-    Tasks := FTasks.List('all', '');
-    for i := 0 to High(Tasks) do
-    begin
-      TaskRows.Add(IntToStr(Tasks[i].Id) + #1 + Fld(Tasks[i].Title) + #1 +
-        Tasks[i].Team + #1 + Tasks[i].StateS + #1 + Fld(Tasks[i].Hito) + #1 +
-        IntToStr(Tasks[i].Parent) + #1 + Tasks[i].Created + #1 +
-        Tasks[i].Closed);
-      for j := 0 to High(Tasks[i].Notes) do
-        NoteRows.Add(IntToStr(Tasks[i].Id) + #1 + Tasks[i].Notes[j].Ts + #1 +
-          Tasks[i].Notes[j].By + #1 + Fld(Tasks[i].Notes[j].Text));
+      for i := 0 to High(FCfg.Teams) do
+        TeamRows.Add(TeamRowDb(FCfg.Teams[i]));
+      for i := 0 to High(FCfg.Groups) do
+      begin
+        Row := FCfg.Groups[i].Name + #1 + FCfg.Groups[i].Project + #1 +
+          FCfg.Groups[i].Boss + #1 + Csv(FCfg.Groups[i].Members) + #1 +
+          Csv(FCfg.Groups[i].Excluded) + #1 + Fld(FCfg.Groups[i].OnIdle) + #1 +
+          Fld(FCfg.Groups[i].OnIdleMsg) + #1 + Fld(FCfg.Groups[i].OnIdleFrom) +
+          #1 + Fld(FCfg.Groups[i].OnIdleReply) + #1 +
+          Fld(FCfg.Groups[i].HdrNote) + #1 + Fld(FCfg.Groups[i].OnBlock);
+        GroupRows.Add(Row);
+      end;
+      for i := 0 to High(FCfg.Projects) do
+        ProjectRows.Add(FCfg.Projects[i].Name + #1 + FCfg.Projects[i].Boss);
+
+      if not FDb.ImportMissing(Names, Teams, Repos, Paths, Purposes,
+        Details, TeamRows, GroupRows, ProjectRows, NImp, Err) then
+        raise Exception.Create('legacy INI registry import failed: ' + Err);
+      if not FDb.MigrateApps(Names, Teams, Repos, Paths, Purposes,
+        Details, Docs, DocPresent, N, NDocs, Err) then
+        raise Exception.Create('legacy application/manual import failed: ' + Err);
+
+      { The old projects= line was only a mirror; role.PROJECT carried the
+        relationship detail. Import the union before removing either section.
+        Existing DB-only pairs remain and an omitted role never erases one. }
+      Ini := OpenPrivateIniFile(FCfgPath);
+      Relations.CaseSensitive := False;
+      Relations.Sorted := True;
+      Relations.Duplicates := dupIgnore;
+      for i := 0 to High(FCfg.Apps) do
+      begin
+        Relations.Clear;
+        Parts := SplitList(FCfg.Apps[i].Projects);
+        for j := 0 to High(Parts) do
+          Relations.Add(Parts[j]);
+        Keys.Clear;
+        Sec := 'app:' + FCfg.Apps[i].Name;
+        Ini.ReadSection(Sec, Keys);
+        for j := 0 to Keys.Count - 1 do
+          if (Length(Keys[j]) > 5) and
+             SameText(Copy(Keys[j], 1, 5), 'role.') then
+            Relations.Add(Copy(Keys[j], 6, Length(Keys[j])));
+        for j := 0 to Relations.Count - 1 do
+        begin
+          Key := Relations[j];
+          F := FDb.OrgDb;
+          if FDb.QueryInt(F, 'SELECT COUNT(*) FROM project WHERE name=' +
+            Q(Key) + ';') = 0 then
+            raise Exception.Create(Format('legacy app %s references unknown ' +
+              'project %s; migration marker was not written',
+              [FCfg.Apps[i].Name, Key]));
+          Role := Ini.ReadString(Sec, 'role.' + Key, '');
+          F := FDb.OrgDb;
+          ExistingPair := FDb.QueryInt(F,
+            'SELECT COUNT(*) FROM app_project WHERE app=' +
+            Q(FCfg.Apps[i].Name) + ' AND project=' + Q(Key) + ';') > 0;
+          if ExistingPair then
+          begin
+            if (Role <> '') and
+               (FDb.QueryStr(F, 'SELECT role FROM app_project WHERE app=' +
+                 Q(FCfg.Apps[i].Name) + ' AND project=' + Q(Key) + ';') <>
+                 Role) then
+              raise Exception.Create('SQLite cutover conflict: role for app "' +
+                FCfg.Apps[i].Name + '" in project "' + Key +
+                '" differs between legacy INI and SQLite');
+            Continue;  { already preserved; do not add duplicate audit history }
+          end;
+          if not FDb.AppProjectSet(FCfg.Apps[i].Name, Key, Role,
+            'migration', Err) then
+            raise Exception.Create('legacy app/project import failed: ' + Err);
+        end;
+      end;
+      FreeAndNil(Ini);
     end;
 
-    { The INI remains the declarative source; manual edits take effect after a
-      restart. SQLite is the historical replica and manual store, so startup
-      reconciles it from the file and mutations update both stores. }
-    if not FDb.ImportMissing(Names, Teams, Repos, Paths, Purposes,
-      Details, TeamRows, GroupRows, ProjectRows, NImp, Err) then
+    if FirstTasks then
     begin
-      FLog.Info('INI import FAILED: ' + Err);
-      FRegistryRO := True;
-      Exit;
+      Tasks := FTasks.List('all', '');
+      for i := 0 to High(Tasks) do
+      begin
+        TaskRows.Add(IntToStr(Tasks[i].Id) + #1 + Fld(Tasks[i].Title) + #1 +
+          Fld(Tasks[i].Team) + #1 + Fld(Tasks[i].StateS) + #1 +
+          Fld(Tasks[i].Hito) + #1 + IntToStr(Tasks[i].Parent) + #1 +
+          Fld(Tasks[i].Created) + #1 + Fld(Tasks[i].Closed));
+        for j := 0 to High(Tasks[i].Notes) do
+          NoteRows.Add(IntToStr(Tasks[i].Id) + #1 +
+            Fld(Tasks[i].Notes[j].Ts) + #1 + Fld(Tasks[i].Notes[j].By) + #1 +
+            Fld(Tasks[i].Notes[j].Text));
+      end;
+      if not FDb.MigrateTasks(TaskRows, NoteRows, NTk, NNo, Err) then
+        raise Exception.Create('legacy task import failed: ' + Err);
     end;
-    if (not First) and (NImp > 0) then
-      FLog.Info(Format('imported %d new INI entries', [NImp]));
-    if First and (not FDb.MigrateApps(Names, Teams, Repos, Paths, Purposes,
-      Details, Docs, N, NDocs, Err)) then
+
+    LoadedCfg := FCfg;
+    if not FDb.LoadRegistry(LoadedCfg, Err) then
+      raise Exception.Create('could not load authoritative registry: ' + Err);
+    if FirstRegistry and
+       (not CutoverCompatible(FCfg, LoadedCfg, True, Err)) then
+      raise Exception.Create('SQLite cutover verification failed: ' + Err +
+        '; migration marker was not written');
+    ValidateParents(LoadedCfg);
+    if not SecretsCoherent(LoadedCfg, Err) then
+      raise Exception.Create('authoritative registry credentials: ' + Err);
+    if FirstRegistry then
     begin
-      FLog.Info('manual migration FAILED: ' + Err);
-      FRegistryRO := True;
-      Exit;
+      { This marker is written LAST. Every preceding import is idempotent, so
+        an interrupted cutover simply retries without declaring a partial DB
+        authoritative. }
+      if not StripLegacyRegistryIni(FCfgPath, ConfigBackup, Err) then
+        raise Exception.Create('could not reduce pizarra.conf to bootstrap ' +
+          'configuration: ' + Err);
+      F := FDb.OrgDb;
+      if not FDb.MetaSet(F, 'registry_authority', 'sqlite-v1', Err) then
+        raise Exception.Create('could not commit SQLite registry authority: ' + Err);
+      FLog.Info(Format('SQLite registry cutover verified: %d teams, %d groups, ' +
+        '%d projects, %d apps (%d legacy rows reconciled)',
+        [Length(LoadedCfg.Teams), Length(LoadedCfg.Groups),
+         Length(LoadedCfg.Projects), Length(LoadedCfg.Apps), NImp]));
+      if ConfigBackup <> '' then
+        FLog.Info('legacy registry INI preserved at ' + ConfigBackup);
     end;
-    if First and (not FDb.MigrateTasks(TaskRows, NoteRows, NTk, NNo, Err)) then
-    begin
-      FLog.Info('task migration FAILED: ' + Err);
-      FRegistryRO := True;
-      Exit;
-    end;
-    if not First then
-      Exit;   { already synchronized; the initial import was completed }
-    { Preserve the actual INI before the first database import. }
-    CopyFileTo(FCfgPath, FCfgPath + '.pre-sqlite.' +
-      FormatDateTime('yyyymmdd-hhnnss', Now) + '.bak');
-    F := FDb.AppsDb; FDb.MetaSet(F, 'ini_migrated', NowStampDb, Err);
-    F := FDb.OrgDb;  FDb.MetaSet(F, 'ini_migrated', NowStampDb, Err);
-    F := FDb.WorkDb; FDb.MetaSet(F, 'ini_migrated', NowStampDb, Err);
-    FLog.Info(Format('SQLite migration: %d apps (%d manuals), %d teams, ' +
-      '%d groups, %d projects, %d tasks (%d notes). Original files remain ' +
-      'unchanged.', [N, NDocs, Length(FCfg.Teams),
-      Length(FCfg.Groups), Length(FCfg.Projects), NTk, NNo]));
+    FCfg := LoadedCfg;
   finally
+    Ini.Free;
     Names.Free; Teams.Free; Repos.Free; Paths.Free; Purposes.Free;
-    Details.Free; Docs.Free; TeamRows.Free; GroupRows.Free; ProjectRows.Free;
-    TaskRows.Free; NoteRows.Free;
+    Details.Free; Docs.Free; DocPresent.Free; TeamRows.Free;
+    GroupRows.Free; ProjectRows.Free;
+    TaskRows.Free; NoteRows.Free; Keys.Free; Relations.Free;
   end;
-end;
-
-{ Find the newest backup for an unreadable-configuration recovery hint. }
-{ Failure to update the SQLite replica is not mutation failure: by this point
-  memory and the declarative INI are already durable. Log the divergence so
-  operators know that backups or history may lag; startup will reconcile the
-  replica from the INI. }
-procedure TPizarra.LogDbDivergence(const What, Err: string);
-begin
-  FLog.Info(Format('sqlite replica BEHIND on %s: %s ' +
-    '(the change IS in memory and in pizarra.conf; the next start ' +
-    'reconciles the database from the INI)', [What, Err]));
+  finally
+    if CutoverLockPath <> '' then
+      DeleteFile(CutoverLockPath);
+  end;
 end;
 
 var
@@ -862,9 +1170,10 @@ end;
 constructor TPizarra.Create(const ConfigPath: string);
 var
   i: Integer;
-  ErrS: string;
+  ErrS, LogDir: string;
 begin
   inherited Create;
+  FHubStoreLock := -1;
   FCfgPath := ExpandFileName(ConfigPath);
   FCfgLock := TCriticalSection.Create;
   FPutLock := TCriticalSection.Create;
@@ -876,11 +1185,19 @@ begin
   if FCfg.Secret = '' then
     raise Exception.Create('[server] secret is empty — refusing to start ' +
       '(set a shared secret in the config).' + LastBackupHint(FCfg.StoreDir));
-  { Reject incoherent team credentials before opening logs, stores, or sockets.
-    A credential equal to the global secret loses its binding; duplicates make
-    identity depend on file order. Diagnostics name teams, never secrets. }
-  if not SecretsCoherent(FCfg, ErrS) then
-    raise Exception.Create('config: ' + ErrS + ' — refusing to start.');
+  { Protect the state tree before TPzStore/TTaskStore/TWorkflowStore can create
+    files or subdirectories in it. FPC 3.2.2 ForceDirectories creates 0777
+    subject to umask; postponing this check until TPzDb made a first custom
+    start create 0755 state and then reject its own directory. }
+  if not EnsurePrivateRuntimeDir(FCfg.StoreDir, ErrS) then
+    raise Exception.Create('unsafe [store] dir: ' + ErrS);
+  if not PzAcquireHubStoreLock(FCfg.StoreDir, True, FHubStoreLock, ErrS) then
+    raise Exception.Create('cannot own [store] dir: ' + ErrS);
+  if Trim(FCfg.LogPath) = '' then
+    raise Exception.Create('[log] path must not be empty');
+  LogDir := ExtractFileDir(ExpandFileName(FCfg.LogPath));
+  if not EnsurePrivateRuntimeDir(LogDir, ErrS) then
+    raise Exception.Create('unsafe [log] directory: ' + ErrS);
   FLog := TPzLog.Create(FCfg.LogPath);
   FStore := TPzStore.Create(FCfg.StoreDir);
   FTasks := TTaskStore.Create(
@@ -888,8 +1205,12 @@ begin
   FWf := TWorkflowStore.Create(
     IncludeTrailingPathDelimiter(FCfg.StoreDir) + 'workflows.json', FTasks);
   OpenRegistryDb;
+  { Team credentials now come from the authoritative database, so coherence
+    must be checked AFTER the typed DB projection, never against legacy INI
+    migration input. Diagnostics name teams and never reveal secrets. }
+  if not SecretsCoherent(FCfg, ErrS) then
+    raise Exception.Create('registry: ' + ErrS + ' — refusing to start.');
   FTasks.SetDb(FDb);   { task mutations are historical from this point }
-  FillAppHasDoc;       { manuals live in the database, not loose files }
   FLock := TCriticalSection.Create;
   FWatchers := TThreadList.Create;
   FDialChannels := TThreadList.Create;
@@ -926,6 +1247,9 @@ begin
   FTasks.Free;
   FStore.Free;
   FLog.Free;
+  { Keep the ownership lock until SQLite, journals, tasks, and workflows have
+    all closed. Restore can acquire it only after every state handle is gone. }
+  PzReleaseHubStoreLock(FHubStoreLock);
   inherited Destroy;
 end;
 
@@ -1904,89 +2228,86 @@ begin
 end;
 
 
-{ The app MANUAL: a long-form document the responsible team writes and every
-  other team can read (inside or outside its group) — the point is to share
-  knowledge, so reading is never restricted. Multi-line text does not belong
-  in an INI, so it lives in <store>/appdocs/<name>.md. }
+{ Legacy application manuals predate app_doc. They are read exactly once during
+  cutover; current manuals and archived divergent versions both live in
+  org.sqlite afterwards. }
 function AppDocPath(const C: TPizarraConfig; const Name: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(C.StoreDir) + 'appdocs' +
     PathDelim + LowerCase(Name) + '.md';
 end;
 
-function ReadAppDoc(const C: TPizarraConfig; const Name: string): string;
+function ReadLegacyAppDoc(const C: TPizarraConfig; const Name: string;
+  out Present: Boolean; out Body, Err: string): Boolean;
 var
-  L: TStringList;
-begin
-  Result := '';
-  if not FileExists(AppDocPath(C, Name)) then
-    Exit;
-  L := TStringList.Create;
-  try
-    try
-      L.LoadFromFile(AppDocPath(C, Name));
-      Result := L.Text;
-    except
-      Result := '';
-    end;
-  finally
-    L.Free;
-  end;
-end;
-
-function WriteAppDoc(const C: TPizarraConfig; const Name, Text: string;
-  out Err: string): Boolean;
-var
-  L: TStringList;
-  Dir, Tmp: string;
+  F: TFileStream;
+  Path: string;
+  Size: Int64;
+  St: TStat;
 begin
   Result := False;
+  Present := False;
+  Body := '';
   Err := '';
-  Dir := IncludeTrailingPathDelimiter(C.StoreDir) + 'appdocs';
-  if not ForceDirectories(Dir) then
+  Path := AppDocPath(C, Name);
+  St := Default(TStat);
+  if FpLStat(Path, St) <> 0 then
   begin
-    Err := 'cannot create ' + Dir;
+    if fpgeterrno = ESysENOENT then
+      Exit(True);
+    Err := 'cannot inspect ' + Path + ': ' + SysErrorMessage(fpgeterrno);
     Exit;
   end;
-  L := TStringList.Create;
+  Present := True;
+  if fpS_ISLNK(St.st_mode) or (not fpS_ISREG(St.st_mode)) then
+  begin
+    Err := Path + ' is not a regular non-symlink file';
+    Exit;
+  end;
   try
-    L.Text := Text;
-    Tmp := AppDocPath(C, Name) + '.tmp';
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
     try
-      L.SaveToFile(Tmp);
-      if not RenameFile(Tmp, AppDocPath(C, Name)) then
+      Size := F.Size;
+      if Size > High(LongInt) then
       begin
-        Err := 'cannot replace the manual file';
-        DeleteFile(Tmp);
+        Err := Path + ' is too large to migrate safely';
         Exit;
       end;
+      SetLength(Body, Size);
+      if Size > 0 then
+        F.ReadBuffer(Body[1], LongInt(Size));
       Result := True;
+    finally
+      F.Free;
+    end;
     except
       on E: Exception do
+      begin
+        Body := '';
         Err := E.Message;
+      end;
     end;
-  finally
-    L.Free;
-  end;
 end;
 
-{ Serialize one team row in pzdb's #1-delimited format. }
-{ Separator #1 cannot occur in a free-text field. }
+{ Serialize one team row in pzdb's #1-delimited compatibility format. Every
+  text field uses reversible framing; prompts and launch commands keep control
+  bytes and newlines exactly. }
 function RowFld(const S: string): string;
 begin
-  Result := StringReplace(StringReplace(S, #1, ' ', [rfReplaceAll]),
-    #10, ' ', [rfReplaceAll]);
+  Result := RowFieldEncode(S);
 end;
 
 { The single team-row serializer. Keeping one constructor prevents schema
   additions from producing differently shaped startup and runtime rows. }
 function TeamRowDb(const T: TTeam): string;
 begin
-  Result := IntToStr(T.Id) + #1 + T.Name + #1 + RowFld(T.Speciality) + #1 +
-    RowFld(T.Prompt) + #1 + T.Parent + #1 + T.Project + #1 + T.Secret + #1 +
-    T.Host + #1 + IntToStr(T.Port) + #1 + IntToStr(Ord(T.Dial)) + #1 +
-    T.TmuxSession + #1 + RowFld(T.Launch) + #1 + T.User + #1 +
-    IntToStr(Ord(T.Slave)) + #1 + RowFld(T.Workdir);
+  Result := IntToStr(T.Id) + #1 + RowFld(T.Name) + #1 +
+    RowFld(T.Speciality) + #1 + RowFld(T.Prompt) + #1 + RowFld(T.Parent) + #1 +
+    RowFld(T.Project) + #1 + RowFld(T.Secret) + #1 + RowFld(T.Host) + #1 +
+    IntToStr(T.Port) + #1 + IntToStr(Ord(T.Dial)) + #1 +
+    RowFld(T.TmuxSession) + #1 + RowFld(T.Launch) + #1 + RowFld(T.User) + #1 +
+    IntToStr(Ord(T.Slave)) + #1 + RowFld(T.Workdir) + #1 +
+    RowFld(T.Delegate) + #1 + IntToStr(Ord(T.HoldBlocked));
 end;
 
 { Serialize group members as a comma-separated list. }
@@ -2174,6 +2495,33 @@ var
     end;
   end;
 
+  function SyncPath(const P: string; IsDir: Boolean; out Why: string): Boolean;
+  var
+    H, Flags: Integer;
+  begin
+    Result := False;
+    Flags := O_RDONLY;
+    if IsDir then
+      Flags := Flags or O_DIRECTORY;
+    H := FpOpen(P, Flags);
+    if H < 0 then
+    begin
+      Why := 'cannot open ' + P + ' for fsync: ' +
+        SysErrorMessage(fpgeterrno);
+      Exit;
+    end;
+    try
+      if PzFsync(H) <> 0 then
+      begin
+        Why := 'cannot fsync ' + P + ': ' + SysErrorMessage(fpgeterrno);
+        Exit;
+      end;
+    finally
+      FpClose(H);
+    end;
+    Result := True;
+  end;
+
   { Copy one included store file and record its size and SHA-256. }
   procedure Take(const RelPath: string);
   var
@@ -2183,11 +2531,14 @@ var
     if not FileExists(Src) then
       Exit;
     Dst := IncludeTrailingPathDelimiter(Tmp) + 'store' + PathDelim + RelPath;
-    ForceDirectories(ExtractFileDir(Dst));
-    CopyFileTo(Src, Dst);
-    if Sha256OfFile(Dst, Hex) then
-      SB.Add(Format('store/%s  %d  %s',
-        [RelPath, FileBytes(Dst), Hex]));
+    if not ForceDirectories(ExtractFileDir(Dst)) then
+      raise EInOutError.Create('cannot create backup subdirectory for ' + Dst);
+    if not CopyFileTo(Src, Dst, Err) then
+      raise EInOutError.Create('cannot copy ' + RelPath + ': ' + Err);
+    if not Sha256OfFile(Dst, Hex) then
+      raise EInOutError.Create('cannot hash copied file ' + Dst);
+    SB.Add(Format('store/%s  %d  %s',
+      [RelPath, FileBytes(Dst), Hex]));
     Inc(Total);
   end;
 
@@ -2221,66 +2572,110 @@ begin
       'accept the risk)'));
     Exit;
   end;
-  Stamp := FormatDateTime('yyyymmdd-hhnnss', Now);
+  Stamp := FormatDateTime('yyyymmdd-hhnnss', Now) + '-' + IntToStr(FpGetpid);
   Dir := IncludeTrailingPathDelimiter(Base) + 'pizarra-' + Stamp;
   Tmp := Dir + '.partial';
-  if not ForceDirectories(Tmp) then
+  if not EnsurePrivateRuntimeDir(Tmp, Err) then
   begin
-    WriteLine(Data, ReplyErr('cannot create ' + Tmp));
+    WriteLine(Data, ReplyErr('cannot create private backup directory ' + Tmp +
+      ': ' + Err));
     Exit;
   end;
   SB := TStringList.Create;
   try
-    Total := 0;
-    SB.Add('# pizarra backup ' + PizarraVersion + '  ' +
-      FormatDateTime('yyyy-mm-dd hh:nn:ss', Now));
-    SB.Add('# SCOPE: core operational state; excludes wfhistory/ and legacy appdocs');
-    SB.Add('# CONTAINS SECRETS: protect it as a credential');
-    SB.Add('# file  bytes  sha256');
-    if not FDb.BackupTo(Tmp, Err) then
-    begin
-      WriteLine(Data, ReplyErr('database copy failed: ' + Err));
-      Exit;
-    end;
-    for i := 0 to 2 do
-    begin
-      case i of
-        0: Err := 'apps.sqlite';
-        1: Err := 'org.sqlite';
-      else
-        Err := 'work.sqlite';
+    try
+      Total := 0;
+      SB.Add('# pizarra backup ' + PizarraVersion + '  ' +
+        FormatDateTime('yyyy-mm-dd hh:nn:ss', Now));
+      SB.Add('# SCOPE: core operational state; excludes wfhistory/, legacy appdocs, releases, and shared/NFS content');
+      SB.Add('# CONTAINS SECRETS: protect it as a credential');
+      SB.Add('# file  bytes  sha256');
+      { One linearization barrier for every piece that participates in restore.
+        Lock order is the program's established order:
+          config -> workflow -> tasks -> message store -> SQLite.
+        Workflow already nests tasks; tasks already nests SQLite; there is no
+        reverse path. Without this barrier the manifest could certify a task
+        JSON newer than work.sqlite or state.json newer than messages.jsonl. }
+      FCfgLock.Enter;
+      try
+        FWf.LockForSnapshot;
+        try
+          FTasks.LockForSnapshot;
+          try
+            FStore.LockForSnapshot;
+            try
+              if not FDb.BackupTo(Tmp, Err) then
+                raise EInOutError.Create('database copy failed: ' + Err);
+              for i := 0 to 2 do
+              begin
+                case i of
+                  0: Err := 'apps.sqlite';
+                  1: Err := 'org.sqlite';
+                else
+                  Err := 'work.sqlite';
+                end;
+                if not Sha256OfFile(IncludeTrailingPathDelimiter(Tmp) + Err,
+                  Manifest) then
+                  raise EInOutError.Create('cannot hash mandatory database ' + Err);
+                SB.Add(Format('%s  %d  %s', [Err,
+                  FileBytes(IncludeTrailingPathDelimiter(Tmp) + Err), Manifest]));
+                Inc(Total);
+              end;
+              Take('messages.jsonl');
+              Take('state.json');
+              Take('tareas.json');
+              Take('workflows.json');
+              { Configuration is mandatory and carries the bus secret. }
+              Err := IncludeTrailingPathDelimiter(Tmp) + 'pizarra.conf';
+              if not CopyFileTo(FCfgPath, Err, Manifest) then
+                raise EInOutError.Create('configuration copy failed: ' + Manifest);
+              if not Sha256OfFile(Err, Manifest) then
+                raise EInOutError.Create('cannot hash mandatory pizarra.conf');
+              SB.Add(Format('pizarra.conf  %d  %s', [FileBytes(Err), Manifest]));
+              Inc(Total);
+            finally
+              FStore.UnlockForSnapshot;
+            end;
+          finally
+            FTasks.UnlockForSnapshot;
+          end;
+        finally
+          FWf.UnlockForSnapshot;
+        end;
+      finally
+        FCfgLock.Leave;
       end;
-      if Sha256OfFile(IncludeTrailingPathDelimiter(Tmp) + Err, Manifest) then
-        SB.Add(Format('%s  %d  %s', [Err,
-          FileBytes(IncludeTrailingPathDelimiter(Tmp) + Err), Manifest]));
-      Inc(Total);
+      Err := IncludeTrailingPathDelimiter(Tmp) + 'MANIFEST';
+      SB.SaveToFile(Err);
+      if FpChmod(Err, &600) <> 0 then
+        raise EInOutError.Create('cannot protect backup MANIFEST');
+      if not SyncPath(Err, False, Manifest) then
+        raise EInOutError.Create(Manifest);
+      if FpChmod(Tmp, &700) <> 0 then
+        raise EInOutError.Create('cannot protect partial backup directory');
+      { Every file is durable now; persist the directory entries that name
+        store/* and the top-level config/MANIFEST before publishing Tmp. }
+      Err := IncludeTrailingPathDelimiter(Tmp) + 'store';
+      if DirectoryExists(Err) and (not SyncPath(Err, True, Manifest)) then
+        raise EInOutError.Create(Manifest);
+      if not SyncPath(Tmp, True, Manifest) then
+        raise EInOutError.Create(Manifest);
+      if not RenameFile(Tmp, Dir) then
+        raise EInOutError.Create('could not finish the backup in ' + Dir);
+      if FpChmod(Dir, &700) <> 0 then
+        raise EInOutError.Create('could not protect completed backup ' + Dir);
+      if not SyncPath(Base, True, Manifest) then
+        raise EInOutError.Create(Manifest);
+      FLog.Info(Format('core-state backup complete in %s (%d pieces)', [Dir, Total]));
+      WriteLine(Data, ReplyTree(Format('core-state backup complete: %s'#10 +
+        '  %d pieces, SHA-256 manifest in MANIFEST'#10 +
+        '  excludes wfhistory/, legacy appdocs, releases, and shared/NFS content'#10 +
+        '  CONTAINS SECRETS: protect it as a credential (mode 0700)'#10 +
+        '  verify: tiza backup verify %s', [Dir, Total, Dir])));
+    except
+      on E: Exception do
+        WriteLine(Data, ReplyErr('backup incomplete: ' + E.Message));
     end;
-    Take('messages.jsonl');
-    Take('state.json');
-    Take('tareas.json');
-    Take('workflows.json');
-    { Configuration is included and carries the bus secret. }
-    CopyFileTo(FCfgPath, IncludeTrailingPathDelimiter(Tmp) + 'pizarra.conf');
-    if Sha256OfFile(IncludeTrailingPathDelimiter(Tmp) + 'pizarra.conf',
-      Manifest) then
-      SB.Add(Format('pizarra.conf  %d  %s',
-        [FileBytes(IncludeTrailingPathDelimiter(Tmp) + 'pizarra.conf'),
-         Manifest]));
-    Inc(Total);
-    SB.SaveToFile(IncludeTrailingPathDelimiter(Tmp) + 'MANIFEST');
-    FpChmod(Tmp, &700);
-    if not RenameFile(Tmp, Dir) then
-    begin
-      WriteLine(Data, ReplyErr('could not finish the backup in ' + Dir));
-      Exit;
-    end;
-    FpChmod(Dir, &700);
-    FLog.Info(Format('core-state backup complete in %s (%d pieces)', [Dir, Total]));
-    WriteLine(Data, ReplyTree(Format('core-state backup complete: %s'#10 +
-      '  %d pieces, SHA-256 manifest in MANIFEST'#10 +
-      '  scope excludes wfhistory/ snapshots and legacy appdocs'#10 +
-      '  CONTAINS SECRETS: protect it as a credential (mode 0700)'#10 +
-      '  verify: tiza backup verify %s', [Dir, Total, Dir])));
   finally
     SB.Free;
   end;
@@ -2294,8 +2689,12 @@ var
   i, t: Integer;
   idx: Integer;
 begin
-  Rows_ := FDb.ProjectsOfApp(AppName);
+  Rows_ := nil;
+  FCfgLock.Enter;
   try
+    { Keep the documented lock order FCfgLock -> SQLite. The projection is
+      published in memory only; pizarra.conf is no longer a registry mirror. }
+    Rows_ := FDb.ProjectsOfApp(AppName);
     ProjectList := '';
     if Rows_ <> nil then
       for i := 0 to Rows_.Count - 1 do
@@ -2308,28 +2707,18 @@ begin
         else
           ProjectList := ProjectList + Rows_[i];
       end;
-    FCfgLock.Enter;
-    try
-      idx := -1;
-      for i := 0 to High(FCfg.Apps) do
-        if SameText(FCfg.Apps[i].Name, AppName) then
-          idx := i;
-      if idx < 0 then
-        Exit;
-      { copy-on-write, like every other config mutation: SetLength may
-        reallocate, so an in-place append is not safe while readers hold a
-        snapshot }
-      NewApps := Copy(FCfg.Apps);
-      NewApps[idx].Projects := ProjectList;
-      { persist BEFORE publishing: a header that names a project the file does
-        not carry would go back to being a lie on the next restart }
-      SaveAppIni(FCfgPath, NewApps[idx], Rows_);
-      FCfg.Apps := NewApps;
-    finally
-      FCfgLock.Leave;
-    end;
+    idx := -1;
+    for i := 0 to High(FCfg.Apps) do
+      if SameText(FCfg.Apps[i].Name, AppName) then
+        idx := i;
+    if idx < 0 then
+      Exit;
+    NewApps := Copy(FCfg.Apps);
+    NewApps[idx].Projects := ProjectList;
+    FCfg.Apps := NewApps;
   finally
     Rows_.Free;
+    FCfgLock.Leave;
   end;
 end;
 
@@ -2433,6 +2822,7 @@ begin
         Fl.DelimitedText := R[i];
         while Fl.Count < 7 do
           Fl.Add('');
+        DecodeRowFields(Fl, [0, 1, 2, 3, 4, 5, 6]);
         if Fl[4] = '' then
           Txt := Txt + Format('snap %-4s %s  %-10s %s'#10,
             [Fl[0], Fl[1], Fl[2], Fl[3]])
@@ -2473,6 +2863,7 @@ begin
       Fl.DelimitedText := Txt;
       while Fl.Count < 8 do
         Fl.Add('');
+      DecodeRowFields(Fl, [0, 1, 2, 3, 4, 5, 6, 7]);
       { A snapshot belongs to exactly one named application. Snapshot numbers
         come from a global sequence, so verify the stored subject before
         re-entering the undo operation. }
@@ -2535,6 +2926,7 @@ begin
           when a field begins with a double quote. }
         Fl.QuoteChar := #0;
         Fl.DelimitedText := Txt;
+        DecodeRowFields(Fl, [0, 1, 2, 3, 4, 5, 6, 7]);
         if (Fl.Count >= 8) and (Fl[0] = 'appdoc') then
           Txt := Fl[7]
         else
@@ -2569,15 +2961,28 @@ begin
         ') may write this manual'));
       Exit;
     end;
-    if not FDb.AppSetDoc(Name, Obj.Get('text', ''), From,
-      FDb.AppDoc(Name), Txt) then
-    begin
-      WriteLine(Data, ReplyErr('manual not saved: ' + Txt));
-      Exit;
-    end;
-    { Readers use live memory, so publish the new manual flag immediately. }
     FCfgLock.Enter;
     try
+      { Recheck ownership under the same outer lock that serializes the SQLite
+        transaction; a concurrent reassignment cannot authorize a stale owner. }
+      if not FindApp(FCfg, Name, A) then
+      begin
+        WriteLine(Data, ReplyErr('unknown app: ' + Name));
+        Exit;
+      end;
+      if (not SameText(From, 'console')) and
+         (not TeamDelegated(FCfg, From, 'app')) and
+         (not SameText(A.Team, From)) then
+      begin
+        WriteLine(Data, ReplyErr('application ownership changed; manual not saved'));
+        Exit;
+      end;
+      if not FDb.AppSetDoc(Name, Obj.Get('text', ''), From,
+        FDb.AppDoc(Name), Txt) then
+      begin
+        WriteLine(Data, ReplyErr('manual not saved: ' + Txt));
+        Exit;
+      end;
       NewCfg := FCfg;
       NewCfg.Apps := Copy(FCfg.Apps, 0, Length(FCfg.Apps));
       for i := 0 to High(NewCfg.Apps) do
@@ -2642,7 +3047,7 @@ begin
     { Assignment requires an existing project and reports a clear error before
       the foreign-key check. Removal instead validates the relationship itself,
       allowing stale database links left by declarative INI edits to be cleaned. }
-    if not FindProject(FCfg, Prj, Prj_) then
+    if not FindProject(C, Prj, Prj_) then
     begin
       if Op = 'project' then
       begin
@@ -2653,11 +3058,29 @@ begin
     end;
     if Op = 'project' then
     begin
-      if not FDb.AppProjectSet(Old.Name, Prj_.Name,
-        Trim(Obj.Get('role', '')), From, DbErr) then
-      begin
-        WriteLine(Data, ReplyErr('could not assign: ' + DbErr));
-        Exit;
+      FCfgLock.Enter;
+      try
+        if (not FindApp(FCfg, Old.Name, A)) or
+           ((not SameText(From, 'console')) and
+            (not TeamDelegated(FCfg, From, 'app')) and
+            (not SameText(A.Team, From))) then
+        begin
+          WriteLine(Data, ReplyErr('application ownership changed; nothing assigned'));
+          Exit;
+        end;
+        if not FindProject(FCfg, Prj_.Name, Prj_) then
+        begin
+          WriteLine(Data, ReplyErr('project was removed; nothing assigned'));
+          Exit;
+        end;
+        if not FDb.AppProjectSet(Old.Name, Prj_.Name,
+          Trim(Obj.Get('role', '')), From, DbErr) then
+        begin
+          WriteLine(Data, ReplyErr('could not assign: ' + DbErr));
+          Exit;
+        end;
+      finally
+        FCfgLock.Leave;
       end;
       MirrorAppProjects(Old.Name);
       WriteLine(Data, ReplyOkNote(Format('app %s assigned to project %s (by %s)',
@@ -2665,10 +3088,23 @@ begin
     end
     else
     begin
-      if not FDb.AppProjectClear(Old.Name, Prj_.Name, From, DbErr) then
-      begin
-        WriteLine(Data, ReplyErr('could not unassign: ' + DbErr));
-        Exit;
+      FCfgLock.Enter;
+      try
+        if (not FindApp(FCfg, Old.Name, A)) or
+           ((not SameText(From, 'console')) and
+            (not TeamDelegated(FCfg, From, 'app')) and
+            (not SameText(A.Team, From))) then
+        begin
+          WriteLine(Data, ReplyErr('application ownership changed; nothing unassigned'));
+          Exit;
+        end;
+        if not FDb.AppProjectClear(Old.Name, Prj_.Name, From, DbErr) then
+        begin
+          WriteLine(Data, ReplyErr('could not unassign: ' + DbErr));
+          Exit;
+        end;
+      finally
+        FCfgLock.Leave;
       end;
       MirrorAppProjects(Old.Name);
       WriteLine(Data, ReplyOkNote(Format('app %s no longer in project %s (by %s)',
@@ -2693,11 +3129,11 @@ begin
        SameText(Name, 'list') or SameText(Name, 'show') or
        SameText(Name, 'doc') or SameText(Name, 'setdoc') or
        SameText(Name, 'project') or SameText(Name, 'unproject') then
-    begin
-      WriteLine(Data, ReplyErr(
-        'invalid app name (unsafe, or clashes with an app subcommand): ' + Name));
-      Exit;
-    end;
+      begin
+        WriteLine(Data, ReplyErr(
+          'invalid app name (unsafe, or clashes with an app subcommand): ' + Name));
+        Exit;
+      end;
     A := Default(TApp);
     A.Name    := Name;
     A.Team    := Trim(Obj.Get('team', ''));
@@ -2799,12 +3235,13 @@ begin
           'only the console or the responsible team may remove this app'));
         Exit;
       end;
-      { Memory and the declarative INI are already committed here. A replica
-        failure is logged without changing the successful response; startup
-        reconciles it. The manual is removed by the foreign-key cascade. }
-      DeleteAppIni(FCfgPath, Name);
+      { SQLite is authoritative. The manual and project links follow the app
+        through foreign-key cascades; publish memory only after COMMIT. }
       if not FDb.AppRemove(Name, From, AppRowJson(NewCfg.Apps[idx]), DbErr) then
-        LogDbDivergence('AppRemove', DbErr);
+      begin
+        WriteLine(Data, ReplyErr('app not removed: ' + DbErr));
+        Exit;
+      end;
       for i := idx to High(NewCfg.Apps) - 1 do
         NewCfg.Apps[i] := NewCfg.Apps[i + 1];
       SetLength(NewCfg.Apps, Length(NewCfg.Apps) - 1);
@@ -2822,10 +3259,12 @@ begin
         OldRow := AppRowJson(NewCfg.Apps[idx]);
         A.HasDoc := NewCfg.Apps[idx].HasDoc;   { leave the manual unchanged }
       end;
-      SaveAppIni(FCfgPath, A);
       if not FDb.AppUpsert(A.Name, A.Team, A.Repo, A.Path, A.Purpose,
         A.Detail, From, OldRow = '', OldRow, Field, ChOld, Value, DbErr) then
-        LogDbDivergence('AppUpsert', DbErr);
+      begin
+        WriteLine(Data, ReplyErr('app not saved: ' + DbErr));
+        Exit;
+      end;
       NewCfg.Apps[idx] := A;
     end;
     FCfg := NewCfg;
@@ -3092,9 +3531,8 @@ var
     if not FindTeam(C, Requested, T) then
       RejectTeam(Requested, 'not a hub team')
     else if not T.Dial then
-      RejectTeam(T.Name, 'not dial=on in the hub config (add dial=on to ' +
-        '[team:N] in pizarra.conf and restart the hub; tiza team set ' +
-        'cannot change it)')
+      RejectTeam(T.Name, 'not dial=on in the SQLite registry (from the real ' +
+        'console run: tiza team set ' + T.Name + ' dial on)')
     else if not ClaimLocked(L, T.Name, From, Holder) then
       RejectTeam(T.Name, 'already served by a dial channel from=' + Holder)
     else
@@ -3257,53 +3695,125 @@ begin
   end;
 end;
 
-{ Create the shared exchange directories (root + one per team + console/)
-  with mode 1777: world-writable, sticky bit — a team can delete only its
-  own uploads. Called at startup and every watchdog tick (the NFS mount may
-  appear late) and after /team add. Never fatal. }
+{ Create one directory per team plus console/ with mode 1777: world-writable,
+  sticky bit — a team can delete only its own uploads. The configured root is
+  an operator-owned mount: NEVER create or chmod it. If it is absent (for
+  example, NFS is not mounted), leave it untouched and retry on the next
+  watchdog tick. Called at startup, on each tick, and after /team add. Never
+  fatal. }
 procedure TPizarra.EnsureSharedDirs;
 var
   C: TPizarraConfig;
-  i: Integer;
+  i, RootFd: Integer;
+  DescriptorRoot: string;
 
   procedure MkDir1777(const P: string);
+  var
+    St: TStat;
+    DirFd, OpenFlags: Integer;
   begin
-    if not DirectoryExists(P) then
-      if not ForceDirectories(P) then
+    { One level only. ForceDirectories could recreate a missing mount root
+      locally after an NFS outage or a check/create race. EEXIST is resolved by
+      the descriptor open below, which rejects links and non-directories. }
+    if FpMkDir(P, &1777) <> 0 then
+      if fpgeterrno <> ESysEEXIST then
         Exit;
-    FpChmod(P, &1777);
+    OpenFlags := O_RDONLY or O_DIRECTORY or O_NOFOLLOW;
+    {$IFDEF LINUX}OpenFlags := OpenFlags or O_CLOEXEC;{$ENDIF}
+    repeat
+      DirFd := FpOpen(P, OpenFlags);
+    until (DirFd >= 0) or (fpgeterrno <> ESysEINTR);
+    if DirFd < 0 then
+      Exit;
+    try
+      St := Default(TStat);
+      if (FpFStat(DirFd, St) <> 0) or (not fpS_ISDIR(St.st_mode)) then
+        Exit;
+      { fchmod the pinned inode: lstat(P) followed by chmod(P) could be
+        redirected to a symlink inserted between those two calls. }
+      C_FChmod(DirFd, &1777);
+    finally
+      FpClose(DirFd);
+    end;
+  end;
+
+  function WriteAll(Fd: Integer; const S: string): Boolean;
+  var
+    Done: SizeInt;
+    N: TSSize;
+  begin
+    Result := False;
+    Done := 0;
+    while Done < Length(S) do
+    begin
+      repeat
+        N := FpWrite(Fd, S[Done + 1], Length(S) - Done);
+      until (N >= 0) or (fpgeterrno <> ESysEINTR);
+      if N <= 0 then
+        Exit;
+      Inc(Done, N);
+    end;
+    Result := True;
   end;
 
 var
-  FS: TFileStream;
   Txt, ManualPath: string;
+  RootStat: TStat;
+  ManualFd, ManualFlags: Integer;
+  ManualOk: Boolean;
 begin
   C := Snap;
   if C.SharedDir = '' then
     Exit;
+  { Defense in depth: the loader rejects root. More importantly, opening the
+    operator-created mount directory pins it without following a final symlink.
+    We never ForceDirectories or chmod this configured root. }
+  if C.SharedDir = PathDelim then
+    Exit;
+  ManualFlags := O_RDONLY or O_DIRECTORY or O_NOFOLLOW;
+  {$IFDEF LINUX}ManualFlags := ManualFlags or O_CLOEXEC;{$ENDIF}
+  repeat
+    RootFd := FpOpen(C.SharedDir, ManualFlags);
+  until (RootFd >= 0) or (fpgeterrno <> ESysEINTR);
+  if RootFd < 0 then
+    Exit;
   try
-    MkDir1777(C.SharedDir);
-    MkDir1777(C.SharedDir + '/console');
+    try
+    RootStat := Default(TStat);
+    if (FpFStat(RootFd, RootStat) <> 0) or
+       (not fpS_ISDIR(RootStat.st_mode)) then
+      Exit;
+    DescriptorRoot := '/proc/self/fd/' + IntToStr(RootFd);
+    MkDir1777(DescriptorRoot + '/console');
     for i := 0 to High(C.Teams) do
-      MkDir1777(C.SharedDir + '/' + LowerCase(C.Teams[i].Name));
+      MkDir1777(DescriptorRoot + '/' + LowerCase(C.Teams[i].Name));
     { the onboarding manual a cold-start agent reads first (header points
       at it); rewritten whenever missing, so it survives NFS wipes and
       updates on hub restarts (startup deletes it first) }
-    ManualPath := C.SharedDir + '/' + SHARED_MANUAL;
-    if not FileExists(ManualPath) then
+    ManualPath := DescriptorRoot + '/' + SHARED_MANUAL;
+    ManualFlags := O_WRONLY or O_CREAT or O_EXCL or O_NOFOLLOW;
+    {$IFDEF LINUX}ManualFlags := ManualFlags or O_CLOEXEC;{$ENDIF}
+    repeat
+      ManualFd := FpOpen(ManualPath, ManualFlags, &600);
+    until (ManualFd >= 0) or (fpgeterrno <> ESysEINTR);
+    if ManualFd >= 0 then
     begin
-      Txt := AgentsManualText;
-      FS := TFileStream.Create(ManualPath, fmCreate);
+      ManualOk := False;
       try
-        if Txt <> '' then       { indexing an empty string is undefined with -Cr }
-          FS.WriteBuffer(Txt[1], Length(Txt));
+        Txt := AgentsManualText;
+        ManualOk := WriteAll(ManualFd, Txt) and
+          (C_FChmod(ManualFd, &644) = 0) and (PzFsync(ManualFd) = 0);
       finally
-        FS.Free;
+        FpClose(ManualFd);
       end;
-      FpChmod(ManualPath, &644);
+      if not ManualOk then
+        FpUnlink(ManualPath);
     end;
-  except
-    { NFS down: retried on the next watchdog tick }
+    except
+      { NFS down: retried on the next watchdog tick }
+    end;
+  finally
+    FpClose(RootFd);
   end;
 end;
 
@@ -3878,9 +4388,8 @@ begin
 end;
 
 { Runtime team management (cmd=team). Mutations are copy-on-write: build a
-  new Teams array, validate it, swap it into FCfg under FCfgLock, and persist
-  the [team:N] section to pizarra.conf (first write keeps a one-time .bak;
-  comments are lost after that — the file becomes machine-managed).
+  new Teams array, validate it, commit the authoritative SQLite transaction,
+  then publish the new FCfg snapshot under FCfgLock.
   Enforcement mirrors tasks: the console is unrestricted, a TEAM may only act
   on itself/its subtree, and new teams must hang from the caller's subtree. }
 procedure TPizarra.HandleTeam(Obj: TJSONObject; const From: string;
@@ -3889,11 +4398,11 @@ var
   C, NewCfg: TPizarraConfig;
   FromTeam, Team, PT: TTeam;
   FromIsTeam: Boolean;
-  Op, Name, Field, Value, HostV, DbErrT, OldVal, GrpTouched: string;
+  Op, Name, Field, Value, HostV, DbErrT, OldVal, HistNew, GrpTouched: string;
   SessRaw: string;
   TouchedG: TGroupArray;
-  i, j, n, MembN, MaxId: Integer;
-  SlaveV, StillThere: Boolean;
+  i, j, n, MembN, ExclN, MaxId: Integer;
+  SlaveV, StillThere, GroupChanged: Boolean;
 
   function InSubtree(const Target: string): Boolean;
   begin
@@ -3901,6 +4410,30 @@ var
       Exit(True);
     Result := SameText(Target, FromTeam.Name) or
       IsSubordinate(C, Target, FromTeam.Name);
+  end;
+
+  function ValidDelegation(const S: string; out Bad: string): Boolean;
+  var
+    Parts_: TStringArray;
+    a, b: Integer;
+    Found: Boolean;
+  begin
+    Result := False;
+    Bad := '';
+    Parts_ := SplitList(S);
+    for a := 0 to High(Parts_) do
+    begin
+      Found := False;
+      for b := Low(DELEGATE_FAMILIES) to High(DELEGATE_FAMILIES) do
+        if SameText(Parts_[a], DELEGATE_FAMILIES[b]) then
+          Found := True;
+      if not Found then
+      begin
+        Bad := Parts_[a];
+        Exit;
+      end;
+    end;
+    Result := True;
   end;
 
 begin
@@ -4022,14 +4555,13 @@ begin
       SetLength(NewCfg.Teams, n + 1);
       NewCfg.Teams[n] := Team;
       ValidateParents(NewCfg);
-      { Persist before publication. IniCommit raises unless data reaches disk;
-        live memory must never expose a value that the failed command did not
-        commit. }
-      SaveTeamIni(FCfgPath, Team);
-      FCfg := NewCfg;
       if not FDb.TeamUpsert(TeamRowDb(Team), From, True, '', '', '', '',
         DbErrT) then
-        LogDbDivergence('TeamUpsert', DbErrT);
+      begin
+        WriteLine(Data, ReplyErr('team not added: ' + DbErrT));
+        Exit;
+      end;
+      FCfg := NewCfg;
     finally
       FCfgLock.Leave;
     end;
@@ -4115,6 +4647,7 @@ begin
       SetLength(TouchedG, 0);
       for i := 0 to High(NewCfg.Groups) do
       begin
+        GroupChanged := False;
         MembN := 0;
         for j := 0 to High(NewCfg.Groups[i].Members) do
           if not SameText(NewCfg.Groups[i].Members[j], Team.Name) then
@@ -4125,8 +4658,27 @@ begin
         if MembN <> Length(NewCfg.Groups[i].Members) then
         begin
           SetLength(NewCfg.Groups[i].Members, MembN);
-          if SameText(NewCfg.Groups[i].Boss, Team.Name) then
-            NewCfg.Groups[i].Boss := '';
+          GroupChanged := True;
+        end;
+        ExclN := 0;
+        for j := 0 to High(NewCfg.Groups[i].Excluded) do
+          if not SameText(NewCfg.Groups[i].Excluded[j], Team.Name) then
+          begin
+            NewCfg.Groups[i].Excluded[ExclN] := NewCfg.Groups[i].Excluded[j];
+            Inc(ExclN);
+          end;
+        if ExclN <> Length(NewCfg.Groups[i].Excluded) then
+        begin
+          SetLength(NewCfg.Groups[i].Excluded, ExclN);
+          GroupChanged := True;
+        end;
+        if SameText(NewCfg.Groups[i].Boss, Team.Name) then
+        begin
+          NewCfg.Groups[i].Boss := '';
+          GroupChanged := True;
+        end;
+        if GroupChanged then
+        begin
           if GrpTouched <> '' then
             GrpTouched := GrpTouched + ', ';
           GrpTouched := GrpTouched + NewCfg.Groups[i].Name;
@@ -4137,22 +4689,15 @@ begin
           TouchedG[High(TouchedG)] := NewCfg.Groups[i];
         end;
       end;
-      { Persist before publication so failed writes never alter live state. }
-      { Remove the team section and every affected group in one INI transaction;
-        partial multi-file-style commits would leave configuration and memory
-        inconsistent. }
-      RemoveTeamWithGroupsIni(FCfgPath, Team.Id, TouchedG);
-      FCfg := NewCfg;
-      for i := 0 to High(TouchedG) do
-        if not FDb.GroupUpsert(TouchedG[i].Name, TouchedG[i].Project,
-          TouchedG[i].Boss, GroupMembersCsv(TouchedG[i]),
-          GroupExcludedCsv(TouchedG[i]), From,
-          '', DbErrT) then
-          LogDbDivergence('GroupUpsert', DbErrT);
-      if not FDb.TeamRemove(Team.Id, Team.Name, From,
+      { Membership cleanup and team deletion are one SQLite transaction. }
+      if not FDb.TeamRemoveWithGroups(Team.Id, Team.Name, From,
         '{"id":' + IntToStr(Team.Id) + ',"name":"' + Team.Name + '"}',
-        DbErrT) then
-        LogDbDivergence('TeamRemove', DbErrT);
+        TouchedG, DbErrT) then
+      begin
+        WriteLine(Data, ReplyErr('team not removed: ' + DbErrT));
+        Exit;
+      end;
+      FCfg := NewCfg;
     finally
       FCfgLock.Leave;
     end;
@@ -4189,11 +4734,29 @@ begin
         [FromTeam.Name])));
       Exit;
     end;
-    if (Field = 'host') or (Field = 'name') then
+    if Field = 'name' then
     begin
       WriteLine(Data, ReplyErr('field ' + Field +
-        ' cannot be changed at runtime (edit the config and restart the hub)'));
+        ' cannot be changed at runtime because other registry rows reference it'));
       Exit;
+    end;
+    { Credentials, delegation and delivery topology change authority or where
+      commands execute. A team delegated the general `team` family may not
+      grant itself those powers; only the actual console identity may. }
+    if ((Field = 'secret') or (Field = 'delegate') or (Field = 'host') or
+        (Field = 'dial')) and (not SameText(From, 'console')) then
+    begin
+      WriteLine(Data, ReplyErr('only the real console may change ' + Field));
+      Exit;
+    end;
+    if Field = 'delegate' then
+    begin
+      Value := LowerCase(Trim(Value));
+      if not ValidDelegation(Value, DbErrT) then
+      begin
+        WriteLine(Data, ReplyErr('unknown delegation family: ' + DbErrT));
+        Exit;
+      end;
     end;
     if Field = 'parent' then
     begin
@@ -4262,6 +4825,18 @@ begin
             if NewCfg.Teams[i].Slave then OldVal := 'on' else OldVal := 'off';
           end
           else if Field = 'workdir' then OldVal := NewCfg.Teams[i].Workdir
+          else if Field = 'secret' then OldVal := '(redacted)'
+          else if Field = 'delegate' then OldVal := NewCfg.Teams[i].Delegate
+          else if Field = 'host' then
+          begin
+            OldVal := NewCfg.Teams[i].Host;
+            if OldVal <> '' then
+              OldVal := OldVal + ':' + IntToStr(NewCfg.Teams[i].Port);
+          end
+          else if Field = 'dial' then
+          begin
+            if NewCfg.Teams[i].Dial then OldVal := 'on' else OldVal := 'off';
+          end
           else if Field = 'hold_when_blocked' then
           begin
             if NewCfg.Teams[i].HoldBlocked then OldVal := 'on' else OldVal := 'off';
@@ -4303,6 +4878,37 @@ begin
             NewCfg.Teams[i].Project := Trim(Value)
           else if Field = 'workdir' then
             NewCfg.Teams[i].Workdir := Trim(Value)
+          else if Field = 'secret' then
+          begin
+            Value := Trim(Value);
+            if Value = '-' then Value := '';
+            NewCfg.Teams[i].Secret := Value;
+          end
+          else if Field = 'delegate' then
+            NewCfg.Teams[i].Delegate := Value
+          else if Field = 'host' then
+          begin
+            Value := Trim(Value);
+            if Value = '-' then Value := '';
+            if Value = '' then
+            begin
+              NewCfg.Teams[i].Host := '';
+              NewCfg.Teams[i].Port := 0;
+            end
+            else
+              SplitHostPort(Value, NewCfg.Teams[i].Host,
+                NewCfg.Teams[i].Port);
+          end
+          else if Field = 'dial' then
+          begin
+            if not ParseOnOff(Value, SlaveV) then
+            begin
+              WriteLine(Data, ReplyErr('dial must be on or off (got: ' +
+                Trim(Value) + ')'));
+              Exit;
+            end;
+            NewCfg.Teams[i].Dial := SlaveV;
+          end
           else if Field = 'slave' then
           begin
             { `slave` explicitly marks a read-only subordinate that answers only
@@ -4333,13 +4939,17 @@ begin
             { Exit runs the finally (single Leave) — do NOT Leave here too }
             WriteLine(Data, ReplyErr('unknown field: ' + Field +
               ' (prompt|speciality|parent|launch|session|user|project|slave|' +
-              'hold_when_blocked' +
-              '|workdir)'));
+              'hold_when_blocked|workdir|secret|delegate|host|dial)'));
             Exit;
           end;
           Team := NewCfg.Teams[i];
         end;
       ValidateParents(NewCfg);
+      if not SecretsCoherent(NewCfg, DbErrT) then
+      begin
+        WriteLine(Data, ReplyErr('credential change rejected: ' + DbErrT));
+        Exit;
+      end;
       if Field = 'parent' then
         { did the new parent survive validation? (cycle protection) }
         for i := 0 to High(NewCfg.Teams) do
@@ -4349,14 +4959,18 @@ begin
             WriteLine(Data, ReplyErr('rejected: that parent would create a cycle'));
             Exit;
           end;
-      { Persist before publishing so a failed IniCommit cannot alter live state. }
-      SaveTeamIni(FCfgPath, Team);
-      FCfg := NewCfg;
+      HistNew := Value;
+      if Field = 'secret' then
+        HistNew := '(redacted)';
       if not FDb.TeamUpsert(TeamRowDb(Team), From, False,
         '{"' + JsonEsc(Field) + '":"' + JsonEsc(OldVal) + '"}',
-        Field, OldVal, Value,
+        Field, OldVal, HistNew,
         DbErrT) then
-        LogDbDivergence('TeamUpsert', DbErrT);
+      begin
+        WriteLine(Data, ReplyErr('team not changed: ' + DbErrT));
+        Exit;
+      end;
+      FCfg := NewCfg;
     finally
       FCfgLock.Leave;
     end;
@@ -4428,6 +5042,7 @@ begin
       G.Add('on_idle_from', C.Groups[i].OnIdleFrom);
       G.Add('on_idle_reply', C.Groups[i].OnIdleReply);
       G.Add('header', C.Groups[i].HdrNote);
+      G.Add('on_block', C.Groups[i].OnBlock);
       allIdle := True;
       anyBlocked := False;
       nMem := 0;
@@ -4455,9 +5070,9 @@ end;
 
 { Runtime group management. Groups are flat named team lists with an optional
   project; a member's effective project falls back to its group's. Mutations use
-  copy-on-write under FCfgLock and persist to both org.sqlite and the
-  declarative pizarra.conf. Build replies after releasing the lock because they
-  perform I/O and reacquire a snapshot. }
+  copy-on-write under FCfgLock, commit org.sqlite first, and then publish FCfg.
+  Build replies after releasing the lock because they perform I/O and reacquire
+  a snapshot. }
 { Console authority is granted per command family, either to the real console
   or a team explicitly delegated that family. }
 function TPizarra.ConsoleFor(const From, Family: string): Boolean;
@@ -4486,6 +5101,15 @@ var
   T: TTeam;
   i, j, gi, n: Integer;
   Ok: Boolean;
+
+  function CommitGroup: Boolean;
+  begin
+    Result := FDb.GroupUpsert(NewGroups[gi], From, '', DbErrT);
+    if Result then
+      FCfg.Groups := NewGroups
+    else
+      ErrMsg := 'group not saved: ' + DbErrT;
+  end;
 begin
   Op := LowerCase(Obj.Get('op', ''));
   Name := Trim(Obj.Get('name', ''));
@@ -4530,7 +5154,8 @@ begin
     { Authentication binds identity but does not grant group administration.
       Creation, deletion, leader, and project changes require console authority;
       the current group leader may also manage membership. }
-    if not ConsoleFor(From, 'group') then
+    if (not SameText(From, 'console')) and
+       (not TeamDelegated(FCfg, From, 'group')) then
     begin
       { gi<0 only reaches here with Op='add' (the rest exited above with
         'unknown group'): that is CREATING a group, which is the console's, like
@@ -4548,7 +5173,7 @@ begin
       if not SameText(FCfg.Groups[gi].Boss, From) then
       begin
         WriteLine(Data, ReplyErr(Format('only the console or @%s''s boss ' +
-          '(%s) may change its membership', [Name,
+          '(%s) may change its membership or policy', [Name,
           BoolToStr(FCfg.Groups[gi].Boss <> '', FCfg.Groups[gi].Boss,
           'nobody - ask the console')])));
         Exit;
@@ -4585,15 +5210,11 @@ begin
             SetLength(NewGroups[gi].Members, n + 1);
             NewGroups[gi].Members[n] := T.Name;
           end;
-        SaveGroupIni(FCfgPath, NewGroups[gi]);   { persist before publication }
-        FCfg.Groups := NewGroups;
-        if not FDb.GroupUpsert(NewGroups[gi].Name, NewGroups[gi].Project,
-          NewGroups[gi].Boss, GroupMembersCsv(NewGroups[gi]),
-          GroupExcludedCsv(NewGroups[gi]), From, '',
-          DbErrT) then
-          LogDbDivergence('GroupUpsert', DbErrT);
-        Note := Format('group %s: members updated by %s', [Name, From]);
-        Ok := True;
+        if CommitGroup then
+        begin
+          Note := Format('group %s: members updated by %s', [Name, From]);
+          Ok := True;
+        end;
       end;
     end
     else if Op = 'boss' then
@@ -4612,16 +5233,12 @@ begin
             FindTeam(FCfg, NewGroups[gi].Boss, T);
             NewGroups[gi].Boss := T.Name;
           end;
-          SaveGroupIni(FCfgPath, NewGroups[gi]);   { persist before publication }
-          FCfg.Groups := NewGroups;
-        if not FDb.GroupUpsert(NewGroups[gi].Name, NewGroups[gi].Project,
-          NewGroups[gi].Boss, GroupMembersCsv(NewGroups[gi]),
-          GroupExcludedCsv(NewGroups[gi]), From, '',
-          DbErrT) then
-          LogDbDivergence('GroupUpsert', DbErrT);
-          Note := Format('group %s: admin = %s (by %s)',
-            [Name, NewGroups[gi].Boss, From]);
-          Ok := True;
+          if CommitGroup then
+          begin
+            Note := Format('group %s: admin = %s (by %s)',
+              [Name, NewGroups[gi].Boss, From]);
+            Ok := True;
+          end;
         end;
       end;
     end
@@ -4632,16 +5249,12 @@ begin
       else
       begin
         NewGroups[gi].Project := Trim(Obj.Get('project', ''));
-        SaveGroupIni(FCfgPath, NewGroups[gi]);   { persist before publication }
-        FCfg.Groups := NewGroups;
-        if not FDb.GroupUpsert(NewGroups[gi].Name, NewGroups[gi].Project,
-          NewGroups[gi].Boss, GroupMembersCsv(NewGroups[gi]),
-          GroupExcludedCsv(NewGroups[gi]), From, '',
-          DbErrT) then
-          LogDbDivergence('GroupUpsert', DbErrT);
-        Note := Format('group %s: project = %s (by %s)',
-          [Name, NewGroups[gi].Project, From]);
-        Ok := True;
+        if CommitGroup then
+        begin
+          Note := Format('group %s: project = %s (by %s)',
+            [Name, NewGroups[gi].Project, From]);
+          Ok := True;
+        end;
       end;
     end
     else if Op = 'exclude' then
@@ -4676,27 +5289,22 @@ begin
               SetLength(NewGroups[gi].Excluded, n + 1);
               NewGroups[gi].Excluded[n] := T.Name;
             end;
-          SaveGroupIni(FCfgPath, NewGroups[gi]);   { persist before publication }
-          FCfg.Groups := NewGroups;
-          if not FDb.GroupUpsert(NewGroups[gi].Name, NewGroups[gi].Project,
-            NewGroups[gi].Boss, GroupMembersCsv(NewGroups[gi]),
-            GroupExcludedCsv(NewGroups[gi]), From, '', DbErrT) then
-            LogDbDivergence('GroupUpsert', DbErrT);
-          if Length(NewGroups[gi].Excluded) = 0 then
-            Note := Format('group %s: broadcast mute cleared (by %s)', [Name, From])
-          else
-            Note := Format('group %s: muted from broadcasts = %s (by %s)',
-              [Name, GroupExcludedCsv(NewGroups[gi]), From]);
-          Ok := True;
+          if CommitGroup then
+          begin
+            if Length(NewGroups[gi].Excluded) = 0 then
+              Note := Format('group %s: broadcast mute cleared (by %s)', [Name, From])
+            else
+              Note := Format('group %s: muted from broadcasts = %s (by %s)',
+                [Name, GroupExcludedCsv(NewGroups[gi]), From]);
+            Ok := True;
+          end;
         end;
       end;
     end
     else if Op = 'onidle' then
     begin
-      { on-idle policy: off | boss | all | team[,team...]. When the whole group
-        goes idle, wake the target(s). Replace semantics; auth boss+console
-        (absent from the console-only guard). Read from in-memory config on the
-        watchdog tick and persisted in the INI — not mirrored to the DB. }
+      { on-idle policy: off | boss | all | team[,team...]. The complete policy
+        is stored in the authoritative group row. }
       if gi < 0 then
         ErrMsg := 'unknown group: ' + Name
       else
@@ -4717,13 +5325,14 @@ begin
         if ErrMsg = '' then
         begin
           NewGroups[gi].OnIdle := Pol;
-          SaveGroupIni(FCfgPath, NewGroups[gi]);   { persist before publication }
-          FCfg.Groups := NewGroups;
-          if Pol = '' then
-            Note := Format('group %s: on-idle signal OFF (by %s)', [Name, From])
-          else
-            Note := Format('group %s: on-idle -> %s (by %s)', [Name, Pol, From]);
-          Ok := True;
+          if CommitGroup then
+          begin
+            if Pol = '' then
+              Note := Format('group %s: on-idle signal OFF (by %s)', [Name, From])
+            else
+              Note := Format('group %s: on-idle -> %s (by %s)', [Name, Pol, From]);
+            Ok := True;
+          end;
         end;
       end;
     end
@@ -4737,14 +5346,15 @@ begin
       begin
         Pol := Trim(Obj.Get('onidlemsg', ''));
         NewGroups[gi].OnIdleMsg := Pol;
-        SaveGroupIni(FCfgPath, NewGroups[gi]);
-        FCfg.Groups := NewGroups;
-        if Pol = '' then
-          Note := Format('group %s: on-idle message reset to default (by %s)',
-            [Name, From])
-        else
-          Note := Format('group %s: on-idle message set (by %s)', [Name, From]);
-        Ok := True;
+        if CommitGroup then
+        begin
+          if Pol = '' then
+            Note := Format('group %s: on-idle message reset to default (by %s)',
+              [Name, From])
+          else
+            Note := Format('group %s: on-idle message set (by %s)', [Name, From]);
+          Ok := True;
+        end;
       end;
     end
     else if (Op = 'onidlefrom') or (Op = 'onidlereply') then
@@ -4765,13 +5375,14 @@ begin
             NewGroups[gi].OnIdleFrom := Pol
           else
             NewGroups[gi].OnIdleReply := Pol;
-          SaveGroupIni(FCfgPath, NewGroups[gi]);
-          FCfg.Groups := NewGroups;
-          if Pol = '' then
-            Note := Format('group %s: %s reset to default (by %s)', [Name, Op, From])
-          else
-            Note := Format('group %s: %s -> %s (by %s)', [Name, Op, Pol, From]);
-          Ok := True;
+          if CommitGroup then
+          begin
+            if Pol = '' then
+              Note := Format('group %s: %s reset to default (by %s)', [Name, Op, From])
+            else
+              Note := Format('group %s: %s -> %s (by %s)', [Name, Op, Pol, From]);
+            Ok := True;
+          end;
         end;
       end;
     end
@@ -4785,13 +5396,44 @@ begin
       begin
         Pol := Trim(Obj.Get('header', ''));
         NewGroups[gi].HdrNote := Pol;
-        SaveGroupIni(FCfgPath, NewGroups[gi]);
-        FCfg.Groups := NewGroups;
-        if Pol = '' then
-          Note := Format('group %s: header rule cleared (by %s)', [Name, From])
+        if CommitGroup then
+        begin
+          if Pol = '' then
+            Note := Format('group %s: header rule cleared (by %s)', [Name, From])
+          else
+            Note := Format('group %s: header rule set (by %s)', [Name, From]);
+          Ok := True;
+        end;
+      end;
+    end
+    else if Op = 'onblock' then
+    begin
+      { Permission-block handling is a persisted group policy. Empty/default
+        restores the normal loud alarm; `log` deliberately suppresses that
+        alarm for non-excluded members while retaining detection and holds. }
+      if gi < 0 then
+        ErrMsg := 'unknown group: ' + Name
+      else
+      begin
+        Pol := LowerCase(Trim(Obj.Get('onblock', '')));
+        if Pol = 'default' then
+          Pol := '';
+        if (Pol <> '') and (Pol <> 'alarm') and (Pol <> 'log') then
+          ErrMsg := 'onblock must be alarm, log, or default'
         else
-          Note := Format('group %s: header rule set (by %s)', [Name, From]);
-        Ok := True;
+        begin
+          NewGroups[gi].OnBlock := Pol;
+          if CommitGroup then
+          begin
+            if (Pol = '') or (Pol = 'alarm') then
+              Note := Format('group %s: blocked members alarm normally (by %s)',
+                [Name, From])
+            else
+              Note := Format('group %s: blocked members log only (by %s)',
+                [Name, From]);
+            Ok := True;
+          end;
+        end;
       end;
     end
     else if Op = 'remove' then
@@ -4814,11 +5456,13 @@ begin
               Inc(n);
             end;
           SetLength(NewGroups, n);
-          RemoveGroupIni(FCfgPath, Name);   { persist before publication }
-          FCfg.Groups := NewGroups;
           if not FDb.GroupRemove(Name, From, '{"group":"' + Name + '"}', DbErrT) then
-            LogDbDivergence('GroupRemove', DbErrT);
-          Note := Format('group %s removed by %s', [Name, From]);
+            ErrMsg := 'group not removed: ' + DbErrT
+          else
+          begin
+            FCfg.Groups := NewGroups;
+            Note := Format('group %s removed by %s', [Name, From]);
+          end;
         end
         else
         begin
@@ -4831,21 +5475,15 @@ begin
               Inc(n);
             end;
           SetLength(NewGroups[gi].Members, n);
-          SaveGroupIni(FCfgPath, NewGroups[gi]);   { persist before publication }
-          FCfg.Groups := NewGroups;
-        if not FDb.GroupUpsert(NewGroups[gi].Name, NewGroups[gi].Project,
-          NewGroups[gi].Boss, GroupMembersCsv(NewGroups[gi]),
-          GroupExcludedCsv(NewGroups[gi]), From, '',
-          DbErrT) then
-          LogDbDivergence('GroupUpsert', DbErrT);
-          Note := Format('group %s: members removed by %s', [Name, From]);
+          if CommitGroup then
+            Note := Format('group %s: members removed by %s', [Name, From]);
         end;
-        Ok := True;
+        Ok := ErrMsg = '';
       end;
     end
     else
       ErrMsg := 'unknown group op (add|remove|boss|project|exclude|onidle|' +
-        'onidlemsg|onidlefrom|onidlereply|header|list)';
+        'onidlemsg|onidlefrom|onidlereply|onblock|header|list)';
   finally
     FCfgLock.Leave;
   end;
@@ -5028,13 +5666,15 @@ begin
           NewProjects[pi].Name := Name;
         end;
         NewProjects[pi].Boss := Boss;
-        SaveProjectIni(FCfgPath, NewProjects[pi]);   { persist before publication }
-        FCfg.Projects := NewProjects;
         if not FDb.ProjectUpsert(NewProjects[pi].Name, NewProjects[pi].Boss, From,
           '', DbErrT) then
-          LogDbDivergence('ProjectUpsert', DbErrT);
-        Note := Format('project %s: admin = %s (by %s)', [Name, Boss, From]);
-        Ok := True;
+          ErrMsg := 'project not saved: ' + DbErrT
+        else
+        begin
+          FCfg.Projects := NewProjects;
+          Note := Format('project %s: admin = %s (by %s)', [Name, Boss, From]);
+          Ok := True;
+        end;
       end;
     end
     else if Op = 'remove' then
@@ -5065,27 +5705,25 @@ begin
             the foreign key has cascaded the pairs away and there is nothing
             left to ask. The refusal above only guards teams and groups, whose
             project is a label; the app pairs are meant to cascade, so the
-            deletion goes ahead and what must be repaired is the MIRROR.
-
-            Without this, the pairs vanished from the database while
-            pizarra.conf kept `projects=<dead>` and its role key under each
-            [app:...]. The delivery header is built in pzconfig, which reads
-            that mirror and not the database, so from then on EVERY message to
-            those teams named a project the hub answers 'unknown project' for -
-            and a restart did not heal it, because LoadConfig reads the lie
-            back from the file. A permanent lie in the one text every agent is
-            guaranteed to read. }
+            deletion goes ahead and the affected applications' in-memory
+            project projection must be rebuilt for delivery headers. }
           OrphanedApps := FDb.AppsOfProject(Name);
           NewProjects := Copy(FCfg.Projects, 0, Length(FCfg.Projects));
           for i := pi to High(NewProjects) - 1 do
             NewProjects[i] := NewProjects[i + 1];
           SetLength(NewProjects, Length(NewProjects) - 1);
-          RemoveProjectIni(FCfgPath, Name);   { persist before publication }
-          FCfg.Projects := NewProjects;
           if not FDb.ProjectDelete(Name, From, DbErrT) then
-            LogDbDivergence('ProjectDelete', DbErrT);
-          Note := Format('project %s removed (by %s)', [Name, From]);
-          Ok := True;
+          begin
+            OrphanedApps.Free;
+            OrphanedApps := nil;
+            ErrMsg := 'project not removed: ' + DbErrT;
+          end
+          else
+          begin
+            FCfg.Projects := NewProjects;
+            Note := Format('project %s removed (by %s)', [Name, From]);
+            Ok := True;
+          end;
         end;
       end;
     end
@@ -7362,9 +8000,11 @@ begin
   Flush(Output);
 
   { refresh the manual with this build's text }
-  if (FCfg.SharedDir <> '') and
-     FileExists(FCfg.SharedDir + '/' + SHARED_MANUAL) then
-    DeleteFile(FCfg.SharedDir + '/' + SHARED_MANUAL);
+  if FCfg.SharedDir <> '' then
+    { unlink removes this exact directory entry and never follows a symlink;
+      unlike FileExists it also catches a dangling link planted in the 1777
+      exchange before the exclusive/no-follow recreation below. }
+    FpUnlink(FCfg.SharedDir + '/' + SHARED_MANUAL);
   EnsureSharedDirs;
   { finish any workflow work the previous shutdown interrupted }
   try
@@ -7410,6 +8050,7 @@ var
   ConfigArg, Path, SqlV, ConfigReason: string;
   i: Integer;
   App: TPizarra;
+  MigrateOnly: Boolean;
 begin
   { treat all AnsiStrings as UTF-8 regardless of the ambient locale — under a
     non-UTF-8 LANG (systemd/tmux default LANG=C) fpjson's parser would otherwise
@@ -7426,11 +8067,17 @@ begin
   if WATCHDOG_INTERVAL < 1 then
     WATCHDOG_INTERVAL := 1;
   ConfigArg := '';
+  MigrateOnly := False;
   i := 1;
   while i <= ParamCount do
   begin
-    if (ParamStr(i) = '--config') and (i < ParamCount) then
+    if ParamStr(i) = '--config' then
     begin
+      if i >= ParamCount then
+      begin
+        Writeln(StdErr, 'pizarra: --config requires a path');
+        Halt(1);
+      end;
       ConfigArg := ParamStr(i + 1);
       Inc(i);
     end
@@ -7442,18 +8089,38 @@ begin
       if SqliteProbe(SqlV) then
         Writeln('sqlite: ', SqlV)
       else
-        Writeln('sqlite: unavailable (the registry would be read-only)');
+        Writeln('sqlite: unavailable (the hub would refuse to start)');
       Halt(0);
     end
+    else if ParamStr(i) = '--migrate-only' then
+      MigrateOnly := True
     else if ParamStr(i) = '--help' then
     begin
-      Writeln('usage: pizarra [--config PATH] [--version]');
+      Writeln('usage: pizarra [--config PATH] [--migrate-only] [--version]');
       Halt(0);
     end;
     Inc(i);
   end;
 
   Path := ResolveConfigStrict(ConfigArg, 'PIZARRA_CONF', 'pizarra.conf', ConfigReason);
+  { A missing canonical config is a genuine first installation only when no
+    identity path was requested. Explicit and environment paths remain strict
+    and are never replaced by a generated identity. }
+  if (Path = '') and (ConfigReason = '') then
+  begin
+    if not BootstrapDefaultPizarraConfig(ConfigReason) then
+    begin
+      Writeln(StdErr, 'pizarra: first-run initialization failed: ', ConfigReason);
+      Writeln(StdErr, 'pizarra: create /etc/pizarra/pizarra.conf (mode 0600) ',
+        'and writable /var/lib/pizarra and /var/log/pizarra directories, or ',
+        'start with --config PATH. No source-tree conf/ file is used.');
+      Halt(1);
+    end;
+    Path := ResolveConfigStrict('', 'PIZARRA_CONF', 'pizarra.conf', ConfigReason);
+    if Path <> '' then
+      Writeln('pizarra: initialized /etc/pizarra and /var/lib/pizarra; ',
+        'created matching pizarra.conf and tiza.conf credentials');
+  end;
   if Path = '' then
   begin
     if ConfigReason <> '' then
@@ -7471,6 +8138,13 @@ begin
       Writeln('pizarra: ', E.Message);
       Halt(1);
     end;
+  end;
+  if MigrateOnly then
+  begin
+    Writeln('pizarra: configuration and SQLite registry verified; ' +
+      'migration-only run complete (no listener or watchdog started)');
+    App.Free;
+    Halt(0);
   end;
   try
     App.Run;

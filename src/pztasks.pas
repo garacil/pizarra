@@ -84,6 +84,10 @@ type
       const Deps: array of Integer; AParent: Integer;
       const AWfName: string; AWfStepUid: Int64; out Why: string): TTask;
   public
+    { Used by the hub's global backup barrier. Workflow must be locked before
+      tasks; callers release in reverse order. }
+    procedure LockForSnapshot;
+    procedure UnlockForSnapshot;
     { The hub attaches this after creating the database; subsequent changes are
       also mirrored to work.sqlite with a history entry. }
     procedure SetDb(D: TPzDb);
@@ -326,23 +330,6 @@ end;
 
 { Write the task and its history entry to the database; never fail the operation
   because JSON remains the tested load path. }
-{ THE DELIMITER IS LEGAL INPUT. Disabling QuoteChar fixed the quote variant, but
-  a #1 INSIDE a field still splits the row and shifts every following column:
-  the title becomes the team, and the team becomes the state. It can arrive
-  through the web because \u0001 is perfectly valid JSON. Sanitize HERE, the
-  single point every row traverses, instead of trusting every future path to
-  reject it. C0 control characters are not legitimate title or milestone
-  content--they indicate an error or attack and also damage terminals and logs. }
-function StripControls(const S: string): string;
-var
-  i: Integer;
-begin
-  Result := S;
-  for i := 1 to Length(Result) do
-    if Result[i] < ' ' then
-      Result[i] := ' ';
-end;
-
 procedure TTaskStore.DbTask(const T: TTask; const Who, Op, ChField, ChOld,
   ChNew: string);
 var
@@ -350,10 +337,10 @@ var
 begin
   if (FDb = nil) or (not FDb.Available) then
     Exit;
-  Row := IntToStr(T.Id) + #1 + StripControls(T.Title) + #1 +
-    StripControls(T.Team) + #1 + StripControls(T.StateS) + #1 +
-    StripControls(T.Hito) + #1 + IntToStr(T.Parent) + #1 +
-    StripControls(T.Created) + #1 + StripControls(T.Closed);
+  Row := IntToStr(T.Id) + #1 + RowFieldEncode(T.Title) + #1 +
+    RowFieldEncode(T.Team) + #1 + RowFieldEncode(T.StateS) + #1 +
+    RowFieldEncode(T.Hito) + #1 + IntToStr(T.Parent) + #1 +
+    RowFieldEncode(T.Created) + #1 + RowFieldEncode(T.Closed);
   FDb.TaskUpsert(Row, Who, Op, ChField, ChOld, ChNew, Err);
 end;
 
@@ -372,6 +359,16 @@ destructor TTaskStore.Destroy;
 begin
   FLock.Free;
   inherited Destroy;
+end;
+
+procedure TTaskStore.LockForSnapshot;
+begin
+  FLock.Enter;
+end;
+
+procedure TTaskStore.UnlockForSnapshot;
+begin
+  FLock.Leave;
 end;
 
 procedure TTaskStore.LoadFromDisk;

@@ -34,9 +34,49 @@ Compiled units are isolated under `build/release`, `build/debug`, and
 `build/tiny`; changing targets cannot silently reuse units produced with a
 different compiler flag set.
 
+The public CI checkout and test path use shell tooling, Free Pascal, SQLite,
+and tmux. They do not install or invoke Node.js, npm, or a JavaScript package
+runner; browser assets are shipped directly and must keep that property.
+
 `make static` intentionally fails because the threaded programs use the system
 C runtime and load SQLite dynamically. Do not treat that failure as a test
 regression.
+
+The repository includes focused regression harnesses. Each creates only a
+disposable temporary tree, below `/tmp` in the default environment:
+
+```sh
+scripts/test-bootstrap-layout.sh
+scripts/test-private-config.sh
+scripts/test-pzshare-symlink.sh
+scripts/test-migrate-release-layout.sh
+scripts/test-retire-repo-runtime-conf.sh
+```
+
+The bootstrap harness compiles the real Pascal layout implementation and checks
+mode `0711` configuration, mode `0700` state/release/log directories, matching
+mode-`0600` hub/client credentials, the generated canonical release path,
+non-overwriting repair of a missing release directory, rejection of unsafe
+release permissions, lock cleanup, and coherent systemd `StateDirectory`
+ownership. The private-config harness compiles a disposable Pascal client
+against the real typed loaders. It checks quoted-value semantics, final and
+ancestor symlink rejection, exact mode-`0600` enforcement, rejection of a
+non-sticky writable ancestor, and that a pathname replacement cannot redirect
+an already opened descriptor. The shared-copy harness compiles the real
+`pzshare` implementation, preplants a temporary-name symlink to a protected
+file, and proves that the target and adversarial link remain untouched while
+the payload is published as an exact mode-`0644` regular file. The
+release-layout harness verifies a
+non-mutating dry run; exact preservation of entry names, types, empty
+directories, and file bytes; mode `0700` on the canonical release root; an
+idempotent canonical rerun and final lineage record;
+rejection of conflicting non-empty trees before destination mutation; and the
+mandatory explicit source for a relative legacy release path. The retirement
+harness exercises both dry-run and confirmed repository-runtime retirement,
+including canonical release-path validation. Run them whenever migration,
+canonical paths, source archival, release publication, or retirement checks
+change. None operates on `/etc/pizarra`, `/var/lib/pizarra`, the checkout's
+`.private` tree, or live tmux sessions.
 
 ## Isolated integration environment
 
@@ -124,13 +164,66 @@ second active channel for the same team.
 
 ### Registries
 
+For the persisted group permission-block policy, build the debug binaries and
+run the focused disposable harness:
+
+```sh
+make debug
+scripts/test-group-onblock.sh
+```
+
+The harness creates its fixture only below `/tmp`. It covers console, group
+boss, and ordinary-member authorization; `alarm`, `log`, and `default` input
+validation; SQLite persistence across a hub restart; and the value returned by
+`group list`.
+
+An additional local browser regression runs the repository's real
+`web/apps/manage.js` in Chromium without Node.js, npm, Playwright, or another
+JavaScript package runner:
+
+```sh
+PIZARRA_TEST_CHROMIUM_BIN=chromium \
+  scripts/test-group-onblock-browser.sh
+```
+
+It requires Python 3 and a Chromium-compatible executable, starts a strict
+loopback fixture server, and keeps its browser profile and captured output
+below `/tmp`. It checks the rendered `when blocked: log only` card, the exact
+`default`, `alarm`, and `log` selector values, and the exact
+`POST /api/group/builders/onblock` body `{"onblock":"default"}`. This test is
+optional for local validation because Chromium is not a public-CI dependency.
+
+The focused organization screenshots and scrolling workflow animation are
+also reproducible from the shipped browser source and synthetic Atlas fixture:
+
+```sh
+scripts/capture-web-showcase.sh
+```
+
+This optional documentation target requires Python 3, Chromium, `png2pnm`, and
+`gifbuild`. It renders `web/apps/index.html` and the production CSS/JavaScript
+directly; it does not require or invoke Node.js, npm, Playwright, Puppeteer, or
+an external JavaScript runtime. Pass an existing output directory as its first
+argument to keep the generated files separate from `screenshots/`.
+
+- A missing implicit canonical installation creates matching mode-`0600` hub
+  and console credentials plus private state/log directories; an explicitly or
+  environmentally selected missing config fails without fallback/bootstrap.
+- A second hub opening the same store fails on the persistent lifetime lock,
+  including the interval before the first hub starts listening; managed child
+  processes do not inherit that descriptor across `exec`.
+- Legacy team/group/project/app input migrates into `org.sqlite` with exact
+  counts, policies, manuals, and relations, then disappears from the active
+  bootstrap INI only after verification and an owner-only backup.
+- A second `--migrate-only` run is idempotent: it preserves registry counts and
+  does not recreate INI registry sections or another cutover marker.
 - Team parent cycles and missing references are rejected.
 - Project and group administrators have only documented authority.
 - Removing an object still referenced by open work or relations is refused.
 - Application ownership, project roles, manuals, history, and undo survive a
   hub restart.
-- When SQLite is unavailable, registry writes fail visibly while messaging,
-  tasks, and workflows remain available.
+- When SQLite is unavailable, corrupt, or cannot be projected completely, hub
+  startup fails visibly; no partial INI registry is served.
 
 ### Files and transfers
 
@@ -165,16 +258,37 @@ second active channel for the same team.
 ### Backup, restore, and update
 
 - A backup is published only after all pieces and the manifest are complete.
-- Verification detects a missing or changed piece, missing secret, and invalid
-  SQLite header.
+- A configured external shared/NFS sentinel is absent from the backup payload;
+  only the `[shared] dir` reference inside the included hub config remains.
+- Verification detects a missing, changed, duplicated, or unlisted piece,
+  missing secret, invalid SQLite integrity/foreign keys, and undeclared
+  SQLite WAL/shared-memory payload.
 - Restore dry-run changes nothing and prints the exact target.
-- Restore refuses a running hub, unconfirmed execution, and an unaccepted
-  credential mismatch.
+- Restore refuses a running/locked hub, a missing or unsafe persistent lock,
+  unconfirmed execution, and an unaccepted credential mismatch.
 - Restore moves previous state aside and does not retain stale SQLite sidecars.
+- A privileged restore preserves the live configuration/store owners so a
+  dedicated-account hub can reopen every mode-`0600` replacement.
 - The restored hub exposes the expected registries, tasks, workflows, cursors,
   and messages.
+- Restore leaves external shared/NFS content unchanged; the restored hub
+  reference and pzweb `[web] shared` are rechecked for exact equality before
+  service startup.
+- Layout migration preserves hub `[shared] dir` and pzweb `[web] shared`
+  literally, never traverses the mounted tree, and retirement leaves an
+  external sentinel unchanged.
+- Release-layout migration preserves the selected tree exactly, leaves its
+  source untouched, rewrites `[server] releases` to
+  `/var/lib/pizarra/releases`, and aborts before installation on conflicting
+  non-empty trees.
+- A relative legacy release path is rejected unless the operator supplies its
+  reviewed absolute source with `--source-releases`.
+- Repository-runtime retirement requires that exact canonical, real, private,
+  outside-repository release directory and rejects symlinks and special entries.
 - A release is not advertised until `VERSION` exists and matches the running
   hub.
+- Publication accepts only an absolute `RELEASEDIR`, stages artifacts under
+  temporary names, and renames `VERSION` last.
 - Endpoint installation rejects a wrong digest, wrong version, oversized
   artifact, or incomplete download; a failed post-install self-test restores
   the previous executable, while verified success prunes rollback copies.
@@ -210,6 +324,44 @@ Before a public release:
    source;
 7. inspect the exact staged diff and `git ls-files` output; and
 8. create release artifacts only from the committed tree.
+
+## Tag, GitHub release, and wiki publication
+
+Version choice is a release decision, not a documentation-only edit. Before
+tagging, prove that `src/pzver.pas`, all three `--version` outputs, the
+changelog heading, release notes, README, and every version-bearing wiki page
+name the same release. Do not reuse the currently deployed version for changed
+binaries, and do not publish a numerically older tag over a newer public
+branch.
+
+The project wiki is a separate Git repository from the source repository. Treat
+its commit and push as a distinct publication step: update it from the same
+source commit, inspect its own diff/status, and do not let a successful source
+push imply that the wiki was updated.
+
+For a release `<version>`:
+
+1. freeze the source and version-bearing documentation;
+2. run the complete build and focused bootstrap, private-config, shared-copy,
+   group-policy, release-layout migration, and retirement tests, plus the
+   relevant isolated integration matrix;
+3. verify Markdown links, screenshots, tracked-file inventory, and both source
+   and wiki diffs;
+4. commit and push the tested source commit;
+5. create an annotated `v<version>` tag on that exact commit and push it;
+6. create the GitHub Release from that tag with notes matching the changelog;
+7. commit and push the separately reviewed wiki update; and
+8. verify the public tag, release assets/notes, source pages, and wiki after
+   publication.
+
+`make publish` serves the fleet's `tiza` self-update artifacts and is not the
+GitHub Release operation. It deliberately requires a clean committed tree;
+both publication channels must refer to the same chosen suite version.
+
+For the first GitHub publication, the fixed release tuple is suite `1.1.22`,
+annotated tag `v1.1.22`, and GitHub Release title **Pizarra 1.1**. This continues
+the deployed 1.1 line after 1.1.21; the discarded, untagged development
+placeholder is not a release and must never be presented as one.
 
 When reporting a test result, include the suite version, operating system,
 architecture, Free Pascal version, SQLite availability, topology, exact command,

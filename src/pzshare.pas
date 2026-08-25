@@ -44,7 +44,8 @@ function ShareCopy(const Src, DestDir: string;
 implementation
 
 uses
-  SysUtils, Classes, Process, BaseUnix, Unix, Errors;
+  SysUtils, Classes, Process, BaseUnix, Unix, Errors
+  {$IFDEF LINUX}, Linux{$ENDIF};
 
 function ShareNameError(const BaseName: string): string;
 var
@@ -138,6 +139,60 @@ begin
   end;
 end;
 
+{ Reserve a private inode before /bin/cp opens it.  The team directories are
+  deliberately sticky and world-writable, so a predictable pathname followed
+  by DeleteFile+cp would leave a symlink race.  O_CREAT|O_EXCL refuses every
+  pre-existing name (including a symlink); O_NOFOLLOW is defense in depth on
+  Linux.  Once this process owns the regular file, the sticky directory stops
+  other users from replacing it before cp completes. }
+function ReserveScratch(const DestDir, BaseName: string;
+  out Scratch, Why: string): Boolean;
+var
+  Attempt, Fd, Flags, OpenErr: Integer;
+begin
+  Result := False;
+  Scratch := '';
+  Why := '';
+  Flags := O_WRONLY or O_CREAT or O_EXCL;
+  {$IFDEF LINUX}
+  Flags := Flags or O_NOFOLLOW or O_CLOEXEC;
+  {$ENDIF}
+  for Attempt := 1 to 64 do
+  begin
+    Scratch := IncludeTrailingPathDelimiter(DestDir) +
+      Format('.pzshare-%d-%d-%s.partial', [FpGetpid, Attempt, BaseName]);
+    repeat
+      Fd := FpOpen(Scratch, Flags, &600);
+    until (Fd >= 0) or (fpgeterrno <> ESysEINTR);
+    if Fd >= 0 then
+    begin
+      { Do not retry close on Linux: after EINTR the descriptor state is not
+        portable.  cp will reopen this already reserved pathname. }
+      if FpClose(Fd) <> 0 then
+      begin
+        OpenErr := fpgeterrno;
+        FpUnlink(Scratch);
+        Scratch := '';
+        Why := 'cannot close reserved shared temporary file: ' +
+          SysErrorMessage(OpenErr);
+        Exit;
+      end;
+      Result := True;
+      Exit;
+    end;
+    OpenErr := fpgeterrno;
+    if OpenErr <> ESysEEXIST then
+    begin
+      Scratch := '';
+      Why := 'cannot reserve shared temporary file: ' +
+        SysErrorMessage(OpenErr);
+      Exit;
+    end;
+  end;
+  Scratch := '';
+  Why := 'cannot reserve a collision-free shared temporary file';
+end;
+
 function ShareCopy(const Src, DestDir: string;
   out FinalPath, Err: string): Boolean;
 var
@@ -145,6 +200,7 @@ var
   Size: Int64;
   FS: TFileStream;
   i: Integer;
+  ScratchStat: TStat;
 begin
   Result := False;
   FinalPath := '';
@@ -201,9 +257,8 @@ begin
     A per-transfer temporary name isolates cleanup and makes the final name
     visible only after all content is present. This is the same tmp+rename
     pattern used for configuration, the journal, and tasks. }
-  Scratch := IncludeTrailingPathDelimiter(DestDir) +
-    Format('.pzshare-%d-%s.partial', [FpGetpid, Base]);
-  DeleteFile(Scratch);
+  if not ReserveScratch(DestDir, Base, Scratch, Err) then
+    Exit;
   if not CpWithDeadline(Src, Scratch, SHARE_COPY_MS) then
   begin
     { Remove only our own temporary file; nobody else can own this name. }
@@ -214,6 +269,25 @@ begin
       Err := '';
     Err := Err + 'share copy failed or timed out (NFS slow/unmounted or disk full)';
     FinalPath := '';
+    Exit;
+  end;
+  ScratchStat := Default(TStat);
+  if (FpLStat(Scratch, ScratchStat) <> 0) or
+     (not fpS_ISREG(ScratchStat.st_mode)) then
+  begin
+    FpUnlink(Scratch);
+    FinalPath := '';
+    Err := 'share copy did not leave the reserved regular temporary file';
+    Exit;
+  end;
+  { cp writes an already existing mode-0600 inode.  Publish shared files as
+    readable only after the complete copy has closed successfully.  Sticky
+    directory ownership prevents another user replacing our inode here. }
+  if FpChmod(Scratch, &644) <> 0 then
+  begin
+    FpUnlink(Scratch);
+    FinalPath := '';
+    Err := 'share copy completed but its permissions could not be published';
     Exit;
   end;
   { Select the name HERE, after the content is complete, and reserve it with

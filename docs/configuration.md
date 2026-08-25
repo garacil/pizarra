@@ -1,24 +1,69 @@
 # Configuration reference
 
-The suite uses INI files. Public examples live in `conf/`; real configuration
-contains secrets and must remain untracked.
+Static process settings use INI files; the organization registry does not.
+Public examples live in `examples/`, while the canonical installed configuration
+is under `/etc/pizarra/`. Real files contain credentials and must never be placed
+under the repository.
+
+The canonical layout is:
+
+| Path | Purpose |
+|---|---|
+| `/etc/pizarra/pizarra.conf` | Hub bootstrap, network, log, store, prompt, and delivery-header settings |
+| `/etc/pizarra/tiza.conf` | Console/CLI identity and optional local host-daemon settings |
+| `/etc/pizarra/pzweb.conf` | Web adapter, hub identity, HTTP perimeter, and asset settings |
+| `/etc/pizarra/agents/*.conf` | Optional identity-specific client files used by managed agent sessions |
+| `/var/lib/pizarra/` | SQLite databases, message/task/workflow state, receipts, backups, and endpoint release artifacts |
+| `/var/lib/pizarra/releases/` | Canonical private release root used by the endpoint update channel |
+| `/var/log/pizarra/` | Hub logs |
+| `/usr/local/share/pizarra/web/apps/` | Installed browser assets loaded by `pzweb` |
+
+Teams, groups, projects, applications, application manuals, memberships, and
+application/project relations are authoritative in
+`/var/lib/pizarra/org.sqlite`. They are managed through the authenticated hub
+commands, not by creating one INI file or section per object.
 
 ## Resolution and identity
 
-`pizarra` resolves `pizarra.conf`; `tiza` resolves `tiza.conf`. Prefer an
-explicit path in services and automation:
+Each program accepts an explicit path, but its only implicit runtime location is
+`/etc/pizarra`:
 
 ```sh
 pizarra --config /etc/pizarra/pizarra.conf
-tiza --config /etc/tiza/tiza.conf <command>
-tiza daemon --config /etc/tiza/tiza.conf
-pzweb --config /etc/pzweb/pzweb.conf
+tiza --config /etc/pizarra/tiza.conf <command>
+tiza daemon --config /etc/pizarra/tiza.conf
+pzweb --config /etc/pizarra/pzweb.conf
 ```
 
-The native programs also honor `PIZARRA_CONF` and `TIZA_CONF`, then look in the
-user configuration directory, `/etc/pizarra`, and the current directory.
-Explicitly requested paths fail closed when missing; they do not silently fall
-back to another identity.
+`PIZARRA_CONF`, `TIZA_CONF`, and `PZWEB_CONF` override the corresponding
+implicit file. For `pizarra` and `pzweb`, resolution order is explicit
+`--config`, environment override, then `/etc/pizarra/<name>`. `tiza` uses the
+same order, with one identity-preserving step before the canonical default: when
+it is running inside a tmux session tagged by `tiza daemon`, it reads that
+session's `@pizarra_conf` option. This lets a bare `tiza` keep the session's
+identity even if a child process did not inherit `TIZA_CONF`.
+
+An explicit, environment-selected, or tmux-tagged path that is missing fails
+closed: the program never falls back to another identity, the home directory,
+the source tree, or the current directory. The host daemon derives the tag from
+the reviewed `TIZA_CONF=...` assignment in that session's `launch` command; the
+tag does not copy a credential into tmux, only the path to its protected
+identity file.
+
+When `pizarra` is started with no explicit path and no `PIZARRA_CONF`, a missing
+canonical hub file is treated as a first installation. With sufficient
+privileges it creates private `/etc/pizarra`, `/var/lib/pizarra`,
+`/var/lib/pizarra/releases`, and `/var/log/pizarra` structure plus matching
+`pizarra.conf` and `tiza.conf` credentials. The generated hub file points
+`[server] releases` at that canonical artifact root. Existing files are never
+overwritten. Explicit and environment paths never trigger this bootstrap.
+
+Every selected credential-bearing INI is opened once through a descriptor that
+is kept for the complete parse. The final file must be a regular mode-`0600`
+file, no path component may be a symbolic link, and group/other-writable
+ancestors are rejected except for a root-owned sticky directory such as
+`/tmp`. Parsing remains pinned to the opened inode if its pathname is replaced,
+and quoted values have the same stripping semantics in every typed loader.
 
 For `tiza`, `[pizarra] self` is the identity. A normal `--from` argument is
 ignored. Use one configuration per identity, especially on a multi-team host.
@@ -34,7 +79,7 @@ ignored. Use one configuration per identity, especially on a multi-team host.
 | `secret` | empty | Master credential; must be set |
 | `master_console_only` | `off` | Restrict the master credential to `from=console` |
 | `header` | `short` | Delivery envelope mode: `short` or `full` |
-| `releases` | empty | Directory containing published endpoint update artifacts |
+| `releases` | empty | Literal directory containing published endpoint update artifacts; empty disables updates |
 | `alarm_max` | `3` | Block alarms per episode, clamped to 1–5 |
 | `alarm_every` | `180` | Seconds between alarms, minimum 15 |
 | `group_idle_dwell` | `120` | Seconds a group must remain idle before its idle action, minimum 15 |
@@ -42,6 +87,14 @@ ignored. Use one configuration per identity, especially on a multi-team host.
 Set `master_console_only = on` only after every team and daemon uses an
 appropriate bound credential. Enabling it earlier can reject legitimate team
 traffic that still uses the master secret.
+
+For an enabled canonical deployment, set `releases` to the exact absolute path
+`/var/lib/pizarra/releases`. Keep that directory real (not a symlink), private
+at mode `0700`, and owned by the hub account. The loader uses the value
+literally: a relative value depends on the process working directory and is
+therefore not a safe production configuration. The hub reads only `VERSION`,
+`src.tar.gz`, and `tiza-<os>-<cpu>` from this root; the published `VERSION` must
+exactly match the running hub version before any artifact is advertised.
 
 ### `[header]`
 
@@ -63,6 +116,31 @@ These keys tune the compact delivery envelope:
 
 Boolean values accept `on/off`, `1/0`, `true/false`, and `yes/no`.
 
+### `[registry]`
+
+```ini
+[registry]
+authority = sqlite
+```
+
+`sqlite` is the only supported live authority. If SQLite cannot be loaded, its
+schema cannot be upgraded, or `org.sqlite` cannot be projected completely, the
+hub refuses to start. It does not continue from an incomplete INI registry.
+
+On the first cutover of a legacy installation, old `[team:*]`, `[group:*]`,
+`[project:*]`, and `[app:*]` sections are migration input only. The hub:
+
+1. takes a mandatory online SQLite backup when a pre-existing store is present;
+2. reconciles legacy and database rows without deleting database-only data;
+3. imports manuals and the union of application/project relations;
+4. reloads and verifies the complete typed registry;
+5. writes a private `pizarra.conf.pre-registry-sqlite.*.bak` copy;
+6. removes the legacy registry sections from `pizarra.conf`; and
+7. writes the `registry_authority=sqlite-v1` database marker last.
+
+An interrupted import therefore retries without declaring partial state
+authoritative. After that marker exists, the INI is never a second registry.
+
 ### `[log]`, `[store]`, `[shared]`, and `[prompts]`
 
 ```ini
@@ -73,29 +151,40 @@ path = /var/log/pizarra/pizarra.log
 dir = /var/lib/pizarra
 
 [shared]
-dir = /srv/pizarra/shared
+dir = /mnt/pizarra-shared
 
 [prompts]
 global = Short project context included in deliveries.
-# global_file = prompts/project.txt
+; global_file = prompts/project.txt
 ```
 
-- `store.dir` defaults beside the hub configuration. It must be writable and
-  backed up as a unit.
-- `shared.dir` is optional. The hub creates one flat directory per team plus
-  `console`, with a startup guide at the root.
+- `store.dir` defaults to `/var/lib/pizarra`. The directory must be private,
+  writable by the hub account, and backed up as a unit.
+- `shared.dir` is optional and may be a separately mounted NFS tree. A non-empty
+  value must be absolute; the hub refuses a relative path rather than resolving
+  it against its process working directory. It is not part of the hub store and
+  must not be moved below `/var/lib/pizarra`. The hub creates one flat directory
+  per team plus `console`, with a startup guide at the root. Never place secrets,
+  live configuration, or backup bundles there.
 - `global_file` is resolved relative to the configuration directory unless
   absolute, and takes precedence over `global`.
 
-### `[team:N]`
+## SQLite organization registry
 
-`N` is the stable numeric team ID.
+The following are logical records in `org.sqlite`, exposed through `tiza`, the
+terminal console, the native protocol, and `pzweb`. The legacy INI headings are
+shown nowhere in a current configuration because there is no duplicated live
+INI registry.
+
+### Teams
+
+Each team has a stable numeric ID and an addressable name.
 
 | Key | Meaning |
 |---|---|
 | `name` | Required addressable name |
 | `speciality` | Short routing description |
-| `prompt` / `prompt_file` | Team-specific delivery instruction; file wins |
+| `prompt` | Team-specific delivery instruction |
 | `parent` | Parent team in the hierarchy |
 | `project` | Direct project label |
 | `secret` | Unique credential bound to this team |
@@ -134,7 +223,7 @@ team group project app task workflow watch backup update header
 contain secrets. `update` restarts endpoint daemons. `header` changes context
 shown to the fleet. Delegate each deliberately.
 
-### `[group:NAME]`
+### Groups
 
 | Key | Meaning |
 |---|---|
@@ -152,18 +241,24 @@ shown to the fleet. Delegate each deliberately.
 Excluded teams remain group members for organization, authority, project, and
 workflow purposes; they are only muted from group broadcasts.
 
-### `[project:NAME]`
+Use `tiza group onblock <name> alarm|log|default` to change `on_block` through
+the authoritative hub. `default` stores no group override and therefore uses
+the normal alarm behavior. `log` suppresses the loud operator alarm for a
+detected block in that group; it does not disable detection, delivery holds, or
+an explicitly configured `auto_enter` action.
 
-```ini
-[project:release]
-boss = planner
-```
+Policy composition is deliberately conservative about noise suppression: a
+team is log-only when it is a non-excluded member of at least one group whose
+policy is `log`. An `alarm` policy in another group does not override that
+match. Excluding the team from the log-only group removes that group's effect.
 
-A project currently stores its name and administrator. Teams and groups may
-carry project labels, while registered applications may have explicit
-many-to-many project relations with a role per relation.
+### Projects
 
-### `[app:NAME]`
+A project stores its name and administrator. Teams and groups may carry project
+labels, while registered applications may have explicit many-to-many project
+relations with a role per relation.
+
+### Applications, manuals, and relations
 
 | Key | Meaning |
 |---|---|
@@ -172,10 +267,13 @@ many-to-many project relations with a role per relation.
 | `path` | Runtime/source location |
 | `purpose` | One-line purpose |
 | `detail` | Longer description |
-| `projects` | Mirrored project relation list maintained by runtime operations |
+| project relations | Zero or more project assignments, each with a pair-specific role |
 
-Application manuals and relation roles are stored in hub state rather than
-inline in the INI.
+Application rows, manual bodies, project assignments, pair-specific roles, and
+their audit history all live in `org.sqlite`. `apps.sqlite` is retained as a
+legacy compatibility/migration database; it is not the current application
+authority. Foreign-key cascades in `org.sqlite` remove relation rows when an app
+or project is deleted without deleting the surviving object.
 
 ## Endpoint: `tiza.conf`
 
@@ -192,12 +290,12 @@ inline in the INI.
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `listen` | `0.0.0.0` | Push listener; override with an explicit private address |
+| `listen` | `127.0.0.1` | Push listener; override with an explicit private address |
 | `port` | `7011` | Push delivery port |
 | `secret` | `[pizarra] secret` | Credential expected from the hub; push mode currently receives the hub master secret |
 | `dial` | `off` | Open a reverse channel to the hub |
 | `keepalive` | `60` | Reverse-channel keepalive seconds, minimum 5 |
-| `state` | `<config>.state` | Writable deduplication receipt path |
+| `state` | `/var/lib/pizarra/tiza.state` | Writable deduplication receipt path |
 | `autoupdate` | `off` | Automatically install a newer published endpoint |
 | `update_path` | `/usr/local/bin/tiza` | Installed endpoint binary |
 | `update_sudo` | `off` | Use privilege elevation for installation |
@@ -249,19 +347,33 @@ requires all ten delegated command families.
 | `allow_from` | none | Required IPv4/CIDR admission list |
 | `host` | none | Required exact HTTP `Host` authority |
 | `origin` | none | Required exact mutation origin, `http://` plus `host` |
-| `static` | `web/apps` | Bundled frontend directory |
-| `shared` | empty | Optional shared-file root used by browser file views |
+| `static` | `/usr/local/share/pizarra/web/apps` | Installed frontend directory |
+| `shared` | empty | Optional absolute shared-file root used by browser file views |
 | `user` | none | Required HTTP Basic username; no colon |
 | `password_sha256` | none | Required lowercase 64-hex SHA-256 password digest |
 
 The static and optional shared paths must exist at startup and contain no
-symlink in any path component. `origin` must exactly describe the cleartext HTTP
-authority in `host`; the current server does not implement proxy-aware origin
-rewriting.
+symlink in any path component. A configured shared path must be absolute;
+`pzweb` rejects a relative value instead of making it depend on its working
+directory. `origin` must exactly describe the cleartext HTTP authority in
+`host`; the current server does not implement proxy-aware origin rewriting.
+
+When the exchange is enabled, hub `[shared] dir` and pzweb `[web] shared` must
+name the same reviewed absolute mount, for example `/mnt/pizarra-shared`.
+Clients using `tiza share` also need that mount visible at the same path; clients
+without it use `tiza put` and `tiza get` through the bus. Migration preserves
+both configuration values literally and does not copy the external tree. The
+built-in backup includes the hub configuration reference but no shared-file
+content; restore may restore that reference and never restores the NFS data.
 
 ## Runtime edits
 
-Team, group, project, application, header, task, and workflow commands can
-persist changes. The first runtime organization write preserves a backup of the
-original INI because subsequent machine writes do not retain comments. Keep the
-declarative file and the whole store directory in the same backup policy.
+Team, group, project, application, manual, and relation mutations commit to
+SQLite before the new in-memory projection is published. A failed database
+write is reported and does not become transient configuration that disappears
+on restart. Header settings remain bootstrap INI values; tasks and workflows
+retain their documented stores and SQLite projections.
+
+Use `tiza team`, `tiza group`, `tiza project`, and `tiza app` (or the equivalent
+console/web operations) for registry changes. Do not add live registry sections
+to `pizarra.conf` and do not edit `org.sqlite` behind a running hub.

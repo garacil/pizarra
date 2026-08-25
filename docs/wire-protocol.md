@@ -120,7 +120,7 @@ the `tiza` CLI or the web API unless you are implementing a client library.
 | `task` | Durable task tree and notes | `add`, `state`, `assign`, `note`, `list`, `show`, `delete` |
 | `workflow` | Dependency plans and recovery | `create`, `step`, `start`, `done`, `error`, `fixed`, `verify`, `abort`, `list`, `show`, `clone`, `insert`, `remove`, `set`, `history`, `undo`, `restore`, `delete` |
 | `team` | Team registry | `add`, `set`, `show`, `remove`, `list` |
-| `group` | Membership and group policy | `add`, `remove`, `show`, `list`, `boss`, `project`, `exclude`, idle policy and header operations |
+| `group` | Membership and group policy | `add`, `remove`, `show`, `list`, `boss`, `project`, `exclude`, `onblock`, idle policy and header operations |
 | `project` | Project registry | `boss`, `show`, `list`, `remove` |
 | `app` | Application ownership, manuals, projects, and history | `add`, `set`, `show`, `list`, `doc`, `history`, `undo`, `project`, `unproject`, `remove` |
 | `header` | Delivery-envelope policy | `list`, `set`, `note` |

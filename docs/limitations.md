@@ -91,15 +91,19 @@ them rather than assuming an unimplemented safety or availability property.
   team directory level, not an arbitrary directory tree API.
 - **Integrity, not provenance:** SHA-256 verifies complete transfer bytes; there
   is no digital signature or malware/content scan.
-- **SQLite is runtime-optional but operationally important:** without a loadable
-  SQLite library, messaging, tasks, and workflows continue, but registries are
-  read-only and the built-in online backup is unavailable.
+- **SQLite is mandatory for hub startup:** `org.sqlite` is the organization
+  authority. Without a loadable SQLite library and a readable, upgradeable,
+  completely projectable registry, the hub refuses to start. There is no
+  read-only fallback to legacy INI registry sections.
 - **Backup artifacts contain secrets:** confidentiality depends on external
   filesystem and storage controls.
 - **Auxiliary history is outside the built-in backup:** `tiza backup` and
-  `tiza restore` do not include `wfhistory/` workflow undo snapshots or legacy
-  `appdocs/` files. Operators that require those records must protect and
-  restore the subdirectories separately.
+  `tiza restore` do not include `wfhistory/` workflow undo snapshots, legacy
+  `appdocs/` files, the canonical `releases/` artifact tree, or content from the
+  external shared/NFS root. The backup contains the hub config's shared-path
+  reference only. Operators that require those records, cannot regenerate
+  releases, or need shared data must protect and restore them separately with a
+  coordinated external snapshot.
 - **Linux-specific secure file handling:** browser shared-file operations rely
   on Linux descriptor facilities. The suite targets Unix-like systems, with its
   strongest tested operational assumptions on GNU/Linux.

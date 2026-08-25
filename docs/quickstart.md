@@ -13,6 +13,8 @@ You need:
 - `tmux` for managed terminal sessions;
 - `libsqlite3` at runtime for registry writes and audit history.
 
+Node.js and npm are not part of the build or test toolchain.
+
 Check the compiler and build the suite:
 
 ```sh
@@ -28,104 +30,108 @@ then writes an ignored `config.mk` containing installation paths only. Run
 
 The build creates `pizarra`, `tiza`, and `pzweb` in the repository root.
 
-## 2. Create private configuration
+## 2. Install and initialize the canonical layout
 
-Copy the public examples with restrictive permissions:
+Install binaries and browser assets:
 
 ```sh
-install -m 600 conf/pizarra.conf.example conf/pizarra.conf
-install -m 600 conf/tiza.conf.example conf/tiza.conf
-install -m 600 conf/pzweb.conf.example conf/pzweb.conf
+sudo make install
 ```
 
-Generate separate long random values for:
+For a new machine, the first **implicit** root run creates the protected Unix
+layout, generates one random master credential, and writes matching hub and
+console files. `--migrate-only` performs that initialization and verifies the
+empty SQLite registry without opening a listener or watchdog:
 
-- the hub master secret;
-- each team secret;
-- the web console's bound team secret;
-- the web login password.
-
-Never use the same value for the master and a team. Real configuration is
-ignored by Git, but permissions and backup handling still matter.
-
-## 3. Configure the hub
-
-Use loopback, writable state paths, and one local team. Replace all angle-bracket
-placeholders before starting.
-
-```ini
-[server]
-listen = 127.0.0.1
-port = 7010
-secret = <master-secret>
-master_console_only = on
-header = short
-
-[log]
-path = /absolute/private/path/pizarra.log
-
-[store]
-dir = /absolute/private/path/store
-
-[prompts]
-global = Work through pizarra, report progress, and verify before completion.
-
-[team:1]
-name = builder
-speciality = Implements and verifies the assigned work
-prompt = Be concise. Report evidence and close completed tasks.
-secret = <builder-secret>
-tmux_session = pizarra-builder
-launch = <interactive-agent-command>
-workdir = /absolute/path/to/the/project
+```sh
+sudo /usr/local/bin/pizarra --migrate-only
 ```
 
-`launch` is executed by the service account and must start an interactive
-terminal program that accepts pasted input. Treat this setting as code. Omit
-the optional team `user` when the hub and session use the same account. Setting
-`user` makes the hub invoke `su` and therefore requires a service topology that
-is explicitly allowed to switch operating-system accounts.
+The result is:
 
-Create a second `tiza` configuration for commands sent from inside that managed
-session:
-
-```ini
-[pizarra]
-host = 127.0.0.1
-port = 7010
-secret = <builder-secret>
-self = builder
+```text
+/etc/pizarra/pizarra.conf       bootstrap/static hub settings, mode 0600
+/etc/pizarra/tiza.conf          matching console identity, mode 0600
+/var/lib/pizarra/.pizarra-hub.lock
+                                persistent exclusive hub/restore lock, mode 0600
+/var/lib/pizarra/releases/      endpoint release root, mode 0700
+/var/lib/pizarra/org.sqlite     authoritative organization registry
+/var/lib/pizarra/work.sqlite    task projection/history
+/var/lib/pizarra/apps.sqlite    retained legacy compatibility database
+/var/log/pizarra/pizarra.log    hub log
+/usr/local/share/pizarra/web/apps/
 ```
 
-Point the session at it with `TIZA_CONF` in the environment or include that
-environment assignment in the launch command. Identity comes from `self`; a
-normal command-line `--from` does not override it.
+The generated listeners are loopback-only and `[registry] authority = sqlite`.
+If you supply `--config` or `PIZARRA_CONF`, the path is strict and no first-run
+files are generated. An alternative manual installation may copy the public
+examples into `/etc/pizarra`, but every placeholder secret must be replaced and
+the directories/files must retain their documented modes.
 
-## 4. Configure the human console
+`pizarra.conf` is not a team registry. Do not add new `[team:*]`, `[group:*]`,
+`[project:*]`, or `[app:*]` sections; current organization state lives only in
+`org.sqlite` and is changed through the hub.
 
-Edit `conf/tiza.conf`:
-
-```ini
-[pizarra]
-host = 127.0.0.1
-port = 7010
-secret = <master-secret>
-self = console
-```
+## 3. Start the hub and register a local agent team
 
 Start the hub in one terminal:
 
 ```sh
-./pizarra --config conf/pizarra.conf
+sudo /usr/local/bin/pizarra
 ```
 
-Start the human console in another:
+In another terminal, create the team through the generated console identity:
 
 ```sh
-./tiza --config conf/tiza.conf chat
+sudo /usr/local/bin/tiza team add builder \
+  "Implements and verifies assigned work" --session pizarra-builder
+sudo /usr/local/bin/tiza team set builder workdir /absolute/path/to/the/project
+sudo /usr/local/bin/tiza team set builder prompt \
+  "Be concise. Report evidence and close completed tasks."
 ```
 
-The hub watchdog creates `pizarra-builder` if it is missing. In the console:
+Give every agent a unique bound credential. Store that same value in a private
+identity file such as `/etc/pizarra/agents/builder.conf`, then load it into the
+registry without placing it in argument history:
+
+```sh
+sudo install -d -m 0711 -o root -g root /etc/pizarra/agents
+sudo /usr/local/bin/tiza team set builder secret --file /secure/builder.secret
+```
+
+The identity file has this shape and must be mode `0600`, owned by the account
+that runs the session:
+
+```ini
+[pizarra]
+host = 127.0.0.1
+port = 7010
+secret = <the-exact-builder-secret>
+self = builder
+```
+
+Configure the reviewed interactive agent wrapper as the tmux launch program:
+
+```sh
+sudo /usr/local/bin/tiza team set builder launch \
+  "bash -lc 'export TIZA_CONF=/etc/pizarra/agents/builder.conf; exec /usr/local/bin/start-ai-agent'"
+```
+
+The hub watchdog creates `pizarra-builder` on its next pass and starts the agent
+in the configured `workdir`. `launch` is executable code; use only a reviewed
+command. If the hub/session uses another operating-system account, change the
+file ownership, service `User`/`Group`, and registry `user` coherently.
+
+## 4. Use the human console
+
+The generated `/etc/pizarra/tiza.conf` identifies as `console` with the matching
+master credential:
+
+```sh
+sudo /usr/local/bin/tiza chat
+```
+
+In the console:
 
 ```text
 builder: Report your identity and current open tasks.
@@ -135,36 +141,36 @@ builder: Report your identity and current open tasks.
 /tree
 ```
 
-From a regular shell, the equivalent direct commands are:
+Equivalent one-shot commands are:
 
 ```sh
-./tiza --config conf/tiza.conf builder "Report your identity and current open tasks."
-./tiza --config conf/tiza.conf task add builder "Inspect the project and propose a verified first change"
-./tiza --config conf/tiza.conf task list open builder
+sudo /usr/local/bin/tiza builder "Report your identity and current open tasks."
+sudo /usr/local/bin/tiza task add builder \
+  "Inspect the project and propose a verified first change"
+sudo /usr/local/bin/tiza task list open builder
 ```
 
 ## 5. Add the web console
 
-The web console intentionally needs a powerful but identity-bound credential.
-Add an inbox-only team to `pizarra.conf`:
+`pzweb` needs an inbox-only, identity-bound team with every administrative
+family. Create it through the hub, not in `pizarra.conf`:
 
-```ini
-[team:90]
-name = pzweb
-speciality = Private operational web console
-secret = <web-team-secret>
-tmux_session = -
-delegate = team, group, project, app, task, workflow, watch, backup, update, header
+```sh
+sudo /usr/local/bin/tiza team add pzweb \
+  "Private operational web console" --session -
+sudo /usr/local/bin/tiza team set pzweb secret --file /secure/pzweb-team.secret
+sudo /usr/local/bin/tiza team set pzweb delegate \
+  "team,group,project,app,task,workflow,watch,backup,update,header"
 ```
 
-Restart the hub after editing the declarative configuration. Then edit
-`conf/pzweb.conf`:
+Install `/etc/pizarra/pzweb.conf` with the same bound team secret and a separate
+HTTP password digest:
 
 ```ini
 [pizarra]
 host = 127.0.0.1
 port = 7010
-secret = <web-team-secret>
+secret = <the-exact-pzweb-team-secret>
 self = pzweb
 
 [web]
@@ -173,47 +179,46 @@ port = 7080
 allow_from = 127.0.0.1
 host = 127.0.0.1:7080
 origin = http://127.0.0.1:7080
-static = web/apps
+static = /usr/local/share/pizarra/web/apps
 user = operator
 password_sha256 = <64-lowercase-hex-sha256-of-the-password>
 ```
 
-`pzweb.conf` must be a regular, non-symlinked file with permissions exactly
-`0600`. Start the service:
+The file must be a regular, non-symlinked file with permissions exactly `0600`.
+Start it and open `http://127.0.0.1:7080/`:
 
 ```sh
-./pzweb --config conf/pzweb.conf
+sudo /usr/local/bin/pzweb
 ```
 
-Open `http://127.0.0.1:7080/` and authenticate with the configured user and the
-original password, not its digest.
+The browser uses the original HTTP password, not its digest. `pzweb` does not
+open `org.sqlite` or parse registry files; every organization view and registry
+mutation is proxied to the running hub over its authenticated bus connection.
 
 ## 6. Add a remote team host
 
-On the hub, replace a local session target with a remote push target:
+Create a push-delivered team through the console identity:
 
-```ini
-[team:2]
-name = reviewer
-speciality = Reviews changes and verifies workflow recovery
-secret = <reviewer-secret>
-host = 10.0.0.42:7011
+```sh
+sudo /usr/local/bin/tiza team add reviewer \
+  "Reviews changes and verifies recovery" --remote 192.0.2.42:7011
+sudo /usr/local/bin/tiza team set reviewer secret --file /secure/reviewer.secret
 ```
 
-On that private host, create `tiza.conf`:
+On that private host, create `/etc/pizarra/tiza.conf`:
 
 ```ini
 [pizarra]
-host = 10.0.0.10
+host = 192.0.2.10
 port = 7010
 secret = <reviewer-secret>
 self = reviewer
 
 [daemon]
-listen = 10.0.0.42
+listen = 192.0.2.42
 port = 7011
 secret = <hub-master-secret>
-state = /var/lib/tiza/tiza.state
+state = /var/lib/pizarra/tiza.state
 
 [session:reviewer]
 tmux_session = pizarra-reviewer
@@ -221,28 +226,26 @@ launch = <interactive-agent-command>
 workdir = /srv/reviewer/project
 ```
 
-This example keeps the daemon and managed session under the same operating-
-system account. Configure a session `user` only when the daemon is intentionally
-privileged to switch accounts; the unprivileged example service cannot do so.
-
 The current push path authenticates hub-to-daemon delivery with the hub master
-secret. This places that credential on the remote host. Keep both ports private
-and prefer reverse dial when distributing the master is unacceptable.
-
-For a host that cannot accept inbound connections, set `dial = on` in the
-daemon section and `dial = on` on the matching hub team, with no `host` value.
+secret. Keep both ports private and prefer reverse dial when that credential
+must not leave the control host. For reverse dial, set `dial = on` in the daemon
+INI and `tiza team set reviewer dial on`, then clear the team host with
+`tiza team set reviewer host -`.
 
 ## 7. Verify behavior
 
-Run these checks before opening any listener beyond loopback:
+Run these checks before opening a listener beyond loopback:
 
 ```sh
-./pizarra --version
-./tiza --version
-./pzweb --version
-./tiza --config conf/tiza.conf ver
-./tiza --config conf/tiza.conf fleet
-./tiza --config conf/tiza.conf inbox --keep
+/usr/local/bin/pizarra --version
+/usr/local/bin/tiza --version
+/usr/local/bin/pzweb --version
+sudo /usr/local/bin/tiza ver
+sudo /usr/local/bin/tiza fleet
+sudo /usr/local/bin/tiza team list
+sudo /usr/local/bin/tiza group list
+sudo /usr/local/bin/tiza app list
+sudo /usr/local/bin/tiza inbox --keep
 ```
 
 Then test one immediate delivery, one queued delivery while a host daemon is

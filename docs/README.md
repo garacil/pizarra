@@ -4,6 +4,13 @@ This documentation describes the public `pizarra` suite as implemented by the
 source tree: the `pizarra` hub, the `tiza` client/console/host daemon, and the
 `pzweb` browser console.
 
+The installed layout is centralized under `/etc/pizarra`, `/var/lib/pizarra`,
+and `/var/log/pizarra`. `org.sqlite` is the sole live organization registry;
+`pzweb` reaches it only through authenticated hub commands. See
+[Configuration](configuration.md) for authority and paths and
+[Operations](operations.md#consolidating-an-existing-checkout-based-installation)
+for lossless cutover from an older checkout-based deployment.
+
 ## Start here
 
 | Document | Purpose |

@@ -84,6 +84,17 @@ Recommended controls:
 
 Authentication without confidential transport is not sufficient protection.
 
+## Configuration-file boundary
+
+All typed hub, client, daemon, and web loaders parse a selected
+credential-bearing INI from one descriptor held for the complete read. The
+final file must be regular with mode exactly `0600`; symbolic links in any path
+component and group/other-writable ancestors are rejected, except for a
+root-owned sticky directory such as `/tmp`. Comparing the pre-open path metadata
+with the opened descriptor and then parsing only that descriptor prevents a
+pathname replacement from redirecting the read. Quoted INI values are stripped
+consistently across loaders.
+
 ## Web safeguards
 
 `pzweb` fails startup unless its security contract is complete:
@@ -159,13 +170,26 @@ The optional shared exchange is operational coordination space, not a secure
 content scanner. Per-team directories are intentionally writable for exchange
 and may use sticky-directory semantics.
 
+Treat it as a separate mounted data domain. Hub `[shared] dir` and pzweb
+`[web] shared` must name the same reviewed absolute mount; do not relocate it
+under `/var/lib/pizarra` during consolidation. Store no credentials, live
+configuration, backup bundle, or release authority in this tree. Migration and
+repository retirement preserve the configuration references but do not copy,
+move, archive, or remove external shared data. The built-in backup contains the
+hub configuration reference only, and restore never restores shared content;
+use a coordinated external snapshot when recovery requires it.
+
 Safeguards include:
 
 - restricted basenames and exact directory levels;
 - no path separators, dot segments, or NUL bytes in public file selectors;
 - descriptor-anchored, no-follow browser operations;
+- local/NFS sharing reserves a mode-`0600` regular temporary inode with
+  `O_CREAT|O_EXCL` and, on Linux, `O_NOFOLLOW` before copying, then publishes it
+  mode `0644` only after completion; a preplanted symlink is never followed or
+  removed;
 - no overwrite on name collision;
-- temporary staging followed by atomic rename;
+- private temporary staging followed by atomic link or rename publication;
 - exact upload offsets and whole-file SHA-256 verification;
 - 512 KiB native chunks and a 10 MiB transferred-file cap; and
 - explicit recursive deletion with partial-outcome reporting.
@@ -177,8 +201,12 @@ the bytes received are the bytes the authenticated sender declared.
 ## Persistence, logs, and backups
 
 The journal, configuration, task text, workflow evidence, application manuals,
-shared files, and logs may all contain sensitive data. Use owner-only
-permissions and encrypted storage where the host threat model requires it.
+and logs may all contain sensitive data. Protect those private state files and
+backups with owner-only permissions and encrypted storage where the host threat
+model requires it. The shared exchange is intentionally different: the hub
+uses sticky writable team directories and publishes exchange files for peer
+access. Control that external mount at the NFS/export, network, host-account,
+and directory boundaries, and do not put secrets there.
 
 Backups include the hub configuration and credentials by design. They are
 assembled privately and published atomically with a digest manifest, but the

@@ -1,14 +1,15 @@
 { pzconfig - INI configuration loader and delivery-message builder, shared by
   pizarra (daemon) and tiza (client/daemon/chat).
 
-  pizarra.conf:
-    [server]  listen / port / secret
+  pizarra.conf (bootstrap/static settings only):
+    [server]  listen / port / secret / releases
     [log]     path
     [store]   dir
     [prompts] global | global_file   (short project prompt on every delivery)
-    [team:N]  name / speciality / prompt | prompt_file
-              host = ip[:port]   -> remote team: push to the tiza daemon there
-              tmux_session, launch -> local team: hub injects + respawns itself
+
+  Teams, groups, projects, applications, manuals, and their relations live in
+  SQLite. Legacy [team:*], [group:*], [project:*], and [app:*] sections are
+  accepted only as one-time migration input and are then removed atomically.
 
   tiza.conf:
     [pizarra]      host / port / secret / self
@@ -18,13 +19,10 @@
   The *_file prompt variants read a UTF-8 text file (path relative to the
   config file's directory unless absolute) and win over the inline key.
 
-  Config file resolution (first that exists):
-    1. explicit path argument
-    2. $PIZARRA_CONF / $TIZA_CONF
-    3. ~/.config/pizarra/<name>
-    4. /etc/pizarra/<name>
-    5. ./conf/<name>
-    6. ./<name>                                                              }
+  Config file resolution:
+    1. explicit path argument (strict; no fallback)
+    2. $PIZARRA_CONF / $TIZA_CONF / $PZWEB_CONF (strict; no fallback)
+    3. /etc/pizarra/<name> (the only implicit runtime location)               }
 unit pzconfig;
 
 {$mode objfpc}{$H+}
@@ -32,7 +30,7 @@ unit pzconfig;
 interface
 
 uses
-  SysUtils, Classes, IniFiles, pzmanual, Types, Unix, BaseUnix;
+  SysUtils, Classes, IniFiles, pzmanual, pzlayout, Types, Unix, BaseUnix;
 
 const
   DEFAULT_DAEMON_PORT = 7011;
@@ -125,13 +123,9 @@ type
     Purpose: string;   { one line: what it is for }
     Detail:  string;   { longer: what it actually does }
     HasDoc:  Boolean;  { has a manual; resolved at load time, not by file }
-    { THE PROJECTS THIS APP TAKES PART IN, comma-separated, mirrored from the
-      INI. The relation itself lives in the database - which rules after load -
-      and this is the mirror written on every mutation, exactly like the rest of
-      an app's fields. It exists because the header is built in pzconfig, which
-      has NO database access: without the mirror the header could not name a
-      single project. The per-pair role is mirrored too, as one key each, but is
-      not loaded here: nothing in the header shows it and the budget is measured. }
+    { Comma-separated projection of the authoritative app_project rows loaded
+      from SQLite. It exists because the delivery-header builder intentionally
+      has no database dependency. Per-pair roles remain in app_project. }
     Projects: string;
   end;
   TAppArray = array of TApp;
@@ -149,6 +143,7 @@ type
     Secret:       string;
     LogPath:      string;
     StoreDir:     string;
+    RegistryAuthority: string; { [registry] authority: sqlite }
     SharedDir:    string;   { NFS exchange root; '' = feature off }
     Releases:     string;   { release-artifact dir served to self-updating
                               daemons (cmd=upget); '' = feature off }
@@ -221,14 +216,11 @@ type
     HubHost:   string;             { [pizarra] host — where to dial }
     HubPort:   Word;               { [pizarra] port }
     HubSecret: string;             { [pizarra] secret — presented when dialing }
-    { DELIVERY-RECEIPT LOCATION. By default it sits next to the configuration
-      file (<config>.state), which assumes the daemon can write that directory.
-      A root-owned configuration under /etc and an unprivileged daemon cannot
-      satisfy that assumption. The tmp+rename save needs directory write access,
-      not merely ownership of an existing file. Without the receipt, a restart
-      forgets the delivered position and can inject a message twice. This option
-      selects a writable state path. }
-    StatePath: string;             { [daemon] state; '' = <config>.state }
+    { DELIVERY-RECEIPT LOCATION. It defaults to /var/lib/pizarra/tiza.state:
+      configuration is root-owned under /etc while the daemon needs directory
+      write access for its tmp+rename save. Without the receipt, a restart
+      forgets the delivered position and can inject a message twice. }
+    StatePath: string;             { [daemon] state; defaults under /var/lib }
     SelfId:    string;             { identity label for the dial connection }
     Sessions:  TPzSessionArray;
     { self-update (1.0.3) — all static, no operator on the box needed }
@@ -245,9 +237,18 @@ function ResolveConfigStrict(const Explicit, EnvVar, BaseName: string;
 
 function ResolveConfig(const Explicit, EnvVar, BaseName: string): string;
 
+{ Secure first implicit hub start. Call only when neither --config nor
+  PIZARRA_CONF was supplied. Existing files are never overwritten. }
+function BootstrapDefaultPizarraConfig(out Why: string): Boolean;
+
 function LoadPizarraConfig(const Path: string): TPizarraConfig;
 function LoadTizaConfig(const Path: string): TTizaConfig;
 function LoadTizaDaemonConfig(const Path: string): TTizaDaemonConfig;
+
+{ Open an INI through the same descriptor-pinned, mode-0600 reader used by
+  the typed loaders. This is reserved for migration-only keys that are not
+  part of TPizarraConfig; callers own the returned instance. }
+function OpenPrivateIniFile(const Path: string): TIniFile;
 
 { Delegable families in one authoritative list shared by cards, authorization,
   and documentation. }
@@ -293,24 +294,11 @@ function ProjectBossOf(const Cfg: TPizarraConfig; const TeamName: string): strin
 { Boss of the first group (with a boss) the team belongs to. }
 function GroupBossOf(const Cfg: TPizarraConfig; const TeamName: string): string;
 
-{ Persist a project registry entry [project:NAME] boss = X. }
-procedure SaveProjectIni(const Path: string; const Prj: TProject);
-procedure RemoveProjectIni(const Path, Name_: string);
-
 { Persist the delivery-header config ([server] header + the [header] toggles). }
 procedure SaveHeaderIni(const Path: string; const Cfg: TPizarraConfig);
 
 { Groups (comma list) a team belongs to, for the header/tree. }
 function GroupsOf(const Cfg: TPizarraConfig; const TeamName: string): string;
-
-{ Runtime group persistence into [group:NAME] members = a, b, c. }
-procedure SaveAppIni(const Path: string; const A: TApp; Roles: TStringList = nil);
-procedure DeleteAppIni(const Path, Name: string);
-procedure SaveGroupIni(const Path: string; const Grp: TGroup);
-{ Remove a team and update every affected group in ONE INI transaction. }
-procedure RemoveTeamWithGroupsIni(const Path: string; Id: Integer;
-  const Groups: TGroupArray);
-procedure RemoveGroupIni(const Path, Name: string);
 
 { Session lookup in a daemon config, by team name. }
 function FindSession(const Cfg: TTizaDaemonConfig; const Team: string;
@@ -344,13 +332,12 @@ function SubordinatesOf(const Cfg: TPizarraConfig;
   runtime /team set parent changes. }
 procedure ValidateParents(var Cfg: TPizarraConfig);
 
-{ Runtime team persistence: rewrite one [team:N] section / erase it. On the
-  FIRST runtime write the original file is preserved once as <path>.bak
-  (TIniFile does not keep comments; the file becomes machine-managed). }
-
-
-procedure SaveTeamIni(const Path: string; const T: TTeam);
-procedure RemoveTeamIni(const Path: string; Id: Integer);
+{ One-time cutover helper. Preserve an owner-only timestamped copy, remove all
+  legacy team/group/project/app sections atomically, and leave only the SQLite
+  authority marker in the bootstrap INI. Existing data is never deleted from
+  SQLite and the backup is never overwritten. }
+function StripLegacyRegistryIni(const Path: string; out BackupPath,
+  Err: string): Boolean;
 
 { 'ip' or 'ip:port' -> host + port (default DEFAULT_DAEMON_PORT). }
 procedure SplitHostPort(const S: string; out Host: string; out Port: Word);
@@ -377,9 +364,58 @@ function BuildDeliveryMinimal(const Team: TTeam; const FromName, ReplyTo,
 
 implementation
 
-{ THE ONLY INI VALUE SANITIZER. Every writer must use it: a newline in an
-  unfiltered group project value could inject complete pizarra.conf sections,
-  including a team identity and secret.
+type
+  { TIniFile's filename constructor opens by pathname and therefore follows
+    links. This reader keeps the descriptor returned by PzOpenPrivateConfig
+    alive for the complete parse and closes it only after TIniFile is done. }
+  TSecureIniFile = class(TIniFile)
+  private
+    FInput: THandleStream;
+    FInputHandle: Integer;
+  public
+    constructor CreatePrivate(const Path: string);
+    destructor Destroy; override;
+  end;
+
+constructor TSecureIniFile.CreatePrivate(const Path: string);
+var
+  Full, Why: string;
+begin
+  FInput := nil;
+  FInputHandle := -1;
+  if not PzOpenPrivateConfig(Path, FInputHandle, Full, Why) then
+    raise EInOutError.Create('unsafe credential configuration ' + Path + ': ' + Why);
+  try
+    FInput := THandleStream.Create(FInputHandle);
+    { The filename constructor enables ifoStripQuotes automatically; the stream
+      overload does not, so request the identical parsing behavior explicitly. }
+    inherited Create(FInput, [ifoStripQuotes]);
+  except
+    FInput.Free;
+    FInput := nil;
+    FpClose(FInputHandle);
+    FInputHandle := -1;
+    raise;
+  end;
+end;
+
+destructor TSecureIniFile.Destroy;
+begin
+  inherited Destroy;
+  FreeAndNil(FInput);
+  if FInputHandle >= 0 then
+    FpClose(FInputHandle);
+  FInputHandle := -1;
+end;
+
+function OpenPrivateIniFile(const Path: string): TIniFile;
+begin
+  Result := TSecureIniFile.CreatePrivate(Path);
+end;
+
+{ THE ONLY INI VALUE SANITIZER. Every static-configuration writer must use it:
+  a newline in an unfiltered header note could inject new pizarra.conf
+  sections, including altered server or store settings.
 
   Collapse line breaks because they split the file. Remove one surrounding
   quote pair because TIniFile.ReadString strips it on reload; otherwise a
@@ -400,8 +436,8 @@ end;
   before writing and provides no temporary file, rename, or fsync. With default
   CacheUpdates, every WriteString/DeleteKey can rewrite the whole file.
 
-  pizarra.conf carries the bus secret and complete registry, so interruption
-  inside that window could leave an empty or truncated authority file. Work on
+  pizarra.conf carries the bus secret and bootstrap settings, so interruption
+  inside that window could leave an empty or truncated identity file. Work on
   a COPY and rename it into place. Keep TIniFile rather than switching to
   TMemIniFile because their quote-stripping behavior differs.
 
@@ -410,16 +446,46 @@ end;
   from its intended target. }
 function RealTarget(const Path: string): string;
 var
-  R: string;
+  R, Cur: string;
+  Seen: TStringList;
+  St: TStat;
+  Depth, ErrNo: Integer;
 begin
-  Result := Path;
-  R := fpReadLink(Path);
-  while R <> '' do
-  begin
-    if (R <> '') and (R[1] <> '/') then
-      R := IncludeTrailingPathDelimiter(ExtractFilePath(Result)) + R;
-    Result := R;
-    R := fpReadLink(Result);
+  Cur := ExpandFileName(Path);
+  Seen := TStringList.Create;
+  try
+    Seen.CaseSensitive := True;
+    Seen.Sorted := True;
+    Seen.Duplicates := dupIgnore;
+    for Depth := 0 to 39 do
+    begin
+      if Seen.IndexOf(Cur) >= 0 then
+        raise EInOutError.Create('symbolic-link cycle while resolving ' + Path);
+      Seen.Add(Cur);
+      St := Default(TStat);
+      if FpLStat(Cur, St) <> 0 then
+      begin
+        ErrNo := fpgeterrno;
+        if ErrNo = ESysENOENT then
+          Exit(Cur);
+        raise EInOutError.CreateFmt('cannot inspect %s: %s',
+          [Cur, SysErrorMessage(ErrNo)]);
+      end;
+      if not fpS_ISLNK(St.st_mode) then
+        Exit(Cur);
+      R := fpReadLink(Cur);
+      if R = '' then
+        raise EInOutError.CreateFmt('cannot read symbolic link %s: %s',
+          [Cur, SysErrorMessage(fpgeterrno)]);
+      if R[1] <> PathDelim then
+        Cur := ExpandFileName(IncludeTrailingPathDelimiter(
+          ExtractFileDir(Cur)) + R)
+      else
+        Cur := ExpandFileName(R);
+    end;
+    raise EInOutError.Create('too many symbolic links while resolving ' + Path);
+  finally
+    Seen.Free;
   end;
 end;
 
@@ -448,13 +514,24 @@ end;
   writer needs a broader redesign. }
 function CreateTempWithRetry(const Tmp: string): TFileStream;
 var
-  Attempts: Integer;
+  Attempts, ErrNo: Integer;
 begin
   Result := nil;
   for Attempts := 1 to 20 do
   begin
     try
-      Result := TFileStream.Create(Tmp, fmCreate);
+      { The three-argument constructor passes Rights to FileCreate. Creating
+        the inode as 0600 closes the exposure window that a later chmod would
+        leave when the process umask is 0022. }
+      Result := TFileStream.Create(Tmp, fmCreate, &600);
+      if FpChmod(Tmp, &600) <> 0 then
+      begin
+        ErrNo := fpgeterrno;
+        FreeAndNil(Result);
+        DeleteFile(Tmp);
+        raise EInOutError.CreateFmt('could not protect %s as mode 0600: %s',
+          [Tmp, SysErrorMessage(ErrNo)]);
+      end;
       Exit;
     except
       on E: EFCreateError do
@@ -469,30 +546,94 @@ end;
 
 function IniOpenForWrite(const Path: string): TIniFile;
 var
-  Tmp, Real_: string;
+  Tmp, Real_, Line: string;
   Src, Dst: TFileStream;
+  Lines: TStringList;
+  i, p: Integer;
 begin
   Real_ := RealTarget(Path);
   Tmp := Real_ + '.tmp';
-  DeleteFile(Tmp);
-  if FileExists(Real_) then
-  begin
-    Src := TFileStream.Create(Real_, fmOpenRead or fmShareDenyNone);
-    try
-      Dst := CreateTempWithRetry(Tmp);
+  if FileExists(Tmp) and (not DeleteFile(Tmp)) then
+    raise EInOutError.CreateFmt('could not remove stale temporary file %s',
+      [Tmp]);
+  Dst := CreateTempWithRetry(Tmp);
+  try
+    if FileExists(Real_) then
+    begin
+      Src := TFileStream.Create(Real_, fmOpenRead or fmShareDenyNone);
       try
         if Src.Size > 0 then
           Dst.CopyFrom(Src, Src.Size);
       finally
-        Dst.Free;
+        Src.Free;
       end;
-    finally
-      Src.Free;
     end;
+  finally
+    Dst.Free;
   end;
-  Result := TIniFile.Create(Tmp);
+  { FPC 3.2.2 TIniFile recognizes only ';' as a comment marker. Existing
+    examples historically used '#'; without normalization UpdateFile drops a
+    leading hash comment or serializes it as an empty-key assignment. Convert
+    only lines whose first non-space byte is '#', never hashes inside values. }
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(Tmp);
+    for i := 0 to Lines.Count - 1 do
+    begin
+      Line := Lines[i];
+      p := 1;
+      while (p <= Length(Line)) and (Line[p] in [' ', #9]) do
+        Inc(p);
+      if (p <= Length(Line)) and (Line[p] = '#') then
+      begin
+        Line[p] := ';';
+        Lines[i] := Line;
+      end;
+    end;
+    Lines.SaveToFile(Tmp);
+    if FpChmod(Tmp, &600) <> 0 then
+      raise EInOutError.CreateFmt('could not retain mode 0600 on %s', [Tmp]);
+  finally
+    Lines.Free;
+  end;
+  try
+    Result := TIniFile.Create(Tmp);
+  except
+    DeleteFile(Tmp);
+    raise;
+  end;
   { Prevent each WriteString from rewriting the complete temporary file. }
   Result.CacheUpdates := True;
+end;
+
+function SyncParentDirectory(const Path: string; out Why: string): Boolean;
+var
+  Dir: string;
+  H, ErrNo: Integer;
+begin
+  Result := False;
+  Why := '';
+  Dir := ExtractFileDir(ExpandFileName(Path));
+  H := FpOpen(Dir, O_RDONLY or O_DIRECTORY);
+  if H < 0 then
+  begin
+    ErrNo := fpgeterrno;
+    Why := 'cannot open parent directory ' + Dir + ' for fsync: ' +
+      SysErrorMessage(ErrNo);
+    Exit;
+  end;
+  try
+    if PzFsync(H) <> 0 then
+    begin
+      ErrNo := fpgeterrno;
+      Why := 'cannot fsync parent directory ' + Dir + ': ' +
+        SysErrorMessage(ErrNo);
+      Exit;
+    end;
+  finally
+    FpClose(H);
+  end;
+  Result := True;
 end;
 
 { Flush to the temporary file, sync it, and rename over the destination. Do not
@@ -502,26 +643,45 @@ procedure IniCommit(Ini: TIniFile);
 var
   Tmp, Path: string;
   H: THandle;
-  Mode: Integer;
-  StBuf: TStat;
+  ErrNo: Integer;
+  Why: string;
 begin
-  Ini.UpdateFile;
   Tmp := Ini.FileName;
-  if Copy(Tmp, Length(Tmp) - 3, 4) <> '.tmp' then
+  if (Length(Tmp) < 4) or
+     (Copy(Tmp, Length(Tmp) - 3, 4) <> '.tmp') then
     Exit;   { not opened by IniOpenForWrite; nothing to rename }
   Path := Copy(Tmp, 1, Length(Tmp) - 4);
-  { Preserve the original mode. Otherwise umask may create a world-readable
-    replacement and expose the bus secret on every atomic save. }
-  Mode := 0;
-  if FpStat(Path, StBuf) = 0 then
-    Mode := StBuf.st_mode and &7777;
+  { TIniFile.UpdateFile reaches TStringList.SaveToFile, whose fmCreate would
+    otherwise use 0666 subject to umask. The inode already exists as 0600, and
+    chmod is repeated after the rewrite so neither implementation changes nor
+    an unusual RTL can make the secret-bearing temporary file readable. }
+  if FpChmod(Tmp, &600) <> 0 then
+  begin
+    ErrNo := fpgeterrno;
+    raise EInOutError.CreateFmt('could not protect %s before update: %s',
+      [Tmp, SysErrorMessage(ErrNo)]);
+  end;
+  Ini.UpdateFile;
+  if FpChmod(Tmp, &600) <> 0 then
+  begin
+    ErrNo := fpgeterrno;
+    raise EInOutError.CreateFmt('could not protect %s after update: %s',
+      [Tmp, SysErrorMessage(ErrNo)]);
+  end;
   { fsync before rename so power loss cannot preserve the rename without data. }
   { Explicit sharing avoids an FPC LOCK_EX request that can make FileOpen fail
     and silently skip fsync before the rename. }
   H := FileOpen(Tmp, fmOpenRead or fmShareDenyNone);
-  if H <> THandle(-1) then
-  begin
-    fpfsync(H);
+  if H = THandle(-1) then
+    raise EInOutError.CreateFmt('could not reopen %s for fsync', [Tmp]);
+  try
+    if PzFsync(H) <> 0 then
+    begin
+      ErrNo := fpgeterrno;
+      raise EInOutError.CreateFmt('could not fsync %s: %s',
+        [Tmp, SysErrorMessage(ErrNo)]);
+    end;
+  finally
     FileClose(H);
   end;
   if not RenameFile(Tmp, Path) then
@@ -529,8 +689,11 @@ begin
     DeleteFile(Tmp);
     raise EInOutError.CreateFmt('could not rename %s over %s', [Tmp, Path]);
   end;
-  if Mode <> 0 then
-    FpChmod(Path, Mode);
+  { The rename is already committed. A directory-fsync failure must be made
+    visible, but reporting the whole mutation as failed would be false and
+    could make a caller retry a change that is already on disk. }
+  if not SyncParentDirectory(Path, Why) then
+    Writeln(StdErr, 'pizarra: warning: configuration committed but ', Why);
 end;
 
 function FileHere(const P: string): Boolean;
@@ -598,30 +761,46 @@ end;
 
 function ResolveConfig(const Explicit, EnvVar, BaseName: string): string;
 var
-  Home, Env: string;
+  Env, DefaultPath: string;
 begin
-  if FileHere(Explicit) then
-    Exit(Explicit);
+  if Trim(Explicit) <> '' then
+  begin
+    if FileHere(Explicit) then
+      Exit(Explicit);
+    Exit('');
+  end;
   Env := GetEnvironmentVariable(EnvVar);
-  if FileHere(Env) then
-    Exit(Env);
-  Home := GetEnvironmentVariable('HOME');
-  if (Home <> '') and FileHere(Home + '/.config/pizarra/' + BaseName) then
-    Exit(Home + '/.config/pizarra/' + BaseName);
-  if FileHere('/etc/pizarra/' + BaseName) then
-    Exit('/etc/pizarra/' + BaseName);
-  if FileHere('./conf/' + BaseName) then
-    Exit('./conf/' + BaseName);
-  if FileHere('./' + BaseName) then
-    Exit('./' + BaseName);
+  if Trim(Env) <> '' then
+  begin
+    if FileHere(Env) then
+      Exit(Env);
+    Exit('');
+  end;
+  DefaultPath := PzDefaultConfigPath(BaseName);
+  if FileHere(DefaultPath) then
+    Exit(DefaultPath);
   Result := '';
+end;
+
+function BootstrapDefaultPizarraConfig(out Why: string): Boolean;
+begin
+  Result := BootstrapDefaultHub(Why);
 end;
 
 { 'ip' or 'ip:port' -> host + port (default DEFAULT_DAEMON_PORT). }
 procedure SplitHostPort(const S: string; out Host: string; out Port: Word);
 var
   T: string;
-  p, cc: Integer;
+  p, cc, Parsed: Integer;
+
+  procedure ReadPort(const V: string);
+  begin
+    if TryStrToInt(Trim(V), Parsed) and (Parsed >= 1) and
+       (Parsed <= High(Word)) then
+      Port := Word(Parsed)
+    else
+      Port := DEFAULT_DAEMON_PORT;
+  end;
 begin
   T := Trim(S);
   Port := DEFAULT_DAEMON_PORT;
@@ -633,7 +812,7 @@ begin
     begin
       Host := Copy(T, 2, p - 2);
       if (p < Length(T)) and (T[p + 1] = ':') then
-        Port := Word(StrToIntDef(Copy(T, p + 2, Length(T)), DEFAULT_DAEMON_PORT));
+        ReadPort(Copy(T, p + 2, Length(T)));
       Exit;
     end;
   end;
@@ -647,20 +826,25 @@ begin
   begin
     p := Pos(':', T);
     Host := Copy(T, 1, p - 1);
-    Port := Word(StrToIntDef(Copy(T, p + 1, Length(T)), DEFAULT_DAEMON_PORT));
+    ReadPort(Copy(T, p + 1, Length(T)));
   end;
 end;
 
 procedure BackupOnce(const Path: string);
 var
   Src, Dst: TFileStream;
+  H: THandle;
+  ErrNo: Integer;
+  Why: string;
 begin
   if (not FileExists(Path)) or FileExists(Path + '.bak') then
     Exit;
   try
     Src := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
     try
-      Dst := TFileStream.Create(Path + '.bak', fmCreate);
+      { pizarra.conf contains the bus credential. Create the backup with its
+        final mode rather than exposing it as 0644 until a later chmod. }
+      Dst := TFileStream.Create(Path + '.bak', fmCreate, &600);
       try
         Dst.CopyFrom(Src, 0);
       finally
@@ -669,92 +853,144 @@ begin
     finally
       Src.Free;
     end;
+    if FpChmod(Path + '.bak', &600) <> 0 then
+    begin
+      ErrNo := fpgeterrno;
+      DeleteFile(Path + '.bak');
+      raise EInOutError.CreateFmt('could not protect config backup: %s',
+        [SysErrorMessage(ErrNo)]);
+    end;
+    H := FileOpen(Path + '.bak', fmOpenRead or fmShareDenyNone);
+    if H = THandle(-1) then
+      raise EInOutError.Create('could not reopen config backup for fsync');
+    try
+      if PzFsync(H) <> 0 then
+      begin
+        ErrNo := fpgeterrno;
+        raise EInOutError.CreateFmt('could not fsync config backup: %s',
+          [SysErrorMessage(ErrNo)]);
+      end;
+    finally
+      FileClose(H);
+    end;
+    if not SyncParentDirectory(Path + '.bak', Why) then
+      Writeln(StdErr, 'pizarra: warning: config backup exists but ', Why);
   except
     on E: Exception do
+    begin
+      DeleteFile(Path + '.bak');
       Writeln(StdErr, 'pizarra: warning: cannot write config backup: ', E.Message);
-  end;
-end;
-
-procedure SaveTeamIni(const Path: string; const T: TTeam);
-var
-  Ini: TIniFile;
-  Sec: string;
-
-  function Flat(const V: string): string;
-  begin
-    Result := IniValorSeguro(V);
-  end;
-
-  procedure W(const Key, Val: string);
-  begin
-    if Val <> '' then
-      Ini.WriteString(Sec, Key, Flat(Val))
-    else
-      Ini.DeleteKey(Sec, Key);
-  end;
-
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    Sec := 'team:' + IntToStr(T.Id);
-    W('name', T.Name);
-    W('speciality', T.Speciality);
-    W('prompt', T.Prompt);
-    W('parent', T.Parent);
-    W('project', T.Project);
-    W('secret', T.Secret);
-    if T.Host <> '' then
-    begin
-      { bracket an IPv6 literal so SplitHostPort re-parses host:port correctly
-        on reload (an unbracketed '::1:7011' would be read as a bare host) }
-      if Pos(':', T.Host) > 0 then
-        Ini.WriteString(Sec, 'host', Format('[%s]:%d', [T.Host, T.Port]))
-      else
-        Ini.WriteString(Sec, 'host', Format('%s:%d', [T.Host, T.Port]));
-      Ini.DeleteKey(Sec, 'tmux_session');
-      Ini.DeleteKey(Sec, 'launch');
-    end
-    else
-    begin
-      Ini.DeleteKey(Sec, 'host');
-      W('tmux_session', T.TmuxSession);
-      W('launch', T.Launch);
-      W('user', T.User);
     end;
-    if T.Dial then
-      Ini.WriteString(Sec, 'dial', 'on')
-    else
-      Ini.DeleteKey(Sec, 'dial');
-    if T.Workdir <> '' then
-      Ini.WriteString(Sec, 'workdir', T.Workdir)
-    else
-      Ini.DeleteKey(Sec, 'workdir');
-    if T.Slave then
-      Ini.WriteString(Sec, 'slave', 'on')
-    else
-      Ini.DeleteKey(Sec, 'slave');
-    if T.HoldBlocked then
-      Ini.WriteString(Sec, 'hold_when_blocked', 'on')
-    else
-      Ini.DeleteKey(Sec, 'hold_when_blocked');
-    IniCommit(Ini);
-  finally
-    Ini.Free;
   end;
 end;
 
-procedure RemoveTeamIni(const Path: string; Id: Integer);
+function StripLegacyRegistryIni(const Path: string; out BackupPath,
+  Err: string): Boolean;
 var
   Ini: TIniFile;
+  Sections: TStringList;
+  Src, Dst: TFileStream;
+  RealPath, Sec: string;
+  H: THandle;
+  i: Integer;
+  HasLegacy: Boolean;
 begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
+  Result := False;
+  BackupPath := '';
+  Err := '';
+  Ini := nil;
+  Sections := TStringList.Create;
   try
-    Ini.EraseSection('team:' + IntToStr(Id));
-    IniCommit(Ini);
+    try
+      RealPath := RealTarget(Path);
+    Ini := TIniFile.Create(RealPath);
+    Ini.ReadSections(Sections);
+    HasLegacy := False;
+    for i := 0 to Sections.Count - 1 do
+    begin
+      Sec := LowerCase(Sections[i]);
+      if (Copy(Sec, 1, 5) = 'team:') or
+         (Copy(Sec, 1, 6) = 'group:') or
+         (Copy(Sec, 1, 8) = 'project:') or
+         (Copy(Sec, 1, 4) = 'app:') then
+        HasLegacy := True;
+    end;
+    FreeAndNil(Ini);
+    if not HasLegacy then
+      Exit(True);
+
+    BackupPath := RealPath + '.pre-registry-sqlite.' +
+      FormatDateTime('yyyymmdd-hhnnss', Now) + '.' +
+      IntToStr(FpGetpid) + '.bak';
+    if FileExists(BackupPath) then
+    begin
+      Err := 'refusing to overwrite migration backup ' + BackupPath;
+      Exit;
+    end;
+    Src := TFileStream.Create(RealPath, fmOpenRead or fmShareDenyNone);
+    try
+      { The three-argument constructor passes Rights to FileCreate directly
+        (FPC rtl/objpas/classes/streams.inc), avoiding even a brief 0644
+        credential backup before chmod. }
+      Dst := TFileStream.Create(BackupPath, fmCreate, &600);
+      try
+        Dst.CopyFrom(Src, 0);
+      finally
+        Dst.Free;
+      end;
+    finally
+      Src.Free;
+    end;
+    if FpChmod(BackupPath, &600) <> 0 then
+    begin
+      Err := 'could not protect migration backup ' + BackupPath;
+      DeleteFile(BackupPath);
+      Exit;
+    end;
+    H := FileOpen(BackupPath, fmOpenRead or fmShareDenyNone);
+    if H = THandle(-1) then
+    begin
+      Err := 'could not reopen migration backup for fsync: ' + BackupPath;
+      Exit;
+    end;
+    try
+      if PzFsync(H) <> 0 then
+      begin
+        Err := 'could not fsync migration backup ' + BackupPath;
+        Exit;
+      end;
+    finally
+      FileClose(H);
+    end;
+    if not SyncParentDirectory(BackupPath, Err) then
+      Exit;
+
+    Ini := IniOpenForWrite(RealPath);
+    try
+      Sections.Clear;
+      Ini.ReadSections(Sections);
+      for i := 0 to Sections.Count - 1 do
+      begin
+        Sec := LowerCase(Sections[i]);
+        if (Copy(Sec, 1, 5) = 'team:') or
+           (Copy(Sec, 1, 6) = 'group:') or
+           (Copy(Sec, 1, 8) = 'project:') or
+           (Copy(Sec, 1, 4) = 'app:') then
+          Ini.EraseSection(Sections[i]);
+      end;
+      Ini.WriteString('registry', 'authority', 'sqlite');
+      IniCommit(Ini);
+    finally
+      FreeAndNil(Ini);
+    end;
+      Result := True;
+    except
+      on E: Exception do
+        Err := E.Message;
+    end;
   finally
     Ini.Free;
+    Sections.Free;
   end;
 end;
 
@@ -939,6 +1175,28 @@ begin
   Result := Def;
 end;
 
+function IniInt(Ini: TIniFile; const Sec, Key: string; Def, MinV,
+  MaxV: Integer): Integer;
+var
+  Raw: string;
+begin
+  Raw := StripInlineComment(Ini.ReadString(Sec, Key, ''));
+  if Raw = '' then
+    Exit(Def);
+  if (not TryStrToInt(Raw, Result)) or (Result < MinV) or (Result > MaxV) then
+  begin
+    CfgWarn(Format('[%s] %s = "%s" is not an integer in %d..%d; assuming %d',
+      [Sec, Key, Raw, MinV, MaxV, Def]));
+    Result := Def;
+  end;
+end;
+
+function IniToken(Ini: TIniFile; const Sec, Key, Def: string): string;
+begin
+  Result := LowerCase(Trim(StripInlineComment(
+    Ini.ReadString(Sec, Key, Def))));
+end;
+
 function LoadPizarraConfig(const Path: string): TPizarraConfig;
 var
   Ini:      TIniFile;
@@ -949,45 +1207,86 @@ var
   ConfDir:  string;
   np, na:   Integer;
 begin
-  if not FileExists(Path) then
-    raise Exception.CreateFmt('config not found: %s', [Path]);
   Result.Teams := nil;
   Result.Apps := nil;
   ConfDir := ExtractFileDir(ExpandFileName(Path));
-  Ini := TIniFile.Create(Path);
+  Ini := OpenPrivateIniFile(Path);
   Sections := TStringList.Create;
   try
     Result.Listen  := Ini.ReadString('server', 'listen', '127.0.0.1');
-    Result.Port    := Ini.ReadInteger('server', 'port', 7010);
+    Result.Port    := IniInt(Ini, 'server', 'port', 7010, 1, High(Word));
     Result.Secret  := Ini.ReadString('server', 'secret', '');
     Result.Releases := Trim(Ini.ReadString('server', 'releases', ''));
-    Result.LogPath := Ini.ReadString('log', 'path', './pizarra.log');
+    Result.LogPath := Ini.ReadString('log', 'path',
+      PZ_LOG_DIR + '/pizarra.log');
+    Result.RegistryAuthority := IniToken(Ini, 'registry', 'authority', 'sqlite');
+    if Result.RegistryAuthority <> 'sqlite' then
+      raise EInOutError.Create('[registry] authority must be sqlite (got "' +
+        Result.RegistryAuthority + '"); legacy INI sections are migration ' +
+        'input, not an alternate live authority');
     Result.GlobalPrompt := ReadPrompt(Ini, 'prompts', 'global', ConfDir);
     { delivery header: 'short' (compact, default) or 'full' (legacy long). The
       [header] toggles trim the short header further; on|off|1|0|true|false. }
-    Result.HeaderMode  := LowerCase(Trim(Ini.ReadString('server', 'header', 'short')));
-    Result.AlarmMax    := Ini.ReadInteger('server', 'alarm_max', 3);
+    Result.HeaderMode  := IniToken(Ini, 'server', 'header', 'short');
+    if (Result.HeaderMode <> 'short') and (Result.HeaderMode <> 'full') then
+    begin
+      CfgWarn('[server] header must be short or full; assuming short');
+      Result.HeaderMode := 'short';
+    end;
+    Result.AlarmMax    := IniInt(Ini, 'server', 'alarm_max', 3,
+      Low(Integer), High(Integer));
     if Result.AlarmMax < 1 then Result.AlarmMax := 1;
     if Result.AlarmMax > 5 then Result.AlarmMax := 5;
-    Result.AlarmEvery  := Ini.ReadInteger('server', 'alarm_every', 180);
+    Result.AlarmEvery  := IniInt(Ini, 'server', 'alarm_every', 180,
+      Low(Integer), High(Integer));
     if Result.AlarmEvery < 15 then Result.AlarmEvery := 15;
-    Result.GroupIdleDwell := Ini.ReadInteger('server', 'group_idle_dwell', 120);
+    Result.GroupIdleDwell := IniInt(Ini, 'server', 'group_idle_dwell', 120,
+      Low(Integer), High(Integer));
     if Result.GroupIdleDwell < 15 then Result.GroupIdleDwell := 15;
     Result.HdrStyle    := IniFlag(Ini, 'header', 'style',   True);
     Result.HdrOrders   := IniFlag(Ini, 'header', 'orders',  True);
     Result.MasterConsoleOnly := IniFlag(Ini, 'server', 'master_console_only', False);
     Result.HdrTasks    := IniFlag(Ini, 'header', 'tasks',   True);
     Result.HdrTeams    := IniFlag(Ini, 'header', 'teams',   True);
-    Result.HdrGroupOwn := LowerCase(Trim(Ini.ReadString('header', 'group', 'own'))) <> 'off';
+    HostV := IniToken(Ini, 'header', 'group', 'own');
+    if (HostV <> 'own') and (HostV <> 'off') then
+    begin
+      CfgWarn('[header] group must be own or off; assuming own');
+      HostV := 'own';
+    end;
+    Result.HdrGroupOwn := HostV = 'own';
     Result.HdrProject  := IniFlag(Ini, 'header', 'project', False);
     Result.HdrSubs     := IniFlag(Ini, 'header', 'subs',    False);
     Result.HdrShared   := IniFlag(Ini, 'header', 'shared',  True);
     Result.HdrWorkflow := IniFlag(Ini, 'header', 'workflow', True);
     Result.GlobalRule  := Trim(Ini.ReadString('header', 'note', ''));
-    Result.HdrManual   := LowerCase(Trim(Ini.ReadString('header', 'manual', 'first')));
-    Result.StoreDir := Ini.ReadString('store', 'dir', ConfDir + '/store');
-    Result.SharedDir := ExcludeTrailingPathDelimiter(
-      Trim(Ini.ReadString('shared', 'dir', '')));
+    Result.HdrManual   := IniToken(Ini, 'header', 'manual', 'first');
+    if (Result.HdrManual <> 'first') and (Result.HdrManual <> 'off') and
+       (Result.HdrManual <> 'always') then
+    begin
+      CfgWarn('[header] manual must be first, off, or always; assuming first');
+      Result.HdrManual := 'first';
+    end;
+    Result.StoreDir := Trim(Ini.ReadString('store', 'dir', PZ_STATE_DIR));
+    if Result.StoreDir = '' then
+      raise EInOutError.Create('[store] dir must not be empty; an empty path ' +
+        'would resolve to the filesystem root in the FPC path helpers');
+    Result.SharedDir := Trim(Ini.ReadString('shared', 'dir', ''));
+    { FPC 3.2.2 ExcludeTrailingPathDelimiter removes only ONE separator.
+      Normalize all of them before the root check: // would otherwise become /
+      and EnsureSharedDirs could chmod the filesystem root mode 01777. }
+    while (Length(Result.SharedDir) > 1) and
+          CharInSet(Result.SharedDir[Length(Result.SharedDir)],
+            AllowDirectorySeparators) do
+      Delete(Result.SharedDir, Length(Result.SharedDir), 1);
+    if (Result.SharedDir <> '') and (Result.SharedDir[1] <> PathDelim) then
+      raise EInOutError.Create('[shared] dir must be an absolute path; a ' +
+        'relative NFS mount would resolve against the hub process working ' +
+        'directory');
+    if Result.SharedDir = PathDelim then
+      raise EInOutError.Create('[shared] dir may not be the filesystem root; ' +
+        'the hub creates and chmods only team directories below a dedicated ' +
+        'operator-owned mount');
 
     Ini.ReadSections(Sections);
     n := 0;
@@ -1004,8 +1303,8 @@ begin
         T.Parent      := Trim(Ini.ReadString(Sec, 'parent', ''));
         T.Project     := Trim(Ini.ReadString(Sec, 'project', ''));
         T.Secret      := Trim(Ini.ReadString(Sec, 'secret', ''));
-        T.Delegate    := LowerCase(Trim(Ini.ReadString(Sec, 'delegate', '')));
-        HostV         := Ini.ReadString(Sec, 'host', '');
+        T.Delegate    := IniToken(Ini, Sec, 'delegate', '');
+        HostV         := StripInlineComment(Ini.ReadString(Sec, 'host', ''));
         if HostV <> '' then
           SplitHostPort(HostV, T.Host, T.Port)
         else
@@ -1039,19 +1338,10 @@ begin
         end;
       end;
     end;
-  finally
-    Sections.Free;
-    Ini.Free;
-  end;
 
-  { validate the hierarchy: a parent must exist and must not form a cycle }
-  ValidateParents(Result);
-
-  { groups: [group:NAME] members = a, b, c }
-  Ini := TIniFile.Create(Path);
-  Sections := TStringList.Create;
-  try
-    Ini.ReadSections(Sections);
+    { Parse every legacy registry family from this same descriptor-pinned INI
+      snapshot. Reopening by pathname here could combine teams from one file
+      generation with groups/projects/apps from another. }
     n := 0;
     np := 0;
     na := 0;
@@ -1075,12 +1365,20 @@ begin
         Result.Groups[n].Boss := Trim(Ini.ReadString(Sec, 'boss', ''));
         Result.Groups[n].Members := SplitList(Ini.ReadString(Sec, 'members', ''));
         Result.Groups[n].Excluded := SplitList(Ini.ReadString(Sec, 'excluded', ''));
-        Result.Groups[n].OnIdle := LowerCase(Trim(Ini.ReadString(Sec, 'on_idle', '')));
+        Result.Groups[n].OnIdle := IniToken(Ini, Sec, 'on_idle', '');
         Result.Groups[n].OnIdleMsg := Trim(Ini.ReadString(Sec, 'on_idle_msg', ''));
         Result.Groups[n].OnIdleFrom := Trim(Ini.ReadString(Sec, 'on_idle_from', ''));
         Result.Groups[n].OnIdleReply := Trim(Ini.ReadString(Sec, 'on_idle_reply', ''));
         Result.Groups[n].HdrNote := Trim(Ini.ReadString(Sec, 'header', ''));
-        Result.Groups[n].OnBlock := LowerCase(Trim(Ini.ReadString(Sec, 'on_block', '')));
+        Result.Groups[n].OnBlock := IniToken(Ini, Sec, 'on_block', '');
+        if (Result.Groups[n].OnBlock <> '') and
+           (Result.Groups[n].OnBlock <> 'alarm') and
+           (Result.Groups[n].OnBlock <> 'log') then
+        begin
+          CfgWarn('[' + Sec + '] on_block must be alarm, log, or empty; ' +
+            'assuming alarm');
+          Result.Groups[n].OnBlock := '';
+        end;
         Inc(n);
       end
       else if (Length(Sec) > 8) and (LowerCase(Copy(Sec, 1, 8)) = 'project:') then
@@ -1113,18 +1411,19 @@ begin
     Sections.Free;
     Ini.Free;
   end;
+
+  { validate the hierarchy: a parent must exist and must not form a cycle }
+  ValidateParents(Result);
 end;
 
 function LoadTizaConfig(const Path: string): TTizaConfig;
 var
   Ini: TIniFile;
 begin
-  if not FileExists(Path) then
-    raise Exception.CreateFmt('config not found: %s', [Path]);
-  Ini := TIniFile.Create(Path);
+  Ini := TSecureIniFile.CreatePrivate(Path);
   try
     Result.Host   := Ini.ReadString('pizarra', 'host', '127.0.0.1');
-    Result.Port   := Ini.ReadInteger('pizarra', 'port', 7010);
+    Result.Port   := IniInt(Ini, 'pizarra', 'port', 7010, 1, High(Word));
     Result.Secret := Ini.ReadString('pizarra', 'secret', '');
     { WITHOUT self THERE IS NO IDENTITY, AND CONSOLE IS NOT A DEFAULT. Keep it
       empty so callers that require identity stop with an actionable error. }
@@ -1142,27 +1441,31 @@ var
   Sec:      string;
   S:        TPzSession;
 begin
-  if not FileExists(Path) then
-    raise Exception.CreateFmt('config not found: %s', [Path]);
   Result.Sessions := nil;
-  Ini := TIniFile.Create(Path);
+  Ini := TSecureIniFile.CreatePrivate(Path);
   Sections := TStringList.Create;
   try
-    Result.Listen := Ini.ReadString('daemon', 'listen', '0.0.0.0');
-    Result.Port   := Ini.ReadInteger('daemon', 'port', DEFAULT_DAEMON_PORT);
+    Result.Listen := Ini.ReadString('daemon', 'listen', '127.0.0.1');
+    Result.Port   := IniInt(Ini, 'daemon', 'port', DEFAULT_DAEMON_PORT,
+      1, High(Word));
     { default: the same secret used to talk to pizarra }
     Result.Secret := Ini.ReadString('daemon', 'secret',
       Ini.ReadString('pizarra', 'secret', ''));
     { reverse delivery channel (dial-in): the daemon dials the hub instead of
       being pushed to — for hosts behind NAT or with a roaming (DHCP/VPN) IP }
     Result.Dial      := IniFlag(Ini, 'daemon', 'dial', False);
-    Result.KeepAlive := Ini.ReadInteger('daemon', 'keepalive', 60);
+    Result.KeepAlive := IniInt(Ini, 'daemon', 'keepalive', 60,
+      Low(Integer), High(Integer));
     if Result.KeepAlive < 5 then
       Result.KeepAlive := 5;   { sane floor }
     Result.HubHost   := Ini.ReadString('pizarra', 'host', '127.0.0.1');
-    Result.HubPort   := Word(Ini.ReadInteger('pizarra', 'port', 7010));
+    Result.HubPort   := Word(IniInt(Ini, 'pizarra', 'port', 7010,
+      1, High(Word)));
     Result.HubSecret := Ini.ReadString('pizarra', 'secret', '');
-    Result.StatePath := Trim(Ini.ReadString('daemon', 'state', ''));
+    Result.StatePath := Trim(Ini.ReadString('daemon', 'state',
+      PZ_TIZA_STATE_PATH));
+    if Result.StatePath = '' then
+      Result.StatePath := PZ_TIZA_STATE_PATH;
     Result.SelfId    := Ini.ReadString('pizarra', 'self', '');
     Result.AutoUpdate := IniFlag(Ini, 'daemon', 'autoupdate', False);
     Result.UpdatePath := Ini.ReadString('daemon', 'update_path',
@@ -1446,37 +1749,6 @@ begin
           Exit(Cfg.Groups[i].Boss);
 end;
 
-{ Remove a complete project section from the file. }
-procedure RemoveProjectIni(const Path, Name_: string);
-var
-  Ini: TIniFile;
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    Ini.EraseSection('project:' + Name_);
-    IniCommit(Ini);
-  finally
-    Ini.Free;
-  end;
-end;
-
-procedure SaveProjectIni(const Path: string; const Prj: TProject);
-var Ini: TIniFile;
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    if Prj.Boss <> '' then
-      Ini.WriteString('project:' + Prj.Name, 'boss', Prj.Boss)
-    else
-      Ini.DeleteKey('project:' + Prj.Name, 'boss');
-    IniCommit(Ini);
-  finally
-    Ini.Free;
-  end;
-end;
-
 procedure SaveHeaderIni(const Path: string; const Cfg: TPizarraConfig);
   function OnOff(B: Boolean): string;
   begin if B then Result := 'on' else Result := 'off'; end;
@@ -1504,204 +1776,6 @@ begin
       Ini.WriteString('header', 'note', IniValorSeguro(Cfg.GlobalRule))
     else
       Ini.DeleteKey('header', 'note');
-    IniCommit(Ini);
-  finally
-    Ini.Free;
-  end;
-end;
-
-{ Persist one [app:NAME] section. An emptied field is DELETED, never left
-  behind, or it would resurrect on the next hub restart. }
-
-
-procedure SaveAppIni(const Path: string; const A: TApp; Roles: TStringList);
-var
-  Ini: TIniFile;
-  Sec: string;
-  Keys: TStringList;
-  i, t: Integer;
-
-  procedure W(const Key, Val: string);
-  var
-    V: string;
-  begin
-    V := IniValorSeguro(Val);
-    if V <> '' then
-      Ini.WriteString(Sec, Key, V)
-    else
-      Ini.DeleteKey(Sec, Key);
-  end;
-
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    Sec := 'app:' + A.Name;
-    { anchor: every W() below DELETES an empty field, and TIniFile only
-      creates the section as a side effect of a WriteString — without this an
-      app registered with no fields yet would never reach the file and would
-      vanish on the next hub restart }
-    Ini.WriteString(Sec, 'name', A.Name);
-    W('team', A.Team);
-    W('repo', A.Repo);
-    W('path', A.Path);
-    W('purpose', A.Purpose);
-    W('detail', A.Detail);
-    W('projects', A.Projects);
-    { THE ROLE MAP IS REWRITTEN WHOLE, never patched: an assignment that goes
-      away must take its key with it, and patching would leave behind a role for
-      a project the app is no longer in - a line that reads true and is not.
-      Roles=nil means the caller is not touching assignments at all (an 'app
-      set', say), and then the keys are left exactly as they were. }
-    if Roles <> nil then
-    begin
-      Keys := TStringList.Create;
-      try
-        Ini.ReadSection(Sec, Keys);
-        for i := 0 to Keys.Count - 1 do
-          if (Length(Keys[i]) > 5) and
-             (LowerCase(Copy(Keys[i], 1, 5)) = 'role.') then
-            Ini.DeleteKey(Sec, Keys[i]);
-      finally
-        Keys.Free;
-      end;
-      for i := 0 to Roles.Count - 1 do
-      begin
-        t := Pos(#9, Roles[i]);
-        if t > 0 then
-          W('role.' + Copy(Roles[i], 1, t - 1),
-            Copy(Roles[i], t + 1, Length(Roles[i]) - t));
-      end;
-    end;
-    IniCommit(Ini);
-  finally
-    Ini.Free;
-  end;
-end;
-
-procedure DeleteAppIni(const Path, Name: string);
-var
-  Ini: TIniFile;
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    Ini.EraseSection('app:' + Name);
-    IniCommit(Ini);
-  finally
-    Ini.Free;
-  end;
-end;
-
-{ Write a group section into an ALREADY OPEN TIniFile without committing. This
-  allows a team removal and every affected group rewrite to share ONE
-  transaction instead of leaving partial cross-section state. }
-procedure WriteGroupSection(Ini: TIniFile; const Grp: TGroup);
-var
-  i: Integer;
-  M, X: string;
-begin
-    M := '';
-    for i := 0 to High(Grp.Members) do
-    begin
-      if M <> '' then M := M + ', ';
-      M := M + Grp.Members[i];
-    end;
-    Ini.WriteString('group:' + Grp.Name, 'members', IniValorSeguro(M));
-    { clear (not just skip) an emptied boss/project so it does not resurrect
-      from the old file on the next hub restart }
-    if Grp.Project <> '' then
-      Ini.WriteString('group:' + Grp.Name, 'project', IniValorSeguro(Grp.Project))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'project');
-    if Grp.Boss <> '' then
-      Ini.WriteString('group:' + Grp.Name, 'boss', IniValorSeguro(Grp.Boss))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'boss');
-    { the muted list: same discipline as boss/project - write when it has
-      something, DeleteKey when empty so a cleared exclusion cannot come back
-      from the old file }
-    X := '';
-    for i := 0 to High(Grp.Excluded) do
-    begin
-      if X <> '' then X := X + ', ';
-      X := X + Grp.Excluded[i];
-    end;
-    if X <> '' then
-      Ini.WriteString('group:' + Grp.Name, 'excluded', IniValorSeguro(X))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'excluded');
-    { on-idle policy: same clear-when-empty discipline }
-    if (Grp.OnIdle <> '') and (Grp.OnIdle <> 'off') then
-      Ini.WriteString('group:' + Grp.Name, 'on_idle', IniValorSeguro(Grp.OnIdle))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'on_idle');
-    if Trim(Grp.OnIdleMsg) <> '' then
-      Ini.WriteString('group:' + Grp.Name, 'on_idle_msg', IniValorSeguro(Grp.OnIdleMsg))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'on_idle_msg');
-    if Trim(Grp.OnIdleFrom) <> '' then
-      Ini.WriteString('group:' + Grp.Name, 'on_idle_from', IniValorSeguro(Grp.OnIdleFrom))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'on_idle_from');
-    if Trim(Grp.OnIdleReply) <> '' then
-      Ini.WriteString('group:' + Grp.Name, 'on_idle_reply', IniValorSeguro(Grp.OnIdleReply))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'on_idle_reply');
-    if Trim(Grp.HdrNote) <> '' then
-      Ini.WriteString('group:' + Grp.Name, 'header', IniValorSeguro(Grp.HdrNote))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'header');
-    if (Grp.OnBlock <> '') and (Grp.OnBlock <> 'alarm') then
-      Ini.WriteString('group:' + Grp.Name, 'on_block', IniValorSeguro(Grp.OnBlock))
-    else
-      Ini.DeleteKey('group:' + Grp.Name, 'on_block');
-  { Do NOT commit here. The caller closes the transaction once after all group
-    sections have been written. }
-end;
-
-procedure SaveGroupIni(const Path: string; const Grp: TGroup);
-var
-  Ini: TIniFile;
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    WriteGroupSection(Ini, Grp);
-    IniCommit(Ini);
-  finally
-    Ini.Free;
-  end;
-end;
-
-{ Complete team removal in one transaction: delete its section and rewrite all
-  affected groups through the SAME temporary file, then commit once. }
-procedure RemoveTeamWithGroupsIni(const Path: string; Id: Integer;
-  const Groups: TGroupArray);
-var
-  Ini: TIniFile;
-  i: Integer;
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    Ini.EraseSection('team:' + IntToStr(Id));
-    for i := 0 to High(Groups) do
-      WriteGroupSection(Ini, Groups[i]);
-    IniCommit(Ini);
-  finally
-    Ini.Free;
-  end;
-end;
-
-procedure RemoveGroupIni(const Path, Name: string);
-var
-  Ini: TIniFile;
-begin
-  BackupOnce(Path);
-  Ini := IniOpenForWrite(Path);
-  try
-    Ini.EraseSection('group:' + Name);
     IniCommit(Ini);
   finally
     Ini.Free;
@@ -1778,9 +1852,10 @@ begin
       if Result <> '' then
         Result := Result + ', ';
       Result := Result + Cfg.Apps[i].Name;
-      { WHICH PROJECTS each app serves, read from the INI mirror because the
-        header is built here and here there is no database. It goes in brackets
-        right after the app so the two never drift apart in the reading. }
+      { WHICH PROJECTS each app serves, projected into this snapshot by the
+        SQLite loader because the header intentionally has no database
+        dependency. It goes in brackets right after the app so both remain
+        adjacent in the rendered text. }
       if WithProjects and (Cfg.Apps[i].Projects <> '') then
         Result := Result + ' [' + Cfg.Apps[i].Projects + ']';
     end;

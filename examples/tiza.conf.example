@@ -1,0 +1,43 @@
+; tiza.conf — public CLI, chat, and team-host daemon configuration example
+;
+; Copy to /etc/pizarra/tiza.conf, set mode 0600, and replace the secrets.
+; The CLI identity always comes from `self`; command-line sender overrides are
+; ignored during normal operation.
+
+[pizarra]
+host = 127.0.0.1
+port = 7010
+secret = CHANGE-ME-BEFORE-USE
+self = console
+
+; The following sections are only needed on a host running `tiza daemon`.
+;[daemon]
+;listen = 127.0.0.1
+;port = 7011
+;secret = replace-with-the-hub-master-secret-for-direct-push
+;state = /var/lib/pizarra/tiza.state
+;dial = on
+;keepalive = 60
+;autoupdate = off
+;update_path = /usr/local/bin/tiza
+;update_sudo = off
+;update_fpc = fpc
+
+; One section per team hosted by this daemon. The name after `session:` must
+; exactly match the team name in the hub's SQLite registry.
+;[session:backend]
+;tmux_session = pizarra-backend
+;launch = /usr/local/bin/start-ai-agent
+;workdir = /srv/example/backend
+; Set only if the daemon may switch operating-system accounts.
+;user = developer
+;activity = on
+;auto_enter = off
+;hint = /run/pizarra/backend.state
+;idle_match = ready>|waiting for input
+;block_match = confirm? (y/n)|approval required
+
+; Reverse delivery (`dial = on`) uses the team's identity-specific secret from
+; [pizarra] and is the recommended remote mode. Direct push (`dial = off` plus
+; a team `host` in the SQLite registry) currently requires `[daemon] secret` to
+; equal the hub's master console secret, because that is what the hub presents.

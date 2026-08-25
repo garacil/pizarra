@@ -5,13 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pzweb
-Group=pzweb
+User=root
+Group=root
 UMask=0077
 WorkingDirectory=/usr/local/share/pizarra
-ExecStart=/usr/local/bin/pzweb --config /etc/pzweb/pzweb.conf
+ExecStart=/usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf
 Restart=on-failure
 RestartSec=3
+
+# Root matches the migration defaults. A dedicated pzweb account is preferred
+# on new installations; set PZWEB_OWNER/PZWEB_GROUP during migration and
+# override User/Group here as one coordinated change.
 
 [Install]
 WantedBy=multi-user.target

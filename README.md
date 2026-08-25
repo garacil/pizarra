@@ -2,6 +2,8 @@
 
 **A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
 
+[![Release: 1.1.22](https://img.shields.io/badge/release-1.1.22-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.22)
+
 pizarra turns independent terminal-based agents into an organized team. It gives
 them a durable message bus, explicit identities, delegated authority, task queues,
 dependency-aware workflows, shared files, activity awareness, and human control
@@ -58,7 +60,22 @@ flowchart LR
 The hub is deliberately the coordination boundary. Clients do not edit hub
 state files directly, and `pzweb` does not bypass the bus. Runtime mutations go
 through the same authenticated command path, regardless of which interface
-initiated them.
+initiated them. In particular, `pzweb` never opens the registry database: it
+proxies hub commands and projects their replies.
+
+Installed bootstrap configuration lives under `/etc/pizarra`; mutable state,
+SQLite databases, and the private endpoint-release root live under
+`/var/lib/pizarra` (`releases/` is the canonical artifact directory); logs live
+under `/var/log/pizarra`; and browser assets live under
+`/usr/local/share/pizarra/web/apps`. `org.sqlite` is the only live authority for
+teams, groups, projects, applications, manuals, and their relations.
+`pizarra.conf` contains only static/bootstrap settings; there
+is no duplicated per-team INI registry.
+
+An optional shared exchange remains a separate operator-mounted filesystem
+(including NFS): hub `[shared] dir` and pzweb `[web] shared` must name the same
+absolute mount. It is not moved into `/var/lib/pizarra` and its contents are not
+included in built-in backup or restore.
 
 ## Web console
 
@@ -79,8 +96,11 @@ See [Web console](docs/web-console.md) and [Web API](docs/web-api.md).
 
 ## Screenshots
 
-These are the real 1.2.0 programs running with an isolated, public Atlas
-workspace. Click any image for the full-size view.
+This gallery combines captures of the real 1.1.22 programs with the shipped
+1.1.22 browser application rendered against an isolated, public Atlas fixture.
+The focused registry views and workflow animation use the documented local
+fixture; none of the images contains production data. Click any image for the
+full-size view.
 
 | Live activity | Durable history |
 |---|---|
@@ -98,6 +118,17 @@ workspace. Click any image for the full-size view.
 |---|---|
 | [![Task board in pzweb](screenshots/web-tasks.png)](screenshots/web-tasks.png) | [![Team and application structure in pzweb](screenshots/web-structure.png)](screenshots/web-structure.png) |
 
+The organization view can also be inspected one registry at a time:
+
+| Teams | Groups | Applications |
+|---|---|---|
+| [![Team registry in pzweb](screenshots/web-structure-teams.png)](screenshots/web-structure-teams.png) | [![Group registry and block policies in pzweb](screenshots/web-structure-groups.png)](screenshots/web-structure-groups.png) | [![Application registry and manuals in pzweb](screenshots/web-structure-apps.png)](screenshots/web-structure-apps.png) |
+
+This animated pass scrolls through a wider dependency graph while keeping its
+current blocker, levels, branches, ownership, and state visible:
+
+[![Animated scrolling workflow map in pzweb](screenshots/web-workflow-scroll.gif)](screenshots/web-workflow-scroll.gif)
+
 The terminal view below combines the live `tiza` console, task board,
 organization map, and workflow graph in a separate
 [SuperTerm](https://github.com/garacil/superterm) session. SuperTerm is optional;
@@ -110,8 +141,9 @@ organization map, and workflow graph in a separate
 ### Requirements
 
 - A Unix-like host with Free Pascal, GNU Make, GCC linker support, and `tmux`
-- `libsqlite3` at runtime for mutable registries and their audit history
+- `libsqlite3` at runtime; the authoritative registry is mandatory for hub startup
 - A private, firewalled network for any non-loopback listener
+- No Node.js, npm, or JavaScript package runner is required or used
 
 Build all three programs:
 
@@ -125,40 +157,50 @@ make test
 Use `./configure --help` to set a different installation prefix, binary
 directory, or data directory. The generated `config.mk` is local and ignored.
 
-Create private runtime configuration from the public examples:
+Install the binaries and browser assets:
 
 ```sh
-install -m 600 conf/pizarra.conf.example conf/pizarra.conf
-install -m 600 conf/tiza.conf.example conf/tiza.conf
-install -m 600 conf/pzweb.conf.example conf/pzweb.conf
+sudo make install
 ```
 
-At minimum, replace every example secret, select explicit listen addresses,
-declare a team and its launch command in `pizarra.conf`, and set the operator
-identity in `tiza.conf`:
-
-```ini
-# conf/tiza.conf
-[pizarra]
-host = 127.0.0.1
-port = 7010
-secret = use-a-long-random-secret
-self = console
-```
-
-Start the hub and terminal console:
+On a new machine, one implicit migration-only run securely creates the canonical
+directories, matching random hub/console credentials, and an empty SQLite
+registry. It opens no listener or watchdog:
 
 ```sh
-./pizarra --config conf/pizarra.conf
-./tiza --config conf/tiza.conf chat
+sudo /usr/local/bin/pizarra --migrate-only
 ```
 
-From another shell, address a team directly:
+Start the hub in one terminal and register a team from another:
 
 ```sh
-./tiza --config conf/tiza.conf builder "Inspect the open tasks and report status."
-./tiza --config conf/tiza.conf task list open
-./tiza --config conf/tiza.conf inbox --keep
+# terminal 1
+sudo /usr/local/bin/pizarra
+
+# terminal 2
+sudo /usr/local/bin/tiza team add builder \
+  "Builds and verifies changes" --session pizarra-builder
+```
+
+Give the team a unique secret with
+`tiza team set builder secret --file ...` and install the matching mode-`0600`
+`/etc/pizarra/agents/builder.conf`, then set the launch command and open the
+console:
+
+```sh
+sudo /usr/local/bin/tiza team set builder launch \
+  "bash -lc 'export TIZA_CONF=/etc/pizarra/agents/builder.conf; exec /usr/local/bin/start-ai-agent'"
+sudo /usr/local/bin/tiza chat
+```
+
+The complete, security-first sequence is in [Quick start](docs/quickstart.md).
+
+From the console identity, address the team directly:
+
+```sh
+sudo /usr/local/bin/tiza builder "Inspect the open tasks and report status."
+sudo /usr/local/bin/tiza task list open
+sudo /usr/local/bin/tiza inbox --keep
 ```
 
 Web setup requires a separately bound team credential with every administrative
@@ -166,10 +208,8 @@ family delegated to it, an exact `0600` configuration file, an IPv4 allowlist,
 an exact `Host`, an exact same-origin URL, and a SHA-256 password digest. Then:
 
 ```sh
-./pzweb --config conf/pzweb.conf
+sudo /usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf
 ```
-
-The complete, security-first walkthrough is in [Quick start](docs/quickstart.md).
 
 ## Autonomous workflow example
 
@@ -261,7 +301,7 @@ Before deployment, read [Security](SECURITY.md). In particular:
 ```text
 src/        Free Pascal sources for pizarra, tiza, pzweb, and shared units
 web/apps/   browser application served by pzweb
-conf/       public configuration examples; real files are ignored
+examples/   public configuration examples; runtime files never live in the repo
 systemd/    example service units
 docs/       public operator and developer documentation
 screenshots/ verified web and terminal views using public demonstration data

@@ -1,0 +1,58 @@
+; pizarra.conf — public hub bootstrap/static configuration example
+;
+; Copy this file to /etc/pizarra/pizarra.conf, set mode 0600, and replace every
+; secret. Never commit the real file. Organization rows do not belong here.
+
+[server]
+listen = 127.0.0.1
+port = 7010
+secret = CHANGE-ME-BEFORE-STARTING
+master_console_only = on
+header = short
+releases = /var/lib/pizarra/releases
+; alarm_max = 3
+; alarm_every = 180
+; group_idle_dwell = 120
+
+; Teams, groups, projects, apps, manuals, and relations live in org.sqlite.
+; On a legacy cutover, the hub imports old registry sections once, verifies
+; every value, preserves the original INI as a 0600 backup, then removes them.
+[registry]
+authority = sqlite
+
+; Fine-grained controls for the compact delivery header.
+[header]
+style = on
+orders = on
+tasks = on
+teams = on
+group = own
+project = off
+subs = off
+shared = on
+workflow = on
+manual = first
+; note = A standing instruction included in every delivery.
+
+[log]
+path = /var/log/pizarra/pizarra.log
+
+[store]
+dir = /var/lib/pizarra
+
+; Optional external/NFS shared exchange. Configure the identical absolute path
+; as [web] shared in pzweb.conf. It is not state, migration input, or part of
+; built-in backup/restore; protect it separately and never store secrets here.
+; Hosts without this mount can use `tiza put` and `tiza get` through the hub.
+;[shared]
+;dir = /mnt/pizarra-shared
+
+[prompts]
+global = Build the project collaboratively. Communicate through tiza and verify completed work.
+; global_file = prompts/project.txt
+
+; After startup, manage the empty/new registry through tiza, for example:
+;   tiza team add frontend "Browser interface" --session pizarra-frontend
+;   tiza team set frontend secret --file /secure/generated-secret
+;   tiza team set frontend launch "/usr/local/bin/start-ai-agent"
+; No runtime registry mutation rewrites this bootstrap file.

@@ -79,6 +79,10 @@ type
       it pending for retry instead of logging one line per attempt. }
     procedure Receipt(const What: string);   { caller holds FLock }
   public
+    { A restore-oriented backup holds this while copying messages.jsonl and
+      state.json together. Callers must release it in finally. }
+    procedure LockForSnapshot;
+    procedure UnlockForSnapshot;
     procedure RetryReceipt;
     procedure LoadAll;
     procedure Compact;            { caller holds FLock }
@@ -160,6 +164,16 @@ begin
   FDelivered.Free;
   FLock.Free;
   inherited Destroy;
+end;
+
+procedure TPzStore.LockForSnapshot;
+begin
+  FLock.Enter;
+end;
+
+procedure TPzStore.UnlockForSnapshot;
+begin
+  FLock.Leave;
 end;
 
 function TPzStore.JournalPath: string;

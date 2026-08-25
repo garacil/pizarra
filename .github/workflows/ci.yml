@@ -15,15 +15,28 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout without a JavaScript action
+        run: |
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_REF"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Install Free Pascal
         run: |
           sudo apt-get update
-          sudo apt-get install -y fp-compiler fp-units-fcl fp-units-db
+          sudo apt-get install -y fp-compiler fp-units-fcl fp-units-db \
+            sqlite3 tmux lsof psmisc util-linux
 
       - name: Build and verify binaries
         run: |
           ./configure
           make test
           make debug
+          scripts/test-bootstrap-layout.sh
+          scripts/test-private-config.sh
+          scripts/test-group-onblock.sh
+          scripts/test-pzshare-symlink.sh
+          scripts/test-migrate-release-layout.sh
+          scripts/test-retire-repo-runtime-conf.sh

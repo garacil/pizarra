@@ -3,9 +3,10 @@
   across the fleet and should continue to depend only on libc.
 
   sqlite3dyn loads the library at RUNTIME with dlopen, so `ldd pizarra` is
-  unchanged. If libsqlite3 is missing, the hub still starts with registries in
-  read-only mode and continues delivering messages. The sqlite3, sqlite3ds, and
-  sqlite3db units would create a hard link dependency and are not used.
+  unchanged. SQLite is the registry authority, so the hub refuses to start if
+  the library or authoritative database cannot be opened. The sqlite3,
+  sqlite3ds, and sqlite3db units would create a hard link dependency and are
+  not used.
 
   Concurrency: each open file has one FULLMUTEX handle, which is safe across
   threads, but prepared statements are not. One TCriticalSection therefore
@@ -39,7 +40,8 @@ unit pzdb;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, BaseUnix, ctypes, sqlite3dyn;
+  SysUtils, Classes, SyncObjs, BaseUnix, Unix, ctypes, sqlite3dyn, Types, pzconfig,
+  pzlayout;
 
 type
   { An open handle to an .sqlite file. }
@@ -65,13 +67,17 @@ type
     FDir:   string;
     function OpenOne(var F: TPzDbFile; const FileName: string;
       out Err: string): Boolean;
-    procedure CloseOne(var F: TPzDbFile);
+    function CloseOne(var F: TPzDbFile): Boolean;
+    { Write one complete group row plus its ordered membership. The caller has
+      already opened the transaction. }
+    function GroupWrite(const Grp: TGroup; const Who, OldRow: string;
+      out Err: string): Boolean;
   public
     constructor Create(const StoreDir: string);   { Never raises an exception. }
     destructor Destroy; override;
 
-    { False when libsqlite3 is unavailable. The hub must still start and expose
-      registries as read-only. }
+    { False when libsqlite3 or the private store is unavailable. The hub treats
+      this as fatal because no partial INI registry exists after cutover. }
     property Available: Boolean read FAvail;
     { Human-readable reason when Available is False. }
     property Unavailable: string read FWhy;
@@ -83,15 +89,18 @@ type
     function Exec(var F: TPzDbFile; const SQL: string; out Err: string): Boolean;
     { Return one text value, or '' when no row exists. }
     function QueryStr(var F: TPzDbFile; const SQL: string): string;
+    function QueryStrChecked(var F: TPzDbFile; const SQL: string;
+      out Value, Err: string): Boolean;
     function QueryInt(var F: TPzDbFile; const SQL: string; Def: Int64 = 0): Int64;
+    { Checked scalar count/value for migration preflights. Unlike QueryInt it
+      distinguishes a real zero from prepare/step failure. }
+    function QueryIntChecked(var F: TPzDbFile; const SQL: string;
+      out Value: Int64; out Err: string): Boolean;
 
-    { Synchronize the database with INI declarations at every startup. The INI
-      is the DECLARATIVE SOURCE (since 1.0.13), so manually editing pizarra.conf
-      and restarting remains supported: unknown records are inserted and known
-      records are UPDATED from the file, including renames detected by ID as
-      described in that branch. Synchronization does NOT delete; removing an
-      INI section does not remove its database record. Return the number of
-      affected rows. }
+    { Import declarations during the initial INI-to-SQLite cutover. It upserts
+      but never deletes, preserving records from either side while the stores
+      are reconciled. Once the caller records the authority marker, startup
+      uses LoadRegistry instead and SQLite is authoritative. }
     function ImportMissing(const Names, Teams, Repos, Paths, Purposes,
       Details: TStringList; const TeamRows, GroupRows,
       ProjectRows: TStringList; out N: Integer; out Err: string): Boolean;
@@ -124,8 +133,12 @@ type
       const OldRow, ChField, ChOld, ChNew: string; out Err: string): Boolean;
     function TeamRemove(Id: Integer; const Name, Who, OldRow: string;
       out Err: string): Boolean;
-    function GroupUpsert(const Name, Project, Boss, Members, Excluded, Who: string;
-      const OldRow: string; out Err: string): Boolean;
+    { Atomically update every group touched by a team removal and then remove
+      the team. Callers pass only the groups whose membership/boss changed. }
+    function TeamRemoveWithGroups(Id: Integer; const Name, Who, OldRow: string;
+      const Groups: TGroupArray; out Err: string): Boolean;
+    function GroupUpsert(const Grp: TGroup; const Who, OldRow: string;
+      out Err: string): Boolean;
     function GroupRemove(const Name, Who, OldRow: string; out Err: string): Boolean;
     function ProjectUpsert(const Name, Boss, Who, OldRow: string;
       out Err: string): Boolean;
@@ -136,10 +149,8 @@ type
     { One-time migration from files. Idempotent through both the
       meta['ini_migrated'] sentinel and INSERT OR IGNORE. }
     function MigrateApps(const Names, Teams, Repos, Paths, Purposes,
-      Details, Docs: TStringList; out N, NDocs: Integer;
+      Details, Docs, DocPresent: TStringList; out N, NDocs: Integer;
       out Err: string): Boolean;
-    function MigrateOrg(const TeamRows, GroupRows, ProjectRows: TStringList;
-      out NT, NG, NP: Integer; out Err: string): Boolean;
     function MigrateTasks(const TaskRows, NoteRows: TStringList;
       out NT, NN: Integer; out Err: string): Boolean;
     { Add an audit row; the caller is already inside its transaction. }
@@ -159,9 +170,16 @@ type
     { One entry: kind|subject|op|field|oldval|newval|before|after. }
     function HistGet(var F: TPzDbFile; Snap: Integer): string;
 
-    { Run a query and return rows with fields separated by #1, matching the
-      migration format. }
+    { Run a query and return rows with fields separated by #1. Each field is
+      RowFieldEncode-framed when needed so embedded separators/control bytes
+      cannot shift columns; consumers decode after splitting. }
     function Rows(var F: TPzDbFile; const SQL: string): TStringList;
+
+    { Replace the four organization registries in Cfg from org.sqlite. This is
+      deliberately a typed reader: registry text is never serialized through
+      Rows/#1, so every SQLite column retains its own boundary. The caller must
+      hold FCfgLock, preserving the documented lock order. }
+    function LoadRegistry(var Cfg: TPizarraConfig; out Err: string): Boolean;
 
     { Create the schema idempotently in all three databases. }
     function EnsureSchema(out Err: string): Boolean;
@@ -191,6 +209,13 @@ function JsonEsc(const S: string): string;
   boundary is fragile: any future path placing text in a numeric position would
   permit injection. Convert nonintegers to -1, which matches no real ID. }
 function QI(const S: string): string;
+{ Reversible framing for the few compatibility/migration APIs that carry
+  several fields in one #1-delimited string. Fields needing it use a long
+  version marker; '%' and all control bytes are hex-escaped. Ordinary unmarked
+  fields decode unchanged for old callers and fixtures. }
+function RowFieldEncode(const S: string): string;
+function RowFieldDecode(const S: string): string;
+procedure DecodeRowFields(Fields: TStrings; const Indices: array of Integer);
 
 { Probe whether libsqlite3 loads without opening a database, allowing
   `pizarra --version` to report it before reading configuration. }
@@ -211,8 +236,31 @@ begin
 end;
 
 function Q(const S: string): string;
+var
+  StartAt, P: Integer;
+  Part: string;
 begin
-  Result := '''' + SqlQuote(S) + '''';
+  { sqlite3_exec receives a NUL-terminated SQL string. Represent embedded NUL
+    bytes as SQL char(0) expressions so they never truncate the statement. }
+  Result := '';
+  StartAt := 1;
+  repeat
+    P := Pos(#0, Copy(S, StartAt, Length(S)));
+    if P > 0 then
+      P := P + StartAt - 1;
+    if P = 0 then
+      Part := Copy(S, StartAt, Length(S) - StartAt + 1)
+    else
+      Part := Copy(S, StartAt, P - StartAt);
+    if Result <> '' then
+      Result := Result + '||';
+    Result := Result + '''' + SqlQuote(Part) + '''';
+    if P > 0 then
+    begin
+      Result := Result + '||char(0)';
+      StartAt := P + 1;
+    end;
+  until P = 0;
 end;
 
 function QN(const S: string): string;
@@ -228,13 +276,127 @@ begin
   Result := IntToStr(StrToIntDef(Trim(S), -1));
 end;
 
-function JsonEsc(const S: string): string;
+function HexNibble(C: Char): Integer;
 begin
-  Result := StringReplace(S, '\', '\\', [rfReplaceAll]);
-  Result := StringReplace(Result, '"', '\"', [rfReplaceAll]);
-  Result := StringReplace(Result, #13, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, #9, ' ', [rfReplaceAll]);
+  case C of
+    '0'..'9': Result := Ord(C) - Ord('0');
+    'a'..'f': Result := Ord(C) - Ord('a') + 10;
+    'A'..'F': Result := Ord(C) - Ord('A') + 10;
+  else
+    Result := -1;
+  end;
+end;
+
+function RowFieldEncode(const S: string): string;
+const
+  Hex: array[0..15] of Char = '0123456789ABCDEF';
+  Marker = '~pizarra-row-v1~';
+var
+  i: Integer;
+  C: Byte;
+  NeedsEncoding: Boolean;
+begin
+  NeedsEncoding := Copy(S, 1, Length(Marker)) = Marker;
+  for i := 1 to Length(S) do
+  begin
+    C := Ord(S[i]);
+    if (C < 32) or (C = Ord('%')) or (C = 127) then
+      NeedsEncoding := True;
+  end;
+  if not NeedsEncoding then
+    Exit(S);
+  Result := Marker;
+  for i := 1 to Length(S) do
+  begin
+    C := Ord(S[i]);
+    if (C < 32) or (C = Ord('%')) or (C = 127) then
+      Result := Result + '%' + Hex[C shr 4] + Hex[C and $0f]
+    else
+      Result := Result + Char(C);
+  end;
+end;
+
+function RowFieldDecode(const S: string): string;
+const
+  Marker = '~pizarra-row-v1~';
+var
+  i, H, L, p: Integer;
+  Framed: Boolean;
+begin
+  if Copy(S, 1, Length(Marker)) <> Marker then
+    Exit(S);
+  { Old unframed callers may legitimately pass text beginning with the marker.
+    Treat it as encoded only when the payload contains a valid escape (the
+    reason ordinary data gets framed) or starts with a second marker (how the
+    encoder disambiguates a literal marker prefix). }
+  Framed := Copy(S, Length(Marker) + 1, Length(Marker)) = Marker;
+  p := Length(Marker) + 1;
+  while (not Framed) and (p + 2 <= Length(S)) do
+  begin
+    if (S[p] = '%') and (HexNibble(S[p + 1]) >= 0) and
+       (HexNibble(S[p + 2]) >= 0) then
+      Framed := True;
+    Inc(p);
+  end;
+  if not Framed then
+    Exit(S);
+  Result := '';
+  i := Length(Marker) + 1;
+  while i <= Length(S) do
+  begin
+    if (S[i] = '%') and (i + 2 <= Length(S)) then
+    begin
+      H := HexNibble(S[i + 1]);
+      L := HexNibble(S[i + 2]);
+      if (H >= 0) and (L >= 0) then
+      begin
+        Result := Result + Char((H shl 4) or L);
+        Inc(i, 3);
+        Continue;
+      end;
+    end;
+    Result := Result + S[i];
+    Inc(i);
+  end;
+end;
+
+procedure DecodeRowFields(Fields: TStrings; const Indices: array of Integer);
+var
+  i, Idx: Integer;
+begin
+  for i := 0 to High(Indices) do
+  begin
+    Idx := Indices[i];
+    if (Idx >= 0) and (Idx < Fields.Count) then
+      Fields[Idx] := RowFieldDecode(Fields[Idx]);
+  end;
+end;
+
+function JsonEsc(const S: string): string;
+const
+  Hex: array[0..15] of Char = '0123456789abcdef';
+var
+  i: Integer;
+  C: Byte;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    C := Ord(S[i]);
+    case C of
+      8:  Result := Result + '\b';
+      9:  Result := Result + '\t';
+      10: Result := Result + '\n';
+      12: Result := Result + '\f';
+      13: Result := Result + '\r';
+      34: Result := Result + '\"';
+      92: Result := Result + '\\';
+      0..7, 11, 14..31:
+        Result := Result + '\u00' + Hex[C shr 4] + Hex[C and $0f];
+    else
+      Result := Result + Char(C);
+    end;
+  end;
 end;
 
 function SqliteProbe(out Ver: string): Boolean;
@@ -255,14 +417,24 @@ end;
 constructor TPzDb.Create(const StoreDir: string);
 var
   i: Integer;
-  Err: string;
+  Err, CleanDir: string;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
-  FDir := IncludeTrailingPathDelimiter(StoreDir);
   FAvail := False;
   FWhy := '';
   FVer := '';
+  CleanDir := Trim(StoreDir);
+  while (Length(CleanDir) > 1) and
+        (CleanDir[Length(CleanDir)] = PathDelim) do
+    Delete(CleanDir, Length(CleanDir), 1);
+  if (CleanDir = '') or (CleanDir = PathDelim) then
+  begin
+    FDir := '';
+    FWhy := 'unsafe empty/root SQLite store directory';
+    Exit;
+  end;
+  FDir := IncludeTrailingPathDelimiter(CleanDir);
   { TryInitializeSqlite returns -1 instead of raising an exception. The
     InitialiseSQLite variant is deprecated and breaks a -Sew build. It expects
     UnicodeString; passing AnsiString emits an implicit-conversion warning. }
@@ -279,10 +451,10 @@ begin
     Exit;
   end;
   FVer := string(sqlite3_libversion());
-  if not ForceDirectories(FDir) then
+  if not EnsurePrivateRuntimeDir(CleanDir, Err) then
   begin
     FAvail := False;
-    FWhy := 'cannot create ' + FDir;
+    FWhy := Err;
     Exit;
   end;
   if not OpenOne(FAppsViejo, 'apps.sqlite', Err) then
@@ -308,13 +480,18 @@ begin
 end;
 
 destructor TPzDb.Destroy;
+var
+  ClosedAll: Boolean;
 begin
   { Close the PHYSICAL handle. FApps becomes an ALIAS of FOrg after migration,
     so closing FApps here would close the same handle twice. }
-  CloseOne(FAppsViejo);
-  CloseOne(FOrg);
-  CloseOne(FWork);
-  if FAvail then
+  ClosedAll := CloseOne(FAppsViejo);
+  ClosedAll := CloseOne(FOrg) and ClosedAll;
+  ClosedAll := CloseOne(FWork) and ClosedAll;
+  { FVer is assigned immediately after the dynamic library loads, even when a
+    later open fails and Available becomes false. Never unload sqlite while a
+    SQLITE_BUSY close has left a connection alive. }
+  if (FVer <> '') and ClosedAll then
     ReleaseSqlite;
   FLock.Free;
   inherited Destroy;
@@ -344,6 +521,17 @@ begin
       Err := FileName + ': could not open it (code ' + IntToStr(rc) + ')';
     Exit;
   end;
+  { sqlite3_open_v2 creates a missing database as 0666 subject to umask.
+    Protect the main file before PRAGMA journal_mode can create sidecars. The
+    containing directory has already been verified mode 0700. }
+  if FpChmod(F.Path, &600) <> 0 then
+  begin
+    Err := FileName + ': cannot protect database as mode 0600: ' +
+      SysErrorMessage(fpgeterrno);
+    sqlite3_close(F.Handle);
+    F.Handle := nil;
+    Exit;
+  end;
   { Wait 5 s when another writer holds the file. WAL prevents readers such as
     online backup from blocking the writer, and FULL synchronizes every commit,
     as required for a configuration registry. }
@@ -354,17 +542,39 @@ begin
     Exit;
   if not Exec(F, 'PRAGMA foreign_keys=ON;', Err) then
     Exit;
-  { The organization database contains team secrets; only the hub owner reads it. }
-  FpChmod(F.Path, &600);
+  { journal_mode may have created sidecars. They are also credential-bearing;
+    chmod those that exist and fail rather than silently leave a weak mode. }
+  if FileExists(F.Path + '-wal') and (FpChmod(F.Path + '-wal', &600) <> 0) then
+  begin
+    Err := FileName + ': cannot protect WAL as mode 0600: ' +
+      SysErrorMessage(fpgeterrno);
+    Exit;
+  end;
+  if FileExists(F.Path + '-shm') and (FpChmod(F.Path + '-shm', &600) <> 0) then
+  begin
+    Err := FileName + ': cannot protect SHM as mode 0600: ' +
+      SysErrorMessage(fpgeterrno);
+    Exit;
+  end;
   Result := True;
 end;
 
-procedure TPzDb.CloseOne(var F: TPzDbFile);
+function TPzDb.CloseOne(var F: TPzDbFile): Boolean;
+var
+  rc: cint;
 begin
+  Result := True;
   if F.Handle <> nil then
   begin
-    sqlite3_close(F.Handle);
-    F.Handle := nil;
+    rc := sqlite3_close(F.Handle);
+    if rc = SQLITE_OK then
+      F.Handle := nil
+    else
+    begin
+      Result := False;
+      Writeln(StdErr, 'pizarra: warning: SQLite close failed for ', F.Path,
+        ' (code ', rc, '); keeping the dynamic library loaded');
+    end;
   end;
 end;
 
@@ -421,8 +631,56 @@ begin
       begin
         P := sqlite3_column_text(St, 0);
         if P <> nil then
-          Result := string(P);
+          SetString(Result, P, sqlite3_column_bytes(St, 0));
       end;
+    finally
+      sqlite3_finalize(St);
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TPzDb.QueryStrChecked(var F: TPzDbFile; const SQL: string;
+  out Value, Err: string): Boolean;
+var
+  S: AnsiString;
+  St: psqlite3_stmt;
+  P: PAnsiChar;
+  rc: cint;
+begin
+  Result := False;
+  Value := '';
+  Err := '';
+  if (not FAvail) or (F.Handle = nil) then
+  begin
+    Err := 'SQLite unavailable';
+    Exit;
+  end;
+  S := SQL;
+  St := nil;
+  FLock.Enter;
+  try
+    rc := sqlite3_prepare_v2(F.Handle, PAnsiChar(S), -1, @St, nil);
+    if rc <> SQLITE_OK then
+    begin
+      Err := string(sqlite3_errmsg(F.Handle));
+      Exit;
+    end;
+    try
+      rc := sqlite3_step(St);
+      if rc <> SQLITE_ROW then
+      begin
+        if rc = SQLITE_DONE then
+          Err := 'query returned no row'
+        else
+          Err := string(sqlite3_errmsg(F.Handle));
+        Exit;
+      end;
+      P := sqlite3_column_text(St, 0);
+      if P <> nil then
+        SetString(Value, P, sqlite3_column_bytes(St, 0));
+      Result := True;
     finally
       sqlite3_finalize(St);
     end;
@@ -440,6 +698,51 @@ begin
     Result := Def
   else
     Result := StrToInt64Def(S, Def);
+end;
+
+function TPzDb.QueryIntChecked(var F: TPzDbFile; const SQL: string;
+  out Value: Int64; out Err: string): Boolean;
+var
+  S: AnsiString;
+  St: psqlite3_stmt;
+  rc: cint;
+begin
+  Result := False;
+  Value := 0;
+  Err := '';
+  if (not FAvail) or (F.Handle = nil) then
+  begin
+    Err := 'SQLite unavailable';
+    Exit;
+  end;
+  S := SQL;
+  St := nil;
+  FLock.Enter;
+  try
+    rc := sqlite3_prepare_v2(F.Handle, PAnsiChar(S), -1, @St, nil);
+    if rc <> SQLITE_OK then
+    begin
+      Err := string(sqlite3_errmsg(F.Handle));
+      Exit;
+    end;
+    try
+      rc := sqlite3_step(St);
+      if rc <> SQLITE_ROW then
+      begin
+        if rc = SQLITE_DONE then
+          Err := 'query returned no row'
+        else
+          Err := string(sqlite3_errmsg(F.Handle));
+        Exit;
+      end;
+      Value := sqlite3_column_int64(St, 0);
+      Result := True;
+    finally
+      sqlite3_finalize(St);
+    end;
+  finally
+    FLock.Leave;
+  end;
 end;
 
 
@@ -516,7 +819,9 @@ const
     '  launch TEXT NOT NULL DEFAULT '''',' +
     '  usr TEXT NOT NULL DEFAULT '''',' +
     '  slave INTEGER NOT NULL DEFAULT 0,' +
-    '  workdir TEXT NOT NULL DEFAULT '''');' +
+    '  workdir TEXT NOT NULL DEFAULT '''',' +
+    '  delegate TEXT NOT NULL DEFAULT '''',' +
+    '  hold_when_blocked INTEGER NOT NULL DEFAULT 0);' +
     'CREATE INDEX IF NOT EXISTS ix_team_parent ON team(parent COLLATE NOCASE);' +
     'CREATE TABLE IF NOT EXISTS grp (' +
     '  name TEXT PRIMARY KEY COLLATE NOCASE,' +
@@ -528,7 +833,13 @@ const
       as 'excluded.excluded' in the ON CONFLICT clause below - valid but a trap.
       The INI key, the JSON field and the CLI verb are all 'excluded'; only this
       column is renamed to dodge the keyword. }
-    '  muted TEXT NOT NULL DEFAULT '''');' +
+    '  muted TEXT NOT NULL DEFAULT '''',' +
+    '  on_idle TEXT NOT NULL DEFAULT '''',' +
+    '  on_idle_msg TEXT NOT NULL DEFAULT '''',' +
+    '  on_idle_from TEXT NOT NULL DEFAULT '''',' +
+    '  on_idle_reply TEXT NOT NULL DEFAULT '''',' +
+    '  hdr_note TEXT NOT NULL DEFAULT '''',' +
+    '  on_block TEXT NOT NULL DEFAULT '''');' +
     'CREATE TABLE IF NOT EXISTS grp_member (' +
     '  grp TEXT NOT NULL COLLATE NOCASE' +
     '    REFERENCES grp(name) ON DELETE CASCADE ON UPDATE CASCADE,' +
@@ -563,9 +874,9 @@ const
     'CREATE INDEX IF NOT EXISTS ix_note_task ON task_note(task_id, id);';
 
 
-{ Every migration receives caller-extracted data, keeping pzdb independent from
-  pzconfig and pztasks. TStringList fields use #1, which cannot appear in INI
-  data or textual JSON. }
+{ Every migration receives caller-extracted data. Compatibility row APIs use
+  #1 only between RowFieldEncode-framed values, so legal JSON control bytes do
+  not flatten or shift columns. }
 
 function TPzDb.HistAdd(var F: TPzDbFile; const Who, Kind, Subject, Op, Field,
   OldV, NewV, Before, After: string; Keep: Boolean; out Err: string): Boolean;
@@ -612,6 +923,7 @@ begin
     F.DelimitedText := Row;
     while F.Count < 8 do
       F.Add('');
+    DecodeRowFields(F, [1, 2, 3, 4, 6, 7]);
     if not Exec(FWork, 'BEGIN IMMEDIATE;', Err) then
       Exit;
     try
@@ -745,7 +1057,7 @@ begin
     ' AND project=' + Q(Project_) + ';');
   try
     if (PreviousRows <> nil) and (PreviousRows.Count > 0) then
-      PreviousRole := PreviousRows[0];
+      PreviousRole := RowFieldDecode(PreviousRows[0]);
   finally
     PreviousRows.Free;
   end;
@@ -803,15 +1115,23 @@ begin
 end;
 
 function TPzDb.ProjectsOfApp(const App_: string): TStringList;
+var
+  i: Integer;
 begin
   Result := Rows(FOrg, 'SELECT project || char(9) || role FROM app_project ' +
     'WHERE app=' + Q(App_) + ' ORDER BY project COLLATE NOCASE;');
+  for i := 0 to Result.Count - 1 do
+    Result[i] := RowFieldDecode(Result[i]);
 end;
 
 function TPzDb.AppsOfProject(const Project_: string): TStringList;
+var
+  i: Integer;
 begin
   Result := Rows(FOrg, 'SELECT app || char(9) || role FROM app_project ' +
     'WHERE project=' + Q(Project_) + ' ORDER BY app COLLATE NOCASE;');
+  for i := 0 to Result.Count - 1 do
+    Result[i] := RowFieldDecode(Result[i]);
 end;
 
 function TPzDb.AppRemove(const Name, Who, OldRow: string;
@@ -905,25 +1225,31 @@ begin
       #0, CheckQuoted always returns False (stringl.inc:556, aQuoteChar<>#0). }
     F.QuoteChar := #0;
     F.DelimitedText := Row;
-    while F.Count < 15 do
+    { id,name,speciality,prompt,parent,project,secret,host,port,dial,
+      tmux_session,launch,usr,slave,workdir,delegate,hold_when_blocked }
+    while F.Count < 17 do
       F.Add('');
+    DecodeRowFields(F, [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 14, 15]);
     if not Exec(FOrg, 'BEGIN IMMEDIATE;', Err) then
       Exit;
     try
       if not Exec(FOrg,
         'INSERT INTO team(id,name,speciality,prompt,parent,project,secret,' +
-        'host,port,dial,tmux_session,launch,usr,slave,workdir) VALUES(' + QI(F[0]) + ',' +
+        'host,port,dial,tmux_session,launch,usr,slave,workdir,delegate,' +
+        'hold_when_blocked) VALUES(' + QI(F[0]) + ',' +
         Q(F[1]) + ',' + Q(F[2]) + ',' + Q(F[3]) + ',' + Q(F[4]) + ',' +
         Q(F[5]) + ',' + Q(F[6]) + ',' + Q(F[7]) + ',' + QI(F[8]) + ',' + QI(F[9]) +
         ',' + Q(F[10]) + ',' + Q(F[11]) + ',' + Q(F[12]) + ',' + QI(F[13]) +
-        ',' + Q(F[14]) + ')' +
+        ',' + Q(F[14]) + ',' + Q(F[15]) + ',' +
+        IntToStr(StrToIntDef(Trim(F[16]), 0)) + ')' +
         ' ON CONFLICT(id) DO UPDATE SET name=excluded.name,' +
         'speciality=excluded.speciality,prompt=excluded.prompt,' +
         'parent=excluded.parent,project=excluded.project,' +
         'secret=excluded.secret,host=excluded.host,port=excluded.port,' +
         'dial=excluded.dial,tmux_session=excluded.tmux_session,' +
         'launch=excluded.launch,usr=excluded.usr,slave=excluded.slave,' +
-        'workdir=excluded.workdir;', Err) then
+        'workdir=excluded.workdir,delegate=excluded.delegate,' +
+        'hold_when_blocked=excluded.hold_when_blocked;', Err) then
         Exit;
       if IsNew then
       begin
@@ -973,10 +1299,10 @@ begin
   end;
 end;
 
-function TPzDb.GroupUpsert(const Name, Project, Boss, Members, Excluded, Who: string;
-  const OldRow: string; out Err: string): Boolean;
+function TPzDb.TeamRemoveWithGroups(Id: Integer;
+  const Name, Who, OldRow: string; const Groups: TGroupArray;
+  out Err: string): Boolean;
 var
-  Mem: TStringList;
   i: Integer;
   Tmp: string;
 begin
@@ -986,45 +1312,106 @@ begin
     Err := FWhy;
     Exit;
   end;
-  Mem := TStringList.Create;
+  if not Exec(FOrg, 'BEGIN IMMEDIATE;', Err) then
+    Exit;
   try
-    Mem.Delimiter := ',';
-    Mem.StrictDelimiter := True;
-    { Disable QUOTING too. StrictDelimiter does NOT disable it: CheckQuoted
-      never consults that property (rtl/objpas/classes/stringl.inc:549-573), and
-      QuoteChar defaults to '"' (stringl.inc:74). A field STARTING with a double
-      quote was split internally, silently shifting EVERY following column. With
-      #0, CheckQuoted always returns False (stringl.inc:556, aQuoteChar<>#0). }
-    Mem.QuoteChar := #0;
-    Mem.DelimitedText := Members;
-    if not Exec(FOrg, 'BEGIN IMMEDIATE;', Err) then
-      Exit;
-    try
-      if not Exec(FOrg, 'INSERT INTO grp(name,project,boss,muted) VALUES(' +
-        Q(Name) + ',' + Q(Project) + ',' + Q(Boss) + ',' + Q(Excluded) + ')' +
-        ' ON CONFLICT(name) DO UPDATE SET project=excluded.project,' +
-        'boss=excluded.boss,muted=excluded.muted;', Err) then
+    { GroupWrite has no transaction of its own: every changed group, its
+      ordered member rows, every audit record, and the team deletion therefore
+      commit (or roll back) as one indivisible organization mutation. }
+    for i := 0 to High(Groups) do
+      if not GroupWrite(Groups[i], Who, '', Err) then
         Exit;
-      if not Exec(FOrg, 'DELETE FROM grp_member WHERE grp=' + Q(Name) + ';',
+    if not Exec(FOrg, 'DELETE FROM team WHERE id=' + IntToStr(Id) + ';',
+      Err) then
+      Exit;
+    if not HistAdd(FOrg, Who, 'team', Name, 'remove', '', '', '', OldRow, '',
+      True, Err) then
+      Exit;
+    Result := Exec(FOrg, 'COMMIT;', Err);
+  finally
+    if not Result then
+      Exec(FOrg, 'ROLLBACK;', Tmp);
+  end;
+end;
+
+function TPzDb.GroupWrite(const Grp: TGroup; const Who, OldRow: string;
+  out Err: string): Boolean;
+var
+  i: Integer;
+  Members, Excluded, AfterRow: string;
+begin
+  Result := False;
+  Members := '';
+  for i := 0 to High(Grp.Members) do
+  begin
+    if Members <> '' then
+      Members := Members + ',';
+    Members := Members + Grp.Members[i];
+  end;
+  Excluded := '';
+  for i := 0 to High(Grp.Excluded) do
+  begin
+    if Excluded <> '' then
+      Excluded := Excluded + ',';
+    Excluded := Excluded + Grp.Excluded[i];
+  end;
+
+  if not Exec(FOrg,
+    'INSERT INTO grp(name,project,boss,muted,on_idle,on_idle_msg,' +
+    'on_idle_from,on_idle_reply,hdr_note,on_block) VALUES(' +
+    Q(Grp.Name) + ',' + Q(Grp.Project) + ',' + Q(Grp.Boss) + ',' +
+    Q(Excluded) + ',' + Q(Grp.OnIdle) + ',' + Q(Grp.OnIdleMsg) + ',' +
+    Q(Grp.OnIdleFrom) + ',' + Q(Grp.OnIdleReply) + ',' + Q(Grp.HdrNote) +
+    ',' + Q(Grp.OnBlock) + ')' +
+    ' ON CONFLICT(name) DO UPDATE SET project=excluded.project,' +
+    'boss=excluded.boss,muted=excluded.muted,on_idle=excluded.on_idle,' +
+    'on_idle_msg=excluded.on_idle_msg,on_idle_from=excluded.on_idle_from,' +
+    'on_idle_reply=excluded.on_idle_reply,hdr_note=excluded.hdr_note,' +
+    'on_block=excluded.on_block;', Err) then
+    Exit;
+  if not Exec(FOrg, 'DELETE FROM grp_member WHERE grp=' + Q(Grp.Name) + ';',
+    Err) then
+    Exit;
+  for i := 0 to High(Grp.Members) do
+    if Trim(Grp.Members[i]) <> '' then
+      if not Exec(FOrg,
+        'INSERT OR IGNORE INTO grp_member(grp,team,ord) VALUES(' +
+        Q(Grp.Name) + ',' + Q(Trim(Grp.Members[i])) + ',' + IntToStr(i) + ');',
         Err) then
         Exit;
-      for i := 0 to Mem.Count - 1 do
-        if Trim(Mem[i]) <> '' then
-          if not Exec(FOrg,
-            'INSERT OR IGNORE INTO grp_member(grp,team,ord) VALUES(' +
-            Q(Name) + ',' + Q(Trim(Mem[i])) + ',' + IntToStr(i) + ');',
-            Err) then
-            Exit;
-      if not HistAdd(FOrg, Who, 'group', Name, 'set', 'members', OldRow,
-        Members, '', '{"members":"' + JsonEsc(Members) + '"}', False, Err) then
-        Exit;
-      Result := Exec(FOrg, 'COMMIT;', Err);
-    finally
-      if not Result then
-        Exec(FOrg, 'ROLLBACK;', Tmp);
-    end;
+
+  AfterRow := '{"project":"' + JsonEsc(Grp.Project) + '","boss":"' +
+    JsonEsc(Grp.Boss) + '","members":"' + JsonEsc(Members) +
+    '","excluded":"' + JsonEsc(Excluded) + '","on_idle":"' +
+    JsonEsc(Grp.OnIdle) + '","on_idle_msg":"' + JsonEsc(Grp.OnIdleMsg) +
+    '","on_idle_from":"' + JsonEsc(Grp.OnIdleFrom) +
+    '","on_idle_reply":"' + JsonEsc(Grp.OnIdleReply) +
+    '","hdr_note":"' + JsonEsc(Grp.HdrNote) + '","on_block":"' +
+    JsonEsc(Grp.OnBlock) + '"}';
+  Result := HistAdd(FOrg, Who, 'group', Grp.Name, 'set', 'members', OldRow,
+    Members, OldRow, AfterRow, False, Err);
+end;
+
+function TPzDb.GroupUpsert(const Grp: TGroup; const Who, OldRow: string;
+  out Err: string): Boolean;
+var
+  Tmp: string;
+begin
+  Result := False;
+  if not FAvail then
+  begin
+    Err := FWhy;
+    Exit;
+  end;
+  if not Exec(FOrg, 'BEGIN IMMEDIATE;', Err) then
+    Exit;
+  try
+    if not GroupWrite(Grp, Who, OldRow, Err) then
+      Exit;
+    Result := Exec(FOrg, 'COMMIT;', Err);
   finally
-    Mem.Free;
+    if not Result then
+      Exec(FOrg, 'ROLLBACK;', Tmp);
   end;
 end;
 
@@ -1112,14 +1499,13 @@ function TPzDb.ImportMissing(const Names, Teams, Repos, Paths, Purposes,
   ProjectRows: TStringList; out N: Integer; out Err: string): Boolean;
 var
   i, j: Integer;
-  F, Mem, INames: TStringList;
-  Keep, Tmp, Old: string;
+  F, Mem: TStringList;
+  Keep, Tmp: string;
 begin
   Result := False;
   N := 0;
   F := TStringList.Create;
   Mem := TStringList.Create;
-  INames := TStringList.Create;
   try
     F.Delimiter := #1;
     F.StrictDelimiter := True;
@@ -1167,28 +1553,19 @@ begin
     if not Exec(FOrg, 'BEGIN IMMEDIATE;', Err) then
       Exit;
     try
-      { Names currently declared by the INI distinguish a RENAME, where no one
-        claims the old row, from an ID collision between two configurations
-        sharing one store. }
-      INames.Clear;
-      INames.CaseSensitive := False;
-      for i := 0 to TeamRows.Count - 1 do
-      begin
-        F.DelimitedText := TeamRows[i];
-        if F.Count > 1 then
-          INames.Add(F[1]);
-      end;
       Keep := '';
       for i := 0 to TeamRows.Count - 1 do
       begin
         F.DelimitedText := TeamRows[i];
-        while F.Count < 15 do
+        while F.Count < 17 do
           F.Add('');
+        DecodeRowFields(F, [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 14, 15]);
         if Keep <> '' then
           Keep := Keep + ',';
         Keep := Keep + F[0];
-        { NAME is the identity. If the database already knows it, update its
-          fields so manual pizarra.conf edits followed by restart remain valid. }
+        { OpenRegistryDb has already proved that every overlapping legacy row
+          is byte-for-byte compatible. Existing rows may therefore be filled
+          with the newly-added policy columns without overwriting a conflict. }
         if QueryStr(FOrg, 'SELECT 1 FROM team WHERE name=' + Q(F[1])) <> '' then
         begin
           if not Exec(FOrg, 'UPDATE team SET speciality=' + Q(F[2]) +
@@ -1196,45 +1573,25 @@ begin
             Q(F[5]) + ',secret=' + Q(F[6]) + ',host=' + Q(F[7]) + ',port=' +
             QI(F[8]) + ',dial=' + QI(F[9]) + ',tmux_session=' + Q(F[10]) +
             ',launch=' + Q(F[11]) + ',usr=' + Q(F[12]) + ',slave=' +
-            QI(F[13]) + ',workdir=' + Q(F[14]) + ' WHERE name=' + Q(F[1]) +
-            ';', Err) then
+            QI(F[13]) + ',workdir=' + Q(F[14]) + ',delegate=' + Q(F[15]) +
+            ',hold_when_blocked=' + IntToStr(StrToIntDef(Trim(F[16]), 0)) +
+            ' WHERE name=' + Q(F[1]) + ';', Err) then
             Exit;
           Continue;
         end;
-        { The database does not contain this name. If a row DOES have this ID
-          and no INI team claims its current name, the row is orphaned and this
-          is a manual RENAME in pizarra.conf. UPDATE that row instead of adding
-          another. Previously a new row received a free ID and BOTH survived:
-          the old orphan and the new name. Every later mutation then failed on
-          UNIQUE(name) even though it WAS applied in memory and the INI, creating
-          silent divergence that appeared successful to the operator. }
-        Old := QueryStr(FOrg, 'SELECT name FROM team WHERE id=' + QI(F[0]));
-        if (Old <> '') and (INames.IndexOf(Old) < 0) then
-        begin
-          if not Exec(FOrg, 'UPDATE team SET name=' + Q(F[1]) +
-            ',speciality=' + Q(F[2]) + ',prompt=' + Q(F[3]) + ',parent=' +
-            Q(F[4]) + ',project=' + Q(F[5]) + ',secret=' + Q(F[6]) +
-            ',host=' + Q(F[7]) + ',port=' + QI(F[8]) + ',dial=' + QI(F[9]) +
-            ',tmux_session=' + Q(F[10]) + ',launch=' + Q(F[11]) + ',usr=' +
-            Q(F[12]) + ',slave=' + QI(F[13]) + ',workdir=' + Q(F[14]) +
-            ' WHERE id=' + QI(F[0]) + ';', Err) then
-            Exit;
-          Inc(N);
-          Continue;
-        end;
-        { Another team may occupy this ID when separate configurations share one
-          store. Assign a free ID instead of silently discarding the team. }
+        { Never infer a rename and never assign a different numeric identity.
+          A name/ID collision means two sources disagree; the preflight rejects
+          it, and the UNIQUE constraint is the final guard. }
         Tmp := F[0];
-        if QueryStr(FOrg, 'SELECT 1 FROM team WHERE id=' + Tmp) <> '' then
-          Tmp := IntToStr(StrToIntDef(QueryStr(FOrg,
-            'SELECT COALESCE(MAX(id),0) FROM team'), 0) + 1);
         if not Exec(FOrg,
           'INSERT INTO team(id,name,speciality,prompt,parent,project,secret,' +
-          'host,port,dial,tmux_session,launch,usr,slave,workdir) VALUES(' + QI(Tmp) + ',' +
+          'host,port,dial,tmux_session,launch,usr,slave,workdir,delegate,' +
+          'hold_when_blocked) VALUES(' + QI(Tmp) + ',' +
           Q(F[1]) + ',' + Q(F[2]) + ',' + Q(F[3]) + ',' + Q(F[4]) + ',' +
           Q(F[5]) + ',' + Q(F[6]) + ',' + Q(F[7]) + ',' + QI(F[8]) + ',' + QI(F[9]) +
           ',' + Q(F[10]) + ',' + Q(F[11]) + ',' + Q(F[12]) + ',' + QI(F[13]) +
-          ',' + Q(F[14]) + ');', Err) then
+          ',' + Q(F[14]) + ',' + Q(F[15]) + ',' +
+          IntToStr(StrToIntDef(Trim(F[16]), 0)) + ');', Err) then
           Exit;
         Inc(N);
       end;
@@ -1243,15 +1600,25 @@ begin
       for i := 0 to GroupRows.Count - 1 do
       begin
         F.DelimitedText := GroupRows[i];
-        while F.Count < 4 do
+        { name,project,boss,members,excluded,on_idle,on_idle_msg,on_idle_from,
+          on_idle_reply,hdr_note,on_block }
+        while F.Count < 11 do
           F.Add('');
+        DecodeRowFields(F, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         if Keep <> '' then
           Keep := Keep + ',';
         Keep := Keep + Q(F[0]);
-        if not Exec(FOrg, 'INSERT INTO grp(name,project,boss) VALUES(' +
-          Q(F[0]) + ',' + Q(F[1]) + ',' + Q(F[2]) + ')' +
+        if not Exec(FOrg,
+          'INSERT INTO grp(name,project,boss,muted,on_idle,on_idle_msg,' +
+          'on_idle_from,on_idle_reply,hdr_note,on_block) VALUES(' +
+          Q(F[0]) + ',' + Q(F[1]) + ',' + Q(F[2]) + ',' + Q(F[4]) + ',' +
+          Q(F[5]) + ',' + Q(F[6]) + ',' + Q(F[7]) + ',' + Q(F[8]) + ',' +
+          Q(F[9]) + ',' + Q(F[10]) + ')' +
           ' ON CONFLICT(name) DO UPDATE SET project=excluded.project,' +
-          'boss=excluded.boss;', Err) then
+          'boss=excluded.boss,muted=excluded.muted,on_idle=excluded.on_idle,' +
+          'on_idle_msg=excluded.on_idle_msg,on_idle_from=excluded.on_idle_from,' +
+          'on_idle_reply=excluded.on_idle_reply,hdr_note=excluded.hdr_note,' +
+          'on_block=excluded.on_block;', Err) then
           Exit;
         if not Exec(FOrg, 'DELETE FROM grp_member WHERE grp=' + Q(F[0]) + ';',
           Err) then
@@ -1273,6 +1640,7 @@ begin
         F.DelimitedText := ProjectRows[i];
         while F.Count < 2 do
           F.Add('');
+        DecodeRowFields(F, [0, 1]);
         if Keep <> '' then
           Keep := Keep + ',';
         Keep := Keep + Q(F[0]);
@@ -1289,15 +1657,17 @@ begin
   finally
     F.Free;
     Mem.Free;
-    INames.Free;
   end;
 end;
 
 function TPzDb.MigrateApps(const Names, Teams, Repos, Paths, Purposes,
-  Details, Docs: TStringList; out N, NDocs: Integer; out Err: string): Boolean;
+  Details, Docs, DocPresent: TStringList; out N, NDocs: Integer;
+  out Err: string): Boolean;
 var
   i: Integer;
-  Tmp: string;
+  Tmp, ExistingBody: string;
+  Inserted: Boolean;
+  Count: Int64;
 begin
   Result := False;
   N := 0;
@@ -1313,20 +1683,60 @@ begin
         Q(Paths[i]) + ',' + Q(Purposes[i]) + ',' + Q(Details[i]) + ');',
         Err) then
         Exit;
-      Inc(N);
-      if not HistAdd(FApps, '(migration)', 'app', Names[i], 'add', '', '', '',
-        '', '{"team":"' + JsonEsc(Teams[i]) + '"}', False, Err) then
-        Exit;
-      if Docs[i] <> '' then
+      Inserted := QueryInt(FApps, 'SELECT changes();') > 0;
+      if Inserted then
       begin
-        if not Exec(FApps,
-          'INSERT OR IGNORE INTO app_doc(app,body,bytes,updated_ts,updated_by)' +
-          ' VALUES(' + Q(Names[i]) + ',' + Q(Docs[i]) + ',' +
-          IntToStr(Length(Docs[i])) + ',' +
-          Q(FormatDateTime('yyyy-mm-dd hh:nn:ss', Now)) + ',' +
-          Q('(migration)') + ');', Err) then
+        Inc(N);
+        if not HistAdd(FApps, '(migration)', 'app', Names[i], 'add', '', '', '',
+          '', '{"team":"' + JsonEsc(Teams[i]) + '"}', False, Err) then
           Exit;
-        Inc(NDocs);
+      end;
+      if (i < DocPresent.Count) and (DocPresent[i] = '1') then
+      begin
+        if not QueryIntChecked(FApps,
+          'SELECT COUNT(*) FROM app_doc WHERE app=' + Q(Names[i]) + ';',
+          Count, Err) then
+          Exit;
+        if Count = 0 then
+        begin
+          if not Exec(FApps,
+            'INSERT INTO app_doc(app,body,bytes,updated_ts,updated_by)' +
+            ' VALUES(' + Q(Names[i]) + ',' + Q(Docs[i]) + ',' +
+            IntToStr(Length(Docs[i])) + ',' +
+            Q(FormatDateTime('yyyy-mm-dd hh:nn:ss', Now)) + ',' +
+            Q('(migration)') + ');', Err) then
+            Exit;
+          Inc(NDocs);
+        end
+        else
+        begin
+          if not QueryStrChecked(FApps,
+            'SELECT body FROM app_doc WHERE app=' + Q(Names[i]) + ';',
+            ExistingBody, Err) then
+            Exit;
+          if ExistingBody <> Docs[i] then
+          begin
+            { app_doc in SQLite was already the live manual source before this
+              registry cutover. Keep it current, but move a divergent legacy
+              appdocs/*.md body into the SAME SQLite history so consolidation
+              loses neither version. The exact-row guard makes retries quiet. }
+            if not QueryIntChecked(FApps,
+              'SELECT COUNT(*) FROM history WHERE kind=''appdoc'' AND subject=' +
+              Q(Names[i]) + ' AND op=''legacy-archive'' AND before=' +
+              Q(ExistingBody) + ' AND after=' + Q(Docs[i]) + ';', Count, Err) then
+              Exit;
+            if Count = 0 then
+            begin
+              if not HistAdd(FApps, '(migration)', 'appdoc', Names[i],
+                'legacy-archive', 'body',
+                IntToStr(Length(ExistingBody)) + ' bytes',
+                IntToStr(Length(Docs[i])) + ' bytes', ExistingBody, Docs[i],
+                True, Err) then
+                Exit;
+              Inc(NDocs);
+            end;
+          end;
+        end;
       end;
     end;
     Result := Exec(FApps, 'COMMIT;', Err);
@@ -1336,111 +1746,30 @@ begin
   end;
 end;
 
-function TPzDb.MigrateOrg(const TeamRows, GroupRows, ProjectRows: TStringList;
-  out NT, NG, NP: Integer; out Err: string): Boolean;
-var
-  i, j: Integer;
-  F, Mem: TStringList;
-  Tmp: string;
-begin
-  Result := False;
-  NT := 0; NG := 0; NP := 0;
-  if not Exec(FOrg, 'BEGIN IMMEDIATE;', Err) then
-    Exit;
-  F := TStringList.Create;
-  Mem := TStringList.Create;
-  try
-    F.Delimiter := #1;
-    F.StrictDelimiter := True;
-    { Disable QUOTING too. StrictDelimiter does NOT disable it: CheckQuoted
-      never consults that property (rtl/objpas/classes/stringl.inc:549-573), and
-      QuoteChar defaults to '"' (stringl.inc:74). A field STARTING with a double
-      quote was split internally, silently shifting EVERY following column. With
-      #0, CheckQuoted always returns False (stringl.inc:556, aQuoteChar<>#0). }
-    F.QuoteChar := #0;
-    Mem.Delimiter := ',';
-    Mem.StrictDelimiter := True;
-    { Disable QUOTING too. StrictDelimiter does NOT disable it: CheckQuoted
-      never consults that property (rtl/objpas/classes/stringl.inc:549-573), and
-      QuoteChar defaults to '"' (stringl.inc:74). A field STARTING with a double
-      quote was split internally, silently shifting EVERY following column. With
-      #0, CheckQuoted always returns False (stringl.inc:556, aQuoteChar<>#0). }
-    Mem.QuoteChar := #0;
-    for i := 0 to TeamRows.Count - 1 do
-    begin
-      F.DelimitedText := TeamRows[i];
-      while F.Count < 15 do
-        F.Add('');
-      if not Exec(FOrg,
-        'INSERT OR IGNORE INTO team(id,name,speciality,prompt,parent,project,' +
-        'secret,host,port,dial,tmux_session,launch,usr,slave,workdir) VALUES(' +
-        QI(F[0]) + ',' + Q(F[1]) + ',' + Q(F[2]) + ',' + Q(F[3]) + ',' +
-        Q(F[4]) + ',' + Q(F[5]) + ',' + Q(F[6]) + ',' + Q(F[7]) + ',' +
-        QI(F[8]) + ',' + QI(F[9]) + ',' + Q(F[10]) + ',' + Q(F[11]) + ',' +
-        Q(F[12]) + ',' + QI(F[13]) + ',' + Q(F[14]) + ');', Err) then
-        Exit;
-      Inc(NT);
-      if not HistAdd(FOrg, '(migration)', 'team', F[1], 'add', '', '', '', '',
-        '{"id":' + QI(F[0]) + '}', False, Err) then
-        Exit;
-    end;
-    for i := 0 to GroupRows.Count - 1 do
-    begin
-      F.DelimitedText := GroupRows[i];
-      while F.Count < 4 do
-        F.Add('');
-      if not Exec(FOrg,
-        'INSERT OR IGNORE INTO grp(name,project,boss) VALUES(' +
-        Q(F[0]) + ',' + Q(F[1]) + ',' + Q(F[2]) + ');', Err) then
-        Exit;
-      Mem.DelimitedText := F[3];
-      for j := 0 to Mem.Count - 1 do
-        if Trim(Mem[j]) <> '' then
-          if not Exec(FOrg,
-            'INSERT OR IGNORE INTO grp_member(grp,team,ord) VALUES(' +
-            Q(F[0]) + ',' + Q(Trim(Mem[j])) + ',' + IntToStr(j) + ');',
-            Err) then
-            Exit;
-      Inc(NG);
-      if not HistAdd(FOrg, '(migration)', 'group', F[0], 'add', '', '', '', '',
-        '{"members":"' + JsonEsc(F[3]) + '"}', False, Err) then
-        Exit;
-    end;
-    for i := 0 to ProjectRows.Count - 1 do
-    begin
-      F.DelimitedText := ProjectRows[i];
-      while F.Count < 2 do
-        F.Add('');
-      if not Exec(FOrg, 'INSERT OR IGNORE INTO project(name,boss) VALUES(' +
-        Q(F[0]) + ',' + Q(F[1]) + ');', Err) then
-        Exit;
-      Inc(NP);
-      if not HistAdd(FOrg, '(migration)', 'project', F[0], 'add', '', '', '',
-        '', '{}', False, Err) then
-        Exit;
-    end;
-    Result := Exec(FOrg, 'COMMIT;', Err);
-  finally
-    F.Free;
-    Mem.Free;
-    if not Result then
-      Exec(FOrg, 'ROLLBACK;', Tmp);
-  end;
-end;
-
 function TPzDb.MigrateTasks(const TaskRows, NoteRows: TStringList;
   out NT, NN: Integer; out Err: string): Boolean;
 var
-  i: Integer;
-  F: TStringList;
-  Tmp: string;
+  i, Idx, TaskId: Integer;
+  F, SeenKeys, SeenCounts: TStringList;
+  Tmp, Key: string;
+  Existing, ExactCount, Desired: Int64;
 begin
   Result := False;
   NT := 0; NN := 0;
   if not Exec(FWork, 'BEGIN IMMEDIATE;', Err) then
     Exit;
   F := TStringList.Create;
+  SeenKeys := TStringList.Create;
+  SeenCounts := TStringList.Create;
   try
+    SeenKeys.CaseSensitive := True;
+    { Recheck under the write transaction. Two simultaneous cold starts may
+      both have observed a missing marker before the first committed. }
+    if MetaGet(FWork, 'ini_migrated') <> '' then
+    begin
+      Result := Exec(FWork, 'COMMIT;', Err);
+      Exit;
+    end;
     F.Delimiter := #1;
     F.StrictDelimiter := True;
     { Disable QUOTING too. StrictDelimiter does NOT disable it: CheckQuoted
@@ -1454,33 +1783,105 @@ begin
       F.DelimitedText := TaskRows[i];
       while F.Count < 8 do
         F.Add('');
-      if not Exec(FWork,
-        'INSERT OR IGNORE INTO task(id,title,team,state,hito,parent,' +
-        'created,closed) VALUES(' + QI(F[0]) + ',' + Q(F[1]) + ',' + Q(F[2]) +
-        ',' + Q(F[3]) + ',' + Q(F[4]) + ',' + QI(F[5]) + ',' + Q(F[6]) + ',' +
-        Q(F[7]) + ');', Err) then
+      DecodeRowFields(F, [1, 2, 3, 4, 6, 7]);
+      if (not TryStrToInt(Trim(F[0]), TaskId)) or (TaskId <= 0) then
+      begin
+        Err := 'legacy task has invalid id "' + F[0] + '"';
         Exit;
-      Inc(NT);
+      end;
+      if not QueryIntChecked(FWork, 'SELECT COUNT(*) FROM task WHERE id=' +
+        IntToStr(TaskId) + ';', Existing, Err) then
+        Exit;
+      if Existing > 0 then
+      begin
+        { A partial pre-marker work.sqlite is legitimate migration input too.
+          Preserve an exact overlap, but never attach JSON notes to a different
+          task merely because INSERT OR IGNORE hid an ID collision. Explicit
+          BINARY overrides the team's NOCASE column for byte-faithful proof. }
+        if not QueryIntChecked(FWork,
+          'SELECT COUNT(*) FROM task WHERE id=' + IntToStr(TaskId) +
+          ' AND title COLLATE BINARY=' + Q(F[1]) +
+          ' AND team COLLATE BINARY=' + Q(F[2]) +
+          ' AND state COLLATE BINARY=' + Q(F[3]) +
+          ' AND hito COLLATE BINARY=' + Q(F[4]) +
+          ' AND parent=' + QI(F[5]) +
+          ' AND created COLLATE BINARY=' + Q(F[6]) +
+          ' AND closed COLLATE BINARY=' + Q(F[7]) + ';', ExactCount, Err) then
+          Exit;
+        if ExactCount <> 1 then
+        begin
+          Err := 'legacy task id ' + IntToStr(TaskId) +
+            ' conflicts with the existing SQLite task; nothing was migrated';
+          Exit;
+        end;
+      end
+      else
+      begin
+        if not Exec(FWork,
+          'INSERT INTO task(id,title,team,state,hito,parent,created,closed) ' +
+          'VALUES(' + IntToStr(TaskId) + ',' + Q(F[1]) + ',' + Q(F[2]) + ',' +
+          Q(F[3]) + ',' + Q(F[4]) + ',' + QI(F[5]) + ',' + Q(F[6]) + ',' +
+          Q(F[7]) + ');', Err) then
+          Exit;
+        Inc(NT);
+      end;
     end;
-      { NOTE TEXT MUST BE LAST. It is free text and may contain newlines or even
-        the delimiter; preserve it exactly because a note is someone's evidence.
-        While it remains the LAST column, an embedded delimiter can only append
-        ignored fields. Adding a later column would silently corrupt rows, as
-        once happened with task titles. Any new fields must go BEFORE the note. }
+    { Notes use RowFieldEncode/Decode, so newlines, #1, NUL, and future fields
+      retain exact byte boundaries. }
     for i := 0 to NoteRows.Count - 1 do
     begin
       F.DelimitedText := NoteRows[i];
       while F.Count < 4 do
         F.Add('');
-      if not Exec(FWork,
-        'INSERT INTO task_note(task_id,ts,by_who,text) VALUES(' +
-        QI(F[0]) + ',' + Q(F[1]) + ',' + Q(F[2]) + ',' + Q(F[3]) + ');',
-        Err) then
+      DecodeRowFields(F, [1, 2, 3]);
+      if (not TryStrToInt(Trim(F[0]), TaskId)) or (TaskId <= 0) then
+      begin
+        Err := 'legacy task note has invalid task id "' + F[0] + '"';
         Exit;
-      Inc(NN);
+      end;
+      { Reconcile note multiplicity, not merely presence: two byte-identical
+        notes in tareas.json remain two notes, while a retry over a partial DB
+        does not duplicate either one. }
+      Key := IntToStr(TaskId) + #1 + RowFieldEncode(F[1]) + #1 +
+        RowFieldEncode(F[2]) + #1 + RowFieldEncode(F[3]);
+      Idx := SeenKeys.IndexOf(Key);
+      if Idx < 0 then
+      begin
+        SeenKeys.Add(Key);
+        SeenCounts.Add('1');
+        Desired := 1;
+      end
+      else
+      begin
+        Desired := StrToInt64Def(SeenCounts[Idx], 0) + 1;
+        SeenCounts[Idx] := IntToStr(Desired);
+      end;
+      if not QueryIntChecked(FWork,
+        'SELECT COUNT(*) FROM task_note WHERE task_id=' + IntToStr(TaskId) +
+        ' AND ts COLLATE BINARY=' + Q(F[1]) +
+        ' AND by_who COLLATE BINARY=' + Q(F[2]) +
+        ' AND text COLLATE BINARY=' + Q(F[3]) + ';', Existing, Err) then
+        Exit;
+      if Existing < Desired then
+      begin
+        if not Exec(FWork,
+          'INSERT INTO task_note(task_id,ts,by_who,text) VALUES(' +
+          IntToStr(TaskId) + ',' + Q(F[1]) + ',' + Q(F[2]) + ',' +
+          Q(F[3]) + ');', Err) then
+          Exit;
+        Inc(NN);
+      end;
     end;
+    { The marker shares this transaction with every task and note. A crash can
+      no longer commit notes and miss the marker, which duplicated all notes on
+      the next startup. }
+    if not MetaSet(FWork, 'ini_migrated',
+      FormatDateTime('yyyy-mm-dd hh:nn:ss', Now), Err) then
+      Exit;
     Result := Exec(FWork, 'COMMIT;', Err);
   finally
+    SeenCounts.Free;
+    SeenKeys.Free;
     F.Free;
     if not Result then
       Exec(FWork, 'ROLLBACK;', Tmp);
@@ -1497,11 +1898,18 @@ function TPzDb.BackupTo(const OutDir: string; out Err: string): Boolean;
     Dst: psqlite3;
     B: psqlite3backup;
     P: AnsiString;
-    rc: cint;
+    H, ErrNo, Retries: Integer;
+    rc, FinishRc, CloseRc: cint;
   begin
     Result := False;
     Dst := nil;
+    B := nil;
     P := IncludeTrailingPathDelimiter(OutDir) + FileName;
+    if FileExists(string(P)) then
+    begin
+      Err := 'refusing to overwrite backup file ' + string(P);
+      Exit;
+    end;
     if sqlite3_open_v2(PAnsiChar(P), @Dst,
       SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, nil) <> SQLITE_OK then
     begin
@@ -1511,27 +1919,110 @@ function TPzDb.BackupTo(const OutDir: string; out Err: string): Boolean;
       Exit;
     end;
     try
+      if FpChmod(string(P), &600) <> 0 then
+      begin
+        ErrNo := fpgeterrno;
+        Err := FileName + ': cannot protect backup as mode 0600: ' +
+          SysErrorMessage(ErrNo);
+        Exit;
+      end;
+      sqlite3_busy_timeout(Dst, 5000);
       B := sqlite3_backup_init(Dst, 'main', Src.Handle, 'main');
       if B = nil then
       begin
         Err := FileName + ': ' + string(sqlite3_errmsg(Dst));
         Exit;
       end;
-        { Copy 256 pages at a time. If another thread writes, SQLite restarts
-          the copy itself without blocking message delivery. }
+      { Copy 256 pages at a time. SQLITE_BUSY/LOCKED means retry later, not a
+        tight spin; cap the wait so a stuck writer cannot hang the hub. }
+      Retries := 0;
       repeat
         rc := sqlite3_backup_step(B, 256);
-      until (rc <> SQLITE_OK) and (rc <> 5) and (rc <> 6);
-      sqlite3_backup_finish(B);
-      if rc <> SQLITE_DONE then
+        if (rc = SQLITE_BUSY) or (rc = SQLITE_LOCKED) then
+        begin
+          Inc(Retries);
+          if Retries > 500 then
+            Break;
+          Sleep(10);
+        end
+        else
+          Retries := 0;
+      until (rc <> SQLITE_OK) and (rc <> SQLITE_BUSY) and
+            (rc <> SQLITE_LOCKED);
+      FinishRc := sqlite3_backup_finish(B);
+      B := nil;
+      if (rc <> SQLITE_DONE) or (FinishRc <> SQLITE_OK) then
       begin
-        Err := FileName + ': incomplete copy (code ' + IntToStr(rc) + ')';
+        Err := FileName + ': incomplete copy (step ' + IntToStr(rc) +
+          ', finish ' + IntToStr(FinishRc) + ')';
         Exit;
       end;
       Result := True;
     finally
-      sqlite3_close(Dst);
+      if B <> nil then
+        sqlite3_backup_finish(B);
+      CloseRc := sqlite3_close(Dst);
+      if CloseRc <> SQLITE_OK then
+      begin
+        sqlite3_close_v2(Dst);
+        Result := False;
+        Err := FileName + ': sqlite close failed (code ' +
+          IntToStr(CloseRc) + ')';
+      end;
+      if not Result then
+        DeleteFile(string(P));
     end;
+    if not Result then
+      Exit;
+    if FpChmod(string(P), &600) <> 0 then
+    begin
+      Err := FileName + ': could not retain mode 0600 after backup';
+      DeleteFile(string(P));
+      Exit(False);
+    end;
+    H := FpOpen(string(P), O_RDONLY);
+    if H < 0 then
+    begin
+      Err := FileName + ': cannot reopen completed backup for fsync';
+      DeleteFile(string(P));
+      Exit(False);
+    end;
+    try
+      if PzFsync(H) <> 0 then
+      begin
+        Err := FileName + ': fsync failed: ' + SysErrorMessage(fpgeterrno);
+        DeleteFile(string(P));
+        Exit(False);
+      end;
+    finally
+      FpClose(H);
+    end;
+  end;
+
+  function SyncOutDir: Boolean;
+  var
+    H, ErrNo: Integer;
+  begin
+    Result := False;
+    H := FpOpen(OutDir, O_RDONLY or O_DIRECTORY);
+    if H < 0 then
+    begin
+      ErrNo := fpgeterrno;
+      Err := 'cannot open backup directory for fsync: ' +
+        SysErrorMessage(ErrNo);
+      Exit;
+    end;
+    try
+      if PzFsync(H) <> 0 then
+      begin
+        ErrNo := fpgeterrno;
+        Err := 'cannot fsync backup directory: ' + SysErrorMessage(ErrNo);
+        Exit;
+      end;
+    finally
+      FpClose(H);
+    end;
+    Result := True;
   end;
 
 begin
@@ -1542,11 +2033,8 @@ begin
     Err := FWhy;
     Exit;
   end;
-  if not ForceDirectories(OutDir) then
-  begin
-    Err := 'cannot create ' + OutDir;
+  if not EnsurePrivateRuntimeDir(OutDir, Err) then
     Exit;
-  end;
   FLock.Enter;
   try
     { Use the PHYSICAL FILE, not its alias. After migration FApps POINTS TO FOrg,
@@ -1558,6 +2046,12 @@ begin
     if not One(FOrg, 'org.sqlite') then
       Exit;
     if not One(FWork, 'work.sqlite') then
+      Exit;
+    if not SyncOutDir then
+      Exit;
+    { fsyncing OutDir persists its children; fsyncing the parent persists the
+      OutDir name itself when this backup directory was just created. }
+    if not PzSyncDirectory(ExtractFileDir(ExpandFileName(OutDir)), Err) then
       Exit;
     Result := True;
   finally
@@ -1646,7 +2140,7 @@ var
   A: AnsiString;
   St: psqlite3_stmt;
   P: PAnsiChar;
-  Line: string;
+  Line, Part: string;
   i, n: Integer;
 begin
   Result := TStringList.Create;
@@ -1669,7 +2163,10 @@ begin
             Line := Line + #1;
           P := sqlite3_column_text(St, i);
           if P <> nil then
-            Line := Line + string(P);
+            SetString(Part, P, sqlite3_column_bytes(St, i))
+          else
+            Part := '';
+          Line := Line + RowFieldEncode(Part);
         end;
         Result.Add(Line);
       end;
@@ -1681,9 +2178,302 @@ begin
   end;
 end;
 
+function TPzDb.LoadRegistry(var Cfg: TPizarraConfig;
+  out Err: string): Boolean;
+var
+  NewTeams: TTeamArray;
+  NewGroups: TGroupArray;
+  NewProjects: TProjectArray;
+  NewApps: TAppArray;
+  St: psqlite3_stmt;
+  rc: cint;
+  n, i, Idx, PortV: Integer;
+  IdV: Int64;
+  Csv, AppName, RelName: string;
+  Parts: TStringArray;
+
+  function ColText(ASt: psqlite3_stmt; Col: Integer): string;
+  var
+    P: PAnsiChar;
+  begin
+    P := sqlite3_column_text(ASt, Col);
+    if P = nil then
+      Result := ''
+    else
+      SetString(Result, P, sqlite3_column_bytes(ASt, Col));
+  end;
+
+  function PrepareStmt(const SQL, What: string;
+    out ASt: psqlite3_stmt): Boolean;
+  var
+    A: AnsiString;
+  begin
+    ASt := nil;
+    A := SQL;
+    Result := sqlite3_prepare_v2(FOrg.Handle, PAnsiChar(A), -1, @ASt,
+      nil) = SQLITE_OK;
+    if not Result then
+      Err := 'load registry (' + What + '): ' +
+        string(sqlite3_errmsg(FOrg.Handle));
+  end;
+
+  function StepComplete(Code: cint; const What: string): Boolean;
+  begin
+    Result := Code = SQLITE_DONE;
+    if not Result then
+      Err := 'load registry (' + What + '): ' +
+        string(sqlite3_errmsg(FOrg.Handle));
+  end;
+
+  function GroupIndex(const Name: string): Integer;
+  var
+    k: Integer;
+  begin
+    for k := 0 to High(NewGroups) do
+      if SameText(NewGroups[k].Name, Name) then
+        Exit(k);
+    Result := -1;
+  end;
+
+  function AppIndex(const Name: string): Integer;
+  var
+    k: Integer;
+  begin
+    for k := 0 to High(NewApps) do
+      if SameText(NewApps[k].Name, Name) then
+        Exit(k);
+    Result := -1;
+  end;
+
+begin
+  Result := False;
+  Err := '';
+  if (not FAvail) or (FOrg.Handle = nil) then
+  begin
+    if FWhy <> '' then
+      Err := FWhy
+    else
+      Err := 'SQLite unavailable';
+    Exit;
+  end;
+  NewTeams := nil;
+  NewGroups := nil;
+  NewProjects := nil;
+  NewApps := nil;
+
+  { Hold the database lock across the complete projection. Apart from keeping
+    prepared statements private, this prevents another operation on this
+    connection from interleaving between registry tables. The caller holds
+    FCfgLock, so the established FCfgLock -> FLock order remains intact. }
+  FLock.Enter;
+  try
+    try
+      if not PrepareStmt(
+        'SELECT id,name,speciality,prompt,parent,project,secret,host,port,dial,' +
+        'tmux_session,launch,usr,slave,workdir,delegate,hold_when_blocked ' +
+        'FROM team ORDER BY id;', 'teams', St) then
+        Exit;
+      try
+        rc := sqlite3_step(St);
+        while rc = SQLITE_ROW do
+        begin
+          n := Length(NewTeams);
+          SetLength(NewTeams, n + 1);
+          IdV := sqlite3_column_int64(St, 0);
+          if (IdV < Low(Integer)) or (IdV > High(Integer)) then
+          begin
+            Err := 'load registry (teams): id outside Integer range';
+            Exit;
+          end;
+          NewTeams[n].Id := Integer(IdV);
+          NewTeams[n].Name := ColText(St, 1);
+          NewTeams[n].Speciality := ColText(St, 2);
+          NewTeams[n].Prompt := ColText(St, 3);
+          NewTeams[n].Parent := ColText(St, 4);
+          NewTeams[n].Project := ColText(St, 5);
+          NewTeams[n].Secret := ColText(St, 6);
+          NewTeams[n].Host := ColText(St, 7);
+          PortV := sqlite3_column_int(St, 8);
+          if (PortV < 0) or (PortV > High(Word)) then
+          begin
+            Err := 'load registry (teams): invalid port for ' +
+              NewTeams[n].Name;
+            Exit;
+          end;
+          NewTeams[n].Port := Word(PortV);
+          NewTeams[n].Dial := sqlite3_column_int(St, 9) <> 0;
+          NewTeams[n].TmuxSession := ColText(St, 10);
+          NewTeams[n].Launch := ColText(St, 11);
+          NewTeams[n].User := ColText(St, 12);
+          NewTeams[n].Slave := sqlite3_column_int(St, 13) <> 0;
+          NewTeams[n].Workdir := ColText(St, 14);
+          NewTeams[n].Delegate := ColText(St, 15);
+          NewTeams[n].HoldBlocked := sqlite3_column_int(St, 16) <> 0;
+          rc := sqlite3_step(St);
+        end;
+        if not StepComplete(rc, 'teams') then
+          Exit;
+      finally
+        sqlite3_finalize(St);
+      end;
+
+      if not PrepareStmt(
+        'SELECT name,project,boss,muted,on_idle,on_idle_msg,on_idle_from,' +
+        'on_idle_reply,hdr_note,on_block FROM grp ORDER BY name COLLATE NOCASE;',
+        'groups', St) then
+        Exit;
+      try
+        rc := sqlite3_step(St);
+        while rc = SQLITE_ROW do
+        begin
+          n := Length(NewGroups);
+          SetLength(NewGroups, n + 1);
+          NewGroups[n].Name := ColText(St, 0);
+          NewGroups[n].Project := ColText(St, 1);
+          NewGroups[n].Boss := ColText(St, 2);
+          Csv := ColText(St, 3);
+          Parts := SplitList(Csv);
+          SetLength(NewGroups[n].Excluded, Length(Parts));
+          for i := 0 to High(Parts) do
+            NewGroups[n].Excluded[i] := Parts[i];
+          NewGroups[n].OnIdle := ColText(St, 4);
+          NewGroups[n].OnIdleMsg := ColText(St, 5);
+          NewGroups[n].OnIdleFrom := ColText(St, 6);
+          NewGroups[n].OnIdleReply := ColText(St, 7);
+          NewGroups[n].HdrNote := ColText(St, 8);
+          NewGroups[n].OnBlock := ColText(St, 9);
+          rc := sqlite3_step(St);
+        end;
+        if not StepComplete(rc, 'groups') then
+          Exit;
+      finally
+        sqlite3_finalize(St);
+      end;
+
+      if not PrepareStmt(
+        'SELECT grp,team FROM grp_member ' +
+        'ORDER BY grp COLLATE NOCASE,ord,team COLLATE NOCASE;',
+        'group members', St) then
+        Exit;
+      try
+        rc := sqlite3_step(St);
+        while rc = SQLITE_ROW do
+        begin
+          RelName := ColText(St, 0);
+          Idx := GroupIndex(RelName);
+          if Idx < 0 then
+          begin
+            Err := 'load registry (group members): orphan group ' + RelName;
+            Exit;
+          end;
+          n := Length(NewGroups[Idx].Members);
+          SetLength(NewGroups[Idx].Members, n + 1);
+          NewGroups[Idx].Members[n] := ColText(St, 1);
+          rc := sqlite3_step(St);
+        end;
+        if not StepComplete(rc, 'group members') then
+          Exit;
+      finally
+        sqlite3_finalize(St);
+      end;
+
+      if not PrepareStmt(
+        'SELECT name,boss FROM project ORDER BY name COLLATE NOCASE;',
+        'projects', St) then
+        Exit;
+      try
+        rc := sqlite3_step(St);
+        while rc = SQLITE_ROW do
+        begin
+          n := Length(NewProjects);
+          SetLength(NewProjects, n + 1);
+          NewProjects[n].Name := ColText(St, 0);
+          NewProjects[n].Boss := ColText(St, 1);
+          rc := sqlite3_step(St);
+        end;
+        if not StepComplete(rc, 'projects') then
+          Exit;
+      finally
+        sqlite3_finalize(St);
+      end;
+
+      if not PrepareStmt(
+        'SELECT a.name,a.team,a.repo,a.path,a.purpose,a.detail,' +
+        'EXISTS(SELECT 1 FROM app_doc d WHERE d.app=a.name AND d.bytes>0) ' +
+        'FROM app a ORDER BY a.name COLLATE NOCASE;', 'apps', St) then
+        Exit;
+      try
+        rc := sqlite3_step(St);
+        while rc = SQLITE_ROW do
+        begin
+          n := Length(NewApps);
+          SetLength(NewApps, n + 1);
+          NewApps[n].Name := ColText(St, 0);
+          NewApps[n].Team := ColText(St, 1);
+          NewApps[n].Repo := ColText(St, 2);
+          NewApps[n].Path := ColText(St, 3);
+          NewApps[n].Purpose := ColText(St, 4);
+          NewApps[n].Detail := ColText(St, 5);
+          NewApps[n].HasDoc := sqlite3_column_int(St, 6) <> 0;
+          NewApps[n].Projects := '';
+          rc := sqlite3_step(St);
+        end;
+        if not StepComplete(rc, 'apps') then
+          Exit;
+      finally
+        sqlite3_finalize(St);
+      end;
+
+      if not PrepareStmt(
+        'SELECT app,project FROM app_project ' +
+        'ORDER BY app COLLATE NOCASE,project COLLATE NOCASE;',
+        'app projects', St) then
+        Exit;
+      try
+        rc := sqlite3_step(St);
+        while rc = SQLITE_ROW do
+        begin
+          AppName := ColText(St, 0);
+          Idx := AppIndex(AppName);
+          if Idx < 0 then
+          begin
+            Err := 'load registry (app projects): orphan app ' + AppName;
+            Exit;
+          end;
+          if NewApps[Idx].Projects <> '' then
+            NewApps[Idx].Projects := NewApps[Idx].Projects + ',';
+          NewApps[Idx].Projects := NewApps[Idx].Projects + ColText(St, 1);
+          rc := sqlite3_step(St);
+        end;
+        if not StepComplete(rc, 'app projects') then
+          Exit;
+      finally
+        sqlite3_finalize(St);
+      end;
+    except
+      on E: Exception do
+      begin
+        Err := 'load registry: ' + E.Message;
+        Exit;
+      end;
+    end;
+  finally
+    FLock.Leave;
+  end;
+
+  { Publication happens only after every table and relationship has loaded.
+    All bootstrap/network/log/header settings in Cfg remain untouched. }
+  Cfg.Teams := NewTeams;
+  Cfg.Groups := NewGroups;
+  Cfg.Projects := NewProjects;
+  Cfg.Apps := NewApps;
+  Result := True;
+end;
+
 function TPzDb.EnsureSchema(out Err: string): Boolean;
 var
   Tmp: string;
+  Count: Int64;
 begin
   Result := False;
   Err := '';
@@ -1706,13 +2496,53 @@ begin
   if not Exec(FOrg, SQL_APPPROJ, Err) then Exit;
   if MetaGet(FOrg, 'apps_en_org') <> '1' then
   begin
-      { ATTACH works across databases even though foreign keys do not, so copy in
-        ONE transaction on the destination database. OR IGNORE makes migration
-        repeatable without duplicates: after interruption, the next run completes
-        missing rows. Apps go BEFORE manuals because app_doc has an active foreign
-        key to app. }
+    { ATTACH works across databases even though foreign keys do not. Refuse a
+      divergent overlap before OR IGNORE can silently choose one version. The
+      physical legacy database and mandatory pre-cutover backup remain intact
+      for an operator-led reconciliation. }
+    if not Exec(FOrg, 'ATTACH DATABASE ' + Q(FAppsViejo.Path) + ' AS vieja;',
+      Err) then
+      Exit;
+    if not QueryIntChecked(FOrg,
+      'SELECT COUNT(*) FROM vieja.app v JOIN main.app o ON v.name=o.name ' +
+      'WHERE v.team COLLATE BINARY<>o.team COLLATE BINARY ' +
+      'OR v.repo COLLATE BINARY<>o.repo COLLATE BINARY ' +
+      'OR v.path COLLATE BINARY<>o.path COLLATE BINARY ' +
+      'OR v.purpose COLLATE BINARY<>o.purpose COLLATE BINARY ' +
+      'OR v.detail COLLATE BINARY<>o.detail COLLATE BINARY;', Count, Err) then
+    begin
+      Exec(FOrg, 'DETACH DATABASE vieja;', Tmp);
+      Exit;
+    end;
+    if Count > 0 then
+    begin
+      Err := IntToStr(Count) + ' application row(s) differ between apps.sqlite ' +
+        'and org.sqlite; refusing an automatic choice';
+      Exec(FOrg, 'DETACH DATABASE vieja;', Tmp);
+      Exit;
+    end;
+    if not QueryIntChecked(FOrg,
+      'SELECT COUNT(*) FROM vieja.app_doc v JOIN main.app_doc o ON v.app=o.app ' +
+      'WHERE v.body COLLATE BINARY<>o.body COLLATE BINARY OR v.bytes<>o.bytes ' +
+      'OR v.sha256 COLLATE BINARY<>o.sha256 COLLATE BINARY ' +
+      'OR v.updated_ts COLLATE BINARY<>o.updated_ts COLLATE BINARY ' +
+      'OR v.updated_by COLLATE BINARY<>o.updated_by COLLATE BINARY;', Count,
+      Err) then
+    begin
+      Exec(FOrg, 'DETACH DATABASE vieja;', Tmp);
+      Exit;
+    end;
+    if Count > 0 then
+    begin
+      Err := IntToStr(Count) + ' manual row(s) differ between apps.sqlite and ' +
+        'org.sqlite; refusing an automatic choice';
+      Exec(FOrg, 'DETACH DATABASE vieja;', Tmp);
+      Exit;
+    end;
+    { Apps go before manuals because app_doc has an active foreign key to app.
+      The authority marker shares the transaction with rows and history: after
+      any crash either none of them committed or startup will never recopy. }
     if not Exec(FOrg,
-      'ATTACH DATABASE ' + Q(FAppsViejo.Path) + ' AS vieja;' +
       'BEGIN IMMEDIATE;' +
       'INSERT OR IGNORE INTO app(name,team,repo,path,purpose,detail) ' +
       '  SELECT name,team,repo,path,purpose,detail FROM vieja.app;' +
@@ -1721,6 +2551,8 @@ begin
       'INSERT INTO history(ts,who,kind,subject,op,field,oldval,newval,before,after,keep) ' +
       '  SELECT ts,who,kind,subject,op,field,oldval,newval,before,after,keep ' +
       '  FROM vieja.history WHERE kind IN (''app'',''appdoc'');' +
+      'INSERT INTO meta(k,v) VALUES(''apps_en_org'',''1'') ' +
+      '  ON CONFLICT(k) DO UPDATE SET v=excluded.v;' +
       'COMMIT;' +
       'DETACH DATABASE vieja;', Err) then
     begin
@@ -1730,7 +2562,6 @@ begin
       Exec(FOrg, 'DETACH DATABASE vieja;', Tmp);
       Exit;
     end;
-    if not MetaSet(FOrg, 'apps_en_org', '1', Err) then Exit;
   end;
   { FROM HERE ON, apps belong to org.sqlite. One assignment redirects every FApps
     write; changing each call manually is how the critical one gets missed. }
@@ -1751,12 +2582,60 @@ begin
       'ALTER TABLE team ADD COLUMN workdir TEXT NOT NULL DEFAULT '''';',
       Err) then
       Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''team'') ' +
+     'WHERE name=''delegate''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE team ADD COLUMN delegate TEXT NOT NULL DEFAULT '''';',
+      Err) then
+      Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''team'') ' +
+     'WHERE name=''hold_when_blocked''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE team ADD COLUMN hold_when_blocked INTEGER NOT NULL DEFAULT 0;',
+      Err) then
+      Exit;
   { grp.muted added later: bases created before the broadcast-mute feature get
     the column here, same pattern as slave/workdir above }
   if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''grp'') ' +
      'WHERE name=''muted''') = '0' then
     if not Exec(FOrg,
       'ALTER TABLE grp ADD COLUMN muted TEXT NOT NULL DEFAULT '''';',
+      Err) then
+      Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''grp'') ' +
+     'WHERE name=''on_idle''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE grp ADD COLUMN on_idle TEXT NOT NULL DEFAULT '''';',
+      Err) then
+      Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''grp'') ' +
+     'WHERE name=''on_idle_msg''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE grp ADD COLUMN on_idle_msg TEXT NOT NULL DEFAULT '''';',
+      Err) then
+      Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''grp'') ' +
+     'WHERE name=''on_idle_from''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE grp ADD COLUMN on_idle_from TEXT NOT NULL DEFAULT '''';',
+      Err) then
+      Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''grp'') ' +
+     'WHERE name=''on_idle_reply''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE grp ADD COLUMN on_idle_reply TEXT NOT NULL DEFAULT '''';',
+      Err) then
+      Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''grp'') ' +
+     'WHERE name=''hdr_note''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE grp ADD COLUMN hdr_note TEXT NOT NULL DEFAULT '''';',
+      Err) then
+      Exit;
+  if QueryStr(FOrg, 'SELECT COUNT(*) FROM pragma_table_info(''grp'') ' +
+     'WHERE name=''on_block''') = '0' then
+    if not Exec(FOrg,
+      'ALTER TABLE grp ADD COLUMN on_block TEXT NOT NULL DEFAULT '''';',
       Err) then
       Exit;
   Result := True;

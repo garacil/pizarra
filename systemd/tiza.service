@@ -5,15 +5,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=tiza
-Group=tiza
+User=root
+Group=root
 UMask=0077
-ExecStart=/usr/local/bin/tiza daemon --config /etc/tiza/tiza.conf
+StateDirectory=pizarra
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/tiza daemon --config /etc/pizarra/tiza.conf
 Restart=always
 RestartSec=3
 
-# Run this service as the account that owns the configured tmux sessions.
-# Do not reuse the hub or pzweb account on a shared host.
+# Run this service as the account that owns the configured tmux sessions. Root
+# matches the existing deployment. StateDirectory owns /var/lib/pizarra, so a
+# tiza instance sharing a host/store with the hub must use the same User/Group;
+# otherwise point [daemon] state at a separately owned private directory.
 
 [Install]
 WantedBy=multi-user.target

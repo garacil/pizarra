@@ -22,6 +22,7 @@ BUILD_TINY    = $(BUILD)/tiny
 PREFIX    ?= /usr/local
 BINDIR    ?= $(PREFIX)/bin
 DATADIR   ?= $(PREFIX)/share/pizarra
+RELEASEDIR ?= /var/lib/pizarra/releases
 
 # Detect the release architecture.
 ARCH := $(shell uname -m)
@@ -75,7 +76,7 @@ debug: $(BUILD_DEBUG)
 # The threaded binaries use glibc and load SQLite dynamically, so fully static
 # linking is not supported.
 static:
-	@echo "static linking is not supported since v2 (cthreads + glibc)."
+	@echo "static linking is not supported by the threaded glibc build."
 	@echo "Linked binaries depend only on libc; libsqlite3 is loaded at runtime."
 	@exit 1
 
@@ -100,7 +101,7 @@ distclean: clean
 	rm -f -- config.mk
 
 # Install the hub and web console on the control host and tiza wherever needed.
-# Each service uses its own protected configuration directory; see the examples.
+# All service bootstrap configuration lives under /etc/pizarra; see examples.
 install: release
 	@echo "Installing binaries and web assets..."
 	install -D -m0755 pizarra $(DESTDIR)$(BINDIR)/pizarra
@@ -111,24 +112,34 @@ install: release
 	@echo "Installed binaries in $(BINDIR) and web assets in $(DATADIR)/web/apps"
 
 # Publish release artifacts for the daemon self-update channel (cmd=upget).
-# Point [server] releases at the releases/ dir. RUN THIS AFTER COMMITTING:
+# [server] releases uses RELEASEDIR. RUN THIS AFTER COMMITTING:
 # src.tar.gz is cut from HEAD, so an uncommitted tree would publish a source
 # snapshot that does not match the binaries.
 publish: release
 	@test -z "$$(git status --porcelain)" || \
 	  (echo "publish: the tree has uncommitted changes - commit first" \
 	   "(src.tar.gz is cut from HEAD and must match these binaries)" && exit 1)
-	mkdir -p releases
+	@case "$(RELEASEDIR)" in \
+	  /*) ;; \
+	  *) echo "publish: RELEASEDIR must be absolute: $(RELEASEDIR)"; exit 1 ;; \
+	esac
+	@test "$(RELEASEDIR)" != / || \
+	  (echo "publish: refusing RELEASEDIR=/" && exit 1)
+	@test ! -L "$(RELEASEDIR)" || \
+	  (echo "publish: refusing symbolic-link RELEASEDIR: $(RELEASEDIR)" && exit 1)
+	install -d -m0700 "$(RELEASEDIR)"
 	@# stage + rename: the hub serves this dir live, so a half-written
 	@# artifact must never be visible to a downloading daemon
-	install -m0755 tiza releases/.tiza-$(TARGET_OS)-$(TARGET_CPU).tmp
-	git archive --format=tar.gz --prefix=pizarra/ -o releases/.src.tar.gz.tmp HEAD
-	./tiza --version | awk '{print $$2}' > releases/.VERSION.tmp
-	mv -f releases/.tiza-$(TARGET_OS)-$(TARGET_CPU).tmp releases/tiza-$(TARGET_OS)-$(TARGET_CPU)
-	mv -f releases/.src.tar.gz.tmp releases/src.tar.gz
+	install -m0755 tiza "$(RELEASEDIR)/.tiza-$(TARGET_OS)-$(TARGET_CPU).tmp"
+	git archive --format=tar.gz --prefix=pizarra/ -o "$(RELEASEDIR)/.src.tar.gz.tmp" HEAD
+	chmod 0644 "$(RELEASEDIR)/.src.tar.gz.tmp"
+	./tiza --version | awk '{print $$2}' > "$(RELEASEDIR)/.VERSION.tmp"
+	chmod 0644 "$(RELEASEDIR)/.VERSION.tmp"
+	mv -f -- "$(RELEASEDIR)/.tiza-$(TARGET_OS)-$(TARGET_CPU).tmp" "$(RELEASEDIR)/tiza-$(TARGET_OS)-$(TARGET_CPU)"
+	mv -f -- "$(RELEASEDIR)/.src.tar.gz.tmp" "$(RELEASEDIR)/src.tar.gz"
 	@# VERSION last: it is the flag that makes the hub serve this release
-	mv -f releases/.VERSION.tmp releases/VERSION
-	@echo "Published release $$(cat releases/VERSION): tiza-$(TARGET_OS)-$(TARGET_CPU) + src.tar.gz"
+	mv -f -- "$(RELEASEDIR)/.VERSION.tmp" "$(RELEASEDIR)/VERSION"
+	@echo "Published release $$(cat "$(RELEASEDIR)/VERSION"): tiza-$(TARGET_OS)-$(TARGET_CPU) + src.tar.gz in $(RELEASEDIR)"
 
 check:
 	@which $(FPC) >/dev/null || (echo "FPC not installed" && exit 1)

@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Pizarra group on-block browser fixture</title>
+</head>
+<body>
+  <!-- manage.js binds every view eagerly.  Keep the production ids and data
+       attributes here, while reducing unrelated views to their smallest valid
+       DOM.  The code under test is always the repository's real manage.js. -->
+  <section data-app-view="tasks" hidden>
+    <button type="button" data-tasks-action="refresh">Refresh</button>
+    <button type="button" data-tasks-action="create">Create</button>
+    <button type="button" data-task-filter="open">Open</button>
+    <div data-tasks-notice hidden></div>
+    <select id="task-team-filter"></select>
+    <input id="task-search">
+    <span id="task-count"></span>
+    <div id="task-list"></div>
+    <div id="task-detail"></div>
+    <div id="task-loading"></div>
+    <div id="task-empty" hidden></div>
+  </section>
+
+  <section data-app-view="structure">
+    <button type="button" data-registry-action="refresh">Refresh</button>
+    <button type="button" data-registry-action="create">Create</button>
+    <button type="button" data-registry="teams" aria-selected="true">Teams
+      <span data-registry-count="teams"></span>
+    </button>
+    <button type="button" data-registry="groups" aria-selected="false">Groups
+      <span data-registry-count="groups"></span>
+    </button>
+    <button type="button" data-registry="apps" aria-selected="false">Apps</button>
+    <div data-registry-notice hidden></div>
+    <p id="registry-kicker"></p>
+    <h1 id="registry-title"></h1>
+    <p id="registry-help"></p>
+    <input id="registry-search">
+    <div id="registry-grid"></div>
+    <div id="registry-loading"></div>
+    <div id="registry-empty" hidden></div>
+  </section>
+
+  <button type="button" data-message-action="create">Message</button>
+  <div id="message-notice" hidden></div>
+
+  <dialog id="manage-dialog">
+    <form id="manage-form" method="dialog" novalidate>
+      <p id="manage-dialog-kicker"></p>
+      <h2 id="manage-dialog-title"></h2>
+      <p id="manage-dialog-help"></p>
+      <p id="manage-dialog-warning" hidden></p>
+      <div id="manage-form-fields"></div>
+      <p id="manage-form-error" hidden></p>
+      <button type="submit" value="cancel">Cancel</button>
+      <button id="manage-submit" type="submit" value="confirm">Save</button>
+    </form>
+  </dialog>
+
+  <pre id="browser-result" data-status="running">RUNNING</pre>
+
+  <script src="/manage.js"></script>
+  <script>
+    (function () {
+      'use strict';
+
+      var resultNode = document.getElementById('browser-result');
+
+      function need(condition, message) {
+        if (!condition) { throw new Error(message); }
+      }
+
+      function normalized(value) {
+        if (Array.isArray(value)) { return value.map(normalized); }
+        if (value !== null && typeof value === 'object') {
+          var copy = {};
+          Object.keys(value).sort().forEach(function (key) { copy[key] = normalized(value[key]); });
+          return copy;
+        }
+        return value;
+      }
+
+      function same(actual, expected, message) {
+        need(JSON.stringify(normalized(actual)) === JSON.stringify(normalized(expected)), message +
+          ' (actual ' + JSON.stringify(actual) + ')');
+      }
+
+      function waitFor(read, description) {
+        return new Promise(function (resolve, reject) {
+          var attempts = 0;
+          function poll() {
+            var value = read();
+            if (value) { resolve(value); return; }
+            attempts += 1;
+            if (attempts >= 250) {
+              reject(new Error('timed out waiting for ' + description));
+              return;
+            }
+            window.setTimeout(poll, 20);
+          }
+          poll();
+        });
+      }
+
+      function findBuildersCard() {
+        return Array.prototype.find.call(document.querySelectorAll('.registry-card'), function (card) {
+          var title = card.querySelector('h3');
+          return title && title.textContent === 'builders';
+        });
+      }
+
+      async function run() {
+        document.querySelector('[data-registry="groups"]').click();
+        var card = await waitFor(findBuildersCard, '@builders card');
+        var facts = Array.prototype.map.call(card.querySelectorAll('.registry-card__facts span'),
+          function (item) { return item.textContent; });
+        need(facts.indexOf('when blocked: log only') >= 0,
+          '@builders card did not render the log-only policy');
+
+        var edit = card.querySelector('[data-task-action="edit"]');
+        need(edit, '@builders card has no Edit action');
+        edit.click();
+
+        var operation = await waitFor(function () {
+          return document.getElementById('manage-form').elements.namedItem('operation');
+        }, 'group operation selector');
+        var onblockOption = Array.prototype.find.call(operation.options, function (option) {
+          return option.value === 'onblock';
+        });
+        need(onblockOption && onblockOption.textContent === 'Permission-block handling',
+          'group editor does not expose the onblock operation');
+
+        operation.value = 'onblock';
+        operation.dispatchEvent(new Event('change', {bubbles: true}));
+        var policy = document.getElementById('manage-form').elements.namedItem('value');
+        need(policy && policy.tagName === 'SELECT', 'onblock value is not a select');
+        same(Array.prototype.map.call(policy.options, function (option) { return option.value; }),
+          ['default', 'alarm', 'log'], 'onblock option values changed');
+        same(Array.prototype.map.call(policy.options, function (option) { return option.textContent; }),
+          ['Default (alarm)', 'Alarm', 'Log only'], 'onblock option labels changed');
+        need(policy.value === 'log', 'the editor did not preserve the current log policy');
+
+        policy.value = 'default';
+        need(policy.value === 'default', 'could not select the default policy');
+        document.getElementById('manage-submit').click();
+
+        await waitFor(function () {
+          var notice = document.querySelector('[data-registry-notice]');
+          return notice.textContent.indexOf('Change applied and confirmed') >= 0 && notice;
+        }, 'confirmed onblock mutation');
+
+        var response = await fetch('/test/result');
+        var payload = await response.json();
+        need(response.ok && payload.ok === true, 'fixture server did not confirm the POST');
+        same(payload.data, {
+          method: 'POST',
+          path: '/api/group/builders/onblock',
+          body: '{"onblock":"default"}',
+          content_type: 'application/json',
+          x_pizarra: '1',
+          count: 1
+        }, 'captured HTTP request differs from the UI contract');
+
+        resultNode.dataset.status = 'pass';
+        resultNode.textContent = [
+          'PASS',
+          'card=when blocked: log only',
+          'operation=onblock',
+          'options=default,alarm,log',
+          'post=' + payload.data.path + ' ' + payload.data.body
+        ].join('\n');
+      }
+
+      run().catch(function (error) {
+        resultNode.dataset.status = 'fail';
+        resultNode.textContent = 'FAIL\n' + (error && error.stack ? error.stack : String(error));
+      });
+    })();
+  </script>
+</body>
+</html>

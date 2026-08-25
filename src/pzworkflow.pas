@@ -244,6 +244,10 @@ type
     procedure QueueStopResume(var W: TWorkflow; const Kind, Why: string;
       const Extra: string = '');
   public
+    { Used by the hub's global backup barrier. This lock may nest the task
+      store lock, exactly matching the engine's documented lock order. }
+    procedure LockForSnapshot;
+    procedure UnlockForSnapshot;
     constructor Create(const APath: string; ATasks: TTaskStore);
     destructor Destroy; override;
 
@@ -1100,6 +1104,16 @@ destructor TWorkflowStore.Destroy;
 begin
   FLock.Free;
   inherited Destroy;
+end;
+
+procedure TWorkflowStore.LockForSnapshot;
+begin
+  FLock.Enter;
+end;
+
+procedure TWorkflowStore.UnlockForSnapshot;
+begin
+  FLock.Leave;
 end;
 
 procedure TWorkflowStore.LoadFromDisk;

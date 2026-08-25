@@ -1,6 +1,6 @@
 { pzver - THE fleet release number, shared by every binary (pizarra, tiza,
-  pzweb). Discipline: bump on EVERY change that ships a binary —
-  patch for fixes, minor for features, major for breaking wire changes.
+  pzweb). Discipline: bump on EVERY change that ships a binary and keep the
+  numeric tuple monotonic because endpoint self-update compares it directly.
   `tiza ver` / `/ver` show it, the hub reports its own over the wire
   (cmd=ver), and `tiza fleet` compares them across the fleet. }
 unit pzver;
@@ -10,7 +10,7 @@ unit pzver;
 interface
 
 const
-  PizarraVersion = '1.2.0';
+  PizarraVersion = '1.1.22';
 
 { dotted numeric compare (1.0.10 > 1.0.9); missing parts count as 0 }
 function VerNewer(const A, B: string): Boolean;

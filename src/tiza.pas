@@ -16,10 +16,11 @@ program tiza;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, IniFiles, ssockets, Sockets, resolve, BaseUnix, SyncObjs, fpjson,
-  base64, process,
+  SysUtils, Classes, ssockets, Sockets, resolve, BaseUnix, Unix,
+  SyncObjs, fpjson,
+  base64, process, ctypes, sqlite3dyn,
   pzproto, pzconfig, pztmux, pznet, pzshare, pzmanual, pzchat, pzver,
-  pzupdate, pzbox, pzsha256, termio, pzansi;
+  pzupdate, pzbox, pzsha256, termio, pzansi, pzlayout;
 
 procedure Fail(const Msg: string);
 begin
@@ -90,6 +91,8 @@ begin
   Writeln('  tiza team remove|show <name> [--detail]   (detail: apps, repos, manuals)');
   Writeln('  tiza team set <name> <field> <value...>');
   Writeln('     fields: prompt|speciality|parent|launch|session|user|project|slave|workdir');
+  Writeln('             hold_when_blocked|host|dial|delegate|secret');
+  Writeln('     secret: prefer `tiza team set NAME secret --file PATH` to avoid argv history');
   Writeln('     workdir = the team''s source dir; its tmux session opens there');
   Writeln('     slave on = READ-ONLY team that reports only to its parent');
   Writeln('  tiza team list');
@@ -114,7 +117,7 @@ begin
   it belongs to, and the project shows which apps build it. }
   Writeln('  tiza app project <name> <project> [--role "what it does there"]');
   Writeln('  tiza app unproject <name> <project>   take it out of that one');
-  Writeln('  tiza backup [dir]                  full backup (contains secrets)');
+  Writeln('  tiza backup [dir]                  core-state backup (contains secrets)');
   Writeln('  tiza backup verify <dir>           check a backup (sha256 + that it would boot)');
   Writeln('  tiza restore <dir> [--dry-run]     roll the hub back to that backup (hub STOPPED)');
   Writeln('  tiza app remove <name>');
@@ -124,6 +127,7 @@ begin
   Writeln('  tiza group project <name> <proj>   tiza group boss <name> <team>');
   Writeln('  tiza group exclude <name> [team...] mute members from @group sends');
   Writeln('                                     (replaces the set; none = clear)');
+  Writeln('  tiza group onblock <name> alarm|log|default');
   Writeln('  tiza group list                    tiza project boss <name> <team>');
   Writeln('  tiza project show <name>           its admin, teams, groups + apps');
   Writeln('  tiza project list');
@@ -1635,7 +1639,7 @@ var
   Obj, G: TJSONObject;
   Arr, M, MI, EX: TJSONArray;
   i, j, mid, tw: Integer;
-  Want, Cell, Hdr, Line, OnIdleP: string;
+  Want, Cell, Hdr, Line, OnIdleP, OnBlockP: string;
   Found, AnyMuted, AllIdle, AnyBlocked: Boolean;
   Cells: array of string;
 
@@ -1705,6 +1709,7 @@ begin
       MI := G.Get('member_ids', TJSONArray(nil));
       EX := G.Get('excluded', TJSONArray(nil));
       OnIdleP := LowerCase(Trim(G.Get('on_idle', '')));
+      OnBlockP := LowerCase(Trim(G.Get('on_block', '')));
       AllIdle := G.Get('all_idle', False);
       AnyBlocked := G.Get('any_blocked', False);
 
@@ -1752,6 +1757,10 @@ begin
       else if AnyBlocked then
         Line := Line + '   (a member is BLOCKED on a prompt)';
       Writeln(Line);
+      if OnBlockP = 'log' then
+        Writeln('  on block: log only (operator alarm suppressed)')
+      else
+        Writeln('  on block: alarm');
       if Trim(G.Get('header', '')) <> '' then
         Writeln('  RULE (in every member''s header): ' + G.Get('header', ''));
     end;
@@ -1791,7 +1800,13 @@ begin
     Exit;
   end;
   if (P.Count = 2) and (Sub <> 'add') and (Sub <> 'remove') and
-     (Sub <> 'project') and (Sub <> 'boss') and (Sub <> 'admin') then
+     (Sub <> 'project') and (Sub <> 'boss') and (Sub <> 'admin') and
+     (Sub <> 'exclude') and (Sub <> 'onidle') and (Sub <> 'idle') and
+     (Sub <> 'onidlemsg') and (Sub <> 'idlemsg') and
+     (Sub <> 'onidlefrom') and (Sub <> 'idlefrom') and
+     (Sub <> 'onidlereply') and (Sub <> 'idlereply') and
+     (Sub <> 'header') and (Sub <> 'rule') and
+     (Sub <> 'onblock') and (Sub <> 'block') then
   begin
     if SendRequest(Cfg, BuildGroupList(Cfg.Secret, Cfg.SelfId), Reply) then
       PrintGroups(Reply, P[1]);
@@ -1887,6 +1902,16 @@ begin
     Msg := '';
     if P.Count >= 4 then Msg := P[3];
     if SendRequest(Cfg, BuildGroupOnIdleReply(Cfg.Secret, Cfg.SelfId, Name, Msg), Reply) then
+      PrintGroups(Reply);
+  end
+  else if (Sub = 'onblock') or (Sub = 'block') then
+  begin
+    if P.Count < 4 then
+      Fail('usage: tiza group onblock <name> alarm|log|default');
+    Msg := LowerCase(Trim(P[3]));
+    if (Msg <> 'alarm') and (Msg <> 'log') and (Msg <> 'default') then
+      Fail('onblock must be alarm, log, or default');
+    if SendRequest(Cfg, BuildGroupOnBlock(Cfg.Secret, Cfg.SelfId, Name, Msg), Reply) then
       PrintGroups(Reply);
   end
   else
@@ -2383,7 +2408,7 @@ begin
     Writeln('  web: https://github.com/garacil/pizarra/blob/main/docs/workflows.md');
     Writeln('  console: /help workflow');
     Writeln('  structure edits (step/insert/remove/set/clone/restore) = console');
-    Writeln('  + the group admin only. Legacy pre-1.2 aliases remain accepted.');
+    Writeln('  + the group admin only. Legacy command aliases remain accepted.');
     WfUsage;
     Exit;
   end;
@@ -3350,14 +3375,21 @@ begin
     if P.Count < 5 then
       Fail('usage: tiza team set <name> <field> <value...>');
     Name := P[2];
-    Field := P[3];
+    Field := LowerCase(P[3]);
     Value := '';
-    for i := 4 to P.Count - 1 do
+    if (Field = 'secret') and (P[4] = '--file') then
     begin
-      if Value <> '' then
-        Value := Value + ' ';
-      Value := Value + P[i];
-    end;
+      if P.Count <> 6 then
+        Fail('usage: tiza team set <name> secret --file <path|->');
+      Value := ReadMsgFile(P[5]);
+    end
+    else
+      for i := 4 to P.Count - 1 do
+      begin
+        if Value <> '' then
+          Value := Value + ' ';
+        Value := Value + P[i];
+      end;
     if SendRequest(Cfg, BuildTeamSet(Cfg.Secret, Cfg.SelfId, Name, Field,
       Value), Reply) then
       PrintTeamCard(Reply);
@@ -3692,24 +3724,6 @@ begin
     Result := '';
 end;
 
-{ The store directory declared by that configuration. }
-function LocalStoreDir: string;
-var
-  Ini: TIniFile;
-  P: string;
-begin
-  Result := '';
-  P := LocalConfPath;
-  if P = '' then
-    Exit;
-  Ini := TIniFile.Create(P);
-  try
-    Result := Trim(Ini.ReadString('store', 'dir', ''));
-  finally
-    Ini.Free;
-  end;
-end;
-
 { Address of the hub that OWNS this store, taken from ITS configuration. The
   client address is not valid here: `tiza restore` changes the LOCAL store, but
   used to test the hub named by tiza.conf. If that file pointed to an old port,
@@ -3718,43 +3732,49 @@ end;
   replaced beneath the process holding them open. }
 procedure HubAddrOf(const ConfPath: string; out Host: string; out Port: Integer);
 var
-  Ini: TIniFile;
+  HubCfg: TPizarraConfig;
 begin
   Host := '127.0.0.1';
   Port := 7010;
   if (ConfPath = '') or (not FileExists(ConfPath)) then
     Exit;
-  Ini := TIniFile.Create(ConfPath);
   try
-    Host := Trim(Ini.ReadString('server', 'listen', '127.0.0.1'));
-    Port := Ini.ReadInteger('server', 'port', 7010);
-    if (Host = '') or (Host = '0.0.0.0') then
-      Host := '127.0.0.1';
-  finally
-    Ini.Free;
+    { Use the hub's real loader. In FPC 3.2.2 ReadInteger does not strip inline
+      comments, while LoadPizarraConfig/IniInt does; probing a default port in
+      that case could replace databases under the still-running real hub. }
+    HubCfg := LoadPizarraConfig(ConfPath);
+    Host := HubCfg.Listen;
+    Port := HubCfg.Port;
+  except
+    on E: Exception do
+      Fail('cannot parse hub config for the live-process check: ' + E.Message);
   end;
+  if (Host = '') or (Host = '0.0.0.0') or (Host = '::') then
+    Host := '127.0.0.1';
 end;
 
 { Read the secret declared by a configuration so replacement can be warned. }
 function SecretOf(const ConfPath: string): string;
 var
-  Ini: TIniFile;
+  HubCfg: TPizarraConfig;
 begin
   Result := '';
   if (ConfPath = '') or (not FileExists(ConfPath)) then
     Exit;
-  Ini := TIniFile.Create(ConfPath);
   try
-    Result := Trim(Ini.ReadString('server', 'secret', ''));
-  finally
-    Ini.Free;
+    { Match startup byte-for-byte and reuse its descriptor-pinned parser. A
+      quoted secret may intentionally contain leading/trailing spaces; Trim
+      would compare a different credential. }
+    HubCfg := LoadPizarraConfig(ConfPath);
+    Result := HubCfg.Secret;
+  except
+    on E: Exception do
+      Fail('cannot parse hub config ' + ConfPath + ': ' + E.Message);
   end;
 end;
 
-{ SQLite file signature: the first 16 bytes are 'SQLite format 3' plus a zero.
-  This is not integrity_check, which would require linking SQLite while tiza is
-  intentionally libc-only, but it catches the practical failures: truncated,
-  partial, or empty files. }
+{ Cheap SQLite signature precheck before loading libsqlite3 for full integrity
+  and foreign-key verification. }
 function IsSqliteFile(const Path: string): Boolean;
 var
   F: TFileStream;
@@ -3777,41 +3797,337 @@ begin
   end;
 end;
 
+function FileSizeByName(const Path: string): Int64;
+var
+  F: TFileStream;
+begin
+  Result := -1;
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      Result := F.Size;
+    finally
+      F.Free;
+    end;
+  except
+    Result := -1;
+  end;
+end;
+
+function VerifySqliteFile(const Path: string; NeedRegistryMarker: Boolean;
+  out Why: string): Boolean;
+var
+  Db: psqlite3;
+  St: psqlite3_stmt;
+  A: AnsiString;
+  rc, CloseRc: cint;
+  P: PAnsiChar;
+  V: string;
+
+  function ImmutableUri(const FileName: string): AnsiString;
+  const
+    Hex = '0123456789ABCDEF';
+  var
+    Raw: RawByteString;
+    i: Integer;
+    B: Byte;
+  begin
+    { A plain SQLITE_OPEN_READONLY connection may still create -wal/-shm when
+      the database header names WAL mode. Verification must never mutate the
+      backup it is authenticating. SQLite's documented immutable URI mode
+      disables locking, change detection, and journal side files. Percent-
+      encode the filesystem bytes so ?, #, %, and non-ASCII bytes cannot be
+      interpreted as URI syntax. }
+    Raw := ExpandFileName(FileName);
+    Result := 'file:';
+    for i := 1 to Length(Raw) do
+    begin
+      B := Byte(Raw[i]);
+      if ((B >= Ord('a')) and (B <= Ord('z'))) or
+         ((B >= Ord('A')) and (B <= Ord('Z'))) or
+         ((B >= Ord('0')) and (B <= Ord('9'))) or
+         (B = Ord('/')) or (B = Ord('-')) or (B = Ord('_')) or
+         (B = Ord('.')) or (B = Ord('~')) then
+        Result := Result + AnsiChar(B)
+      else
+        Result := Result + '%' + Hex[(B shr 4) + 1] + Hex[(B and $0f) + 1];
+    end;
+    Result := Result + '?mode=ro&immutable=1';
+  end;
+
+  function Prepare(const SQL: string): Boolean;
+  begin
+    A := SQL;
+    St := nil;
+    Result := sqlite3_prepare_v2(Db, PAnsiChar(A), -1, @St, nil) = SQLITE_OK;
+    if not Result then
+      Why := string(sqlite3_errmsg(Db));
+  end;
+
+  function TextCol(Col: Integer): string;
+  begin
+    P := sqlite3_column_text(St, Col);
+    if P = nil then
+      Result := ''
+    else
+      SetString(Result, P, sqlite3_column_bytes(St, Col));
+  end;
+
+begin
+  Result := False;
+  Why := '';
+  Db := nil;
+  A := ImmutableUri(Path);
+  rc := sqlite3_open_v2(PAnsiChar(A), @Db,
+    SQLITE_OPEN_READONLY or SQLITE_OPEN_FULLMUTEX or SQLITE_OPEN_URI, nil);
+  if rc <> SQLITE_OK then
+  begin
+    if Db <> nil then
+      Why := string(sqlite3_errmsg(Db))
+    else
+      Why := 'sqlite open code ' + IntToStr(rc);
+    if Db <> nil then
+      sqlite3_close(Db);
+    Exit;
+  end;
+  try
+    if not Prepare('PRAGMA quick_check;') then
+      Exit;
+    try
+      rc := sqlite3_step(St);
+      if rc <> SQLITE_ROW then
+      begin
+        Why := 'quick_check returned no result';
+        Exit;
+      end;
+      while rc = SQLITE_ROW do
+      begin
+        V := TextCol(0);
+        if V <> 'ok' then
+        begin
+          Why := 'quick_check: ' + V;
+          Exit;
+        end;
+        rc := sqlite3_step(St);
+      end;
+      if rc <> SQLITE_DONE then
+      begin
+        Why := 'quick_check failed: ' + string(sqlite3_errmsg(Db));
+        Exit;
+      end;
+    finally
+      sqlite3_finalize(St);
+      St := nil;
+    end;
+    if not Prepare('PRAGMA foreign_key_check;') then
+      Exit;
+    try
+      rc := sqlite3_step(St);
+      if rc = SQLITE_ROW then
+      begin
+        Why := 'foreign_key_check found a violation in table ' + TextCol(0);
+        Exit;
+      end;
+      if rc <> SQLITE_DONE then
+      begin
+        Why := 'foreign_key_check failed: ' + string(sqlite3_errmsg(Db));
+        Exit;
+      end;
+    finally
+      sqlite3_finalize(St);
+      St := nil;
+    end;
+    if NeedRegistryMarker then
+    begin
+      if not Prepare('SELECT v FROM meta WHERE k=' +
+        '''registry_authority'';') then
+        Exit;
+      try
+        if sqlite3_step(St) <> SQLITE_ROW then
+        begin
+          Why := 'missing registry_authority marker';
+          Exit;
+        end;
+        if TextCol(0) <> 'sqlite-v1' then
+        begin
+          Why := 'unsupported registry_authority marker ' + TextCol(0);
+          Exit;
+        end;
+      finally
+        sqlite3_finalize(St);
+        St := nil;
+      end;
+    end;
+    Result := True;
+  finally
+    CloseRc := sqlite3_close(Db);
+    if CloseRc <> SQLITE_OK then
+    begin
+      Result := False;
+      Why := 'sqlite close failed with code ' + IntToStr(CloseRc);
+    end;
+  end;
+end;
+
 { `tiza backup verify <dir>` checks a backup WITHOUT restoring anything: every
   manifest entry must exist and match its SHA-256. This is local directory
   access and does not contact the hub. }
 procedure RunBackupVerify(const Dir: string);
 var
   L: TStringList;
-  i, bad, n: Integer;
+  i, j, bad, n: Integer;
   Parts: TStringList;
-  P, Hex: string;
-  Ini: TIniFile;
+  Seen: TStringList;
+  P, Hex, Why, Rel: string;
+  St: TStat;
+  BackupCfg: TPizarraConfig;
+  SeenConf, SqliteLoaded: Boolean;
+  SeenDb: array[0..2] of Boolean;
+  ExpectedBytes: Int64;
 const
   DBS: array[0..2] of string = ('apps.sqlite', 'org.sqlite', 'work.sqlite');
+  STORE_FILES: array[0..3] of string =
+    ('store/messages.jsonl', 'store/state.json', 'store/tareas.json',
+     'store/workflows.json');
+  LIBS: array[0..3] of UnicodeString =
+    ('libsqlite3.so.0', 'libsqlite3.so', 'libsqlite3.dylib', 'libsqlite3.so.3');
+
+  function AllowedRel(const ARel: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := (ARel = 'pizarra.conf');
+    for k := 0 to High(DBS) do
+      if ARel = DBS[k] then
+        Exit(True);
+    for k := 0 to High(STORE_FILES) do
+      if ARel = STORE_FILES[k] then
+        Exit(True);
+  end;
+
+  procedure CheckPhysicalDir(const Base, Prefix: string; Root: Boolean);
+  var
+    LocalInfo: TSearchRec;
+    LocalFull, LocalRel: string;
+  begin
+    if not DirectoryExists(Base) then
+      Exit;
+    if FindFirst(IncludeTrailingPathDelimiter(Base) + '*', faAnyFile,
+      LocalInfo) <> 0 then
+      Exit;
+    try
+      repeat
+        if (LocalInfo.Name = '.') or (LocalInfo.Name = '..') then
+          Continue;
+        LocalFull := IncludeTrailingPathDelimiter(Base) + LocalInfo.Name;
+        LocalRel := Prefix + LocalInfo.Name;
+        St := Default(TStat);
+        if FpLStat(LocalFull, St) <> 0 then
+        begin
+          Writeln('UNREADABLE physical backup entry ', LocalRel);
+          Inc(bad);
+          Continue;
+        end;
+        if Root and (LocalInfo.Name = 'store') then
+        begin
+          if fpS_ISLNK(St.st_mode) or (not fpS_ISDIR(St.st_mode)) then
+          begin
+            Writeln('UNSAFE TYPE store (must be a real directory)');
+            Inc(bad);
+          end
+          else
+            CheckPhysicalDir(LocalFull, 'store/', False);
+          Continue;
+        end;
+        if Root and (LocalInfo.Name = 'MANIFEST') then
+        begin
+          if fpS_ISLNK(St.st_mode) or (not fpS_ISREG(St.st_mode)) then
+          begin
+            Writeln('UNSAFE TYPE MANIFEST (must be a regular file)');
+            Inc(bad);
+          end;
+          Continue;
+        end;
+        if fpS_ISLNK(St.st_mode) or (not fpS_ISREG(St.st_mode)) then
+        begin
+          Writeln('UNSAFE TYPE ', LocalRel,
+            ' (backup payload must contain regular files only)');
+          Inc(bad);
+        end
+        else if Seen.IndexOf(LocalRel) < 0 then
+        begin
+          { Restore must never replay an unverified WAL/SHM or copy an
+            operator-added file that the manifest did not authenticate. }
+          Writeln('UNLISTED ', LocalRel);
+          Inc(bad);
+        end;
+      until FindNext(LocalInfo) <> 0;
+    finally
+      FindClose(LocalInfo);
+    end;
+  end;
 begin
-  if not FileExists(IncludeTrailingPathDelimiter(Dir) + 'MANIFEST') then
+  P := IncludeTrailingPathDelimiter(Dir) + 'MANIFEST';
+  St := Default(TStat);
+  if (FpLStat(P, St) <> 0) or fpS_ISLNK(St.st_mode) or
+     (not fpS_ISREG(St.st_mode)) then
     Fail('no pizarra backup there (MANIFEST missing): ' + Dir);
   L := TStringList.Create;
   Parts := TStringList.Create;
+  Seen := TStringList.Create;
+  SqliteLoaded := False;
   try
-    L.LoadFromFile(IncludeTrailingPathDelimiter(Dir) + 'MANIFEST');
+    L.LoadFromFile(P);
     Parts.Delimiter := ' ';
     Parts.StrictDelimiter := False;
+    Seen.CaseSensitive := True;
     bad := 0;
     n := 0;
+    SeenConf := False;
+    for i := 0 to High(SeenDb) do
+      SeenDb[i] := False;
     for i := 0 to L.Count - 1 do
     begin
       if (Trim(L[i]) = '') or (Copy(Trim(L[i]), 1, 1) = '#') then
         Continue;
       Parts.DelimitedText := L[i];
       if Parts.Count < 3 then
+      begin
+        Writeln('MALFORMED manifest line ', i + 1);
+        Inc(bad);
         Continue;
+      end;
       Inc(n);
-      P := IncludeTrailingPathDelimiter(Dir) + Parts[0];
-      if not FileExists(P) then
+      Rel := Parts[0];
+      if not AllowedRel(Rel) then
+      begin
+        Writeln('UNSUPPORTED manifest entry ', Rel);
+        Inc(bad);
+        Continue;
+      end;
+      if Seen.IndexOf(Rel) >= 0 then
+      begin
+        Writeln('DUPLICATE manifest entry ', Rel);
+        Inc(bad);
+        Continue;
+      end;
+      Seen.Add(Rel);
+      if Rel = 'pizarra.conf' then
+        SeenConf := True;
+      for j := 0 to High(DBS) do
+        if Rel = DBS[j] then
+          SeenDb[j] := True;
+      P := IncludeTrailingPathDelimiter(Dir) + Rel;
+      St := Default(TStat);
+      if (FpLStat(P, St) <> 0) then
       begin
         Writeln('MISSING  ', Parts[0]);
+        Inc(bad);
+        Continue;
+      end;
+      if fpS_ISLNK(St.st_mode) or (not fpS_ISREG(St.st_mode)) then
+      begin
+        Writeln('UNSAFE TYPE ', Parts[0], ' (must be a regular file)');
         Inc(bad);
         Continue;
       end;
@@ -3826,50 +4142,135 @@ begin
         Writeln('CHANGED  ', Parts[0]);
         Inc(bad);
       end;
+      if (not TryStrToInt64(Parts[1], ExpectedBytes)) or
+         (ExpectedBytes <> FileSizeByName(P)) then
+      begin
+        Writeln('BAD SIZE ', Rel);
+        Inc(bad);
+      end;
     end;
+    { The manifest is an allow-list as well as a checksum list. In particular,
+      reject an unlisted store/org.sqlite-wal or *-shm: restore must not replay
+      bytes that were never part of the verified SQLite online backup. }
+    CheckPhysicalDir(Dir, '', True);
+    if not SeenConf then
+    begin
+      Writeln('MISSING  pizarra.conf (mandatory manifest entry)');
+      Inc(bad);
+    end;
+    for i := 0 to High(DBS) do
+      if not SeenDb[i] then
+      begin
+        Writeln('MISSING  ', DBS[i], ' (mandatory manifest entry)');
+        Inc(bad);
+      end;
     { Matching bytes do not prove that a backup is usable: a truncated
       pizarra.conf is consistent with its own manifest. Also check the minimum
       requirements for STARTUP: a readable configuration containing a secret,
-      and an SQLite signature on every .sqlite file. Full PRAGMA integrity_check
-      is intentionally omitted because tiza is deployed across the fleet and
-      must remain libc-only. These checks reject the common failures: truncated,
-      partial, or empty files. }
+      and an SQLite signature on every .sqlite file. Full dynamic SQLite checks
+      follow after these cheap truncation/empty-file checks. }
     if bad = 0 then
     begin
       P := IncludeTrailingPathDelimiter(Dir) + 'pizarra.conf';
       if FileExists(P) then
       begin
-        Ini := TIniFile.Create(P);
         try
-          if Trim(Ini.ReadString('server', 'secret', '')) = '' then
+          { Use exactly the hub parser: it applies the same defaults, quote
+            handling, inline-comment rules, ranges, and authority validation. }
+          BackupCfg := LoadPizarraConfig(P);
+          if BackupCfg.Secret = '' then
           begin
             Writeln('NO SECRET   pizarra.conf carries no [server] secret: ' +
               'the hub would NOT start from this backup');
             Inc(bad);
           end;
-        finally
-          Ini.Free;
+        except
+          on E: Exception do
+          begin
+            Writeln('BAD CONFIG pizarra.conf: ', E.Message);
+            Inc(bad);
+          end;
         end;
       end;
       for i := 0 to High(DBS) do
       begin
         P := IncludeTrailingPathDelimiter(Dir) + DBS[i];
         if not FileExists(P) then
+        begin
+          Inc(bad);
           Continue;
+        end;
         if not IsSqliteFile(P) then
         begin
           Writeln('NOT SQLITE  ', DBS[i], ' (truncated or corrupt)');
           Inc(bad);
         end;
       end;
+      if bad = 0 then
+      begin
+        for i := 0 to High(LIBS) do
+          if TryInitializeSqlite(LIBS[i]) > 0 then
+          begin
+            SqliteLoaded := True;
+            Break;
+          end;
+        if not SqliteLoaded then
+        begin
+          Writeln('NO SQLITE  libsqlite3 is required for integrity verification');
+          Inc(bad);
+        end;
+      end;
+      if bad = 0 then
+        for i := 0 to High(DBS) do
+        begin
+          P := IncludeTrailingPathDelimiter(Dir) + DBS[i];
+          if not VerifySqliteFile(P, DBS[i] = 'org.sqlite', Why) then
+          begin
+            Writeln('DB INVALID ', DBS[i], ': ', Why);
+            Inc(bad);
+          end;
+        end;
     end;
     if bad = 0 then
       Writeln(Format('backup intact and bootable: %d pieces by sha256, ' +
-        'conf carries a secret, %d databases with a valid header', [n, Length(DBS)]))
+        'conf carries a secret, %d databases pass SQLite integrity/FK checks',
+        [n, Length(DBS)]))
     else
     begin
       Writeln(Format('BACKUP DAMAGED: %d of %d pieces do not match', [bad, n]));
       Halt(1);
+    end;
+  finally
+    if SqliteLoaded then
+      ReleaseSqlite;
+    Seen.Free;
+    Parts.Free;
+    L.Free;
+  end;
+end;
+
+{ RunBackupVerify has already rejected malformed, duplicate, unsupported, or
+  unlisted payload. Restore uses this exact-membership helper only to decide
+  which OPTIONAL store files were captured. }
+function BackupManifestHas(const Dir, Wanted: string): Boolean;
+var
+  L, Parts: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  L := TStringList.Create;
+  Parts := TStringList.Create;
+  try
+    L.LoadFromFile(IncludeTrailingPathDelimiter(Dir) + 'MANIFEST');
+    Parts.Delimiter := ' ';
+    Parts.StrictDelimiter := False;
+    for i := 0 to L.Count - 1 do
+    begin
+      if (Trim(L[i]) = '') or (Copy(Trim(L[i]), 1, 1) = '#') then
+        Continue;
+      Parts.DelimitedText := L[i];
+      if (Parts.Count >= 3) and (Parts[0] = Wanted) then
+        Exit(True);
     end;
   finally
     Parts.Free;
@@ -3886,9 +4287,10 @@ end;
   2. Verify the backup BEFORE touching live state.
   3. Move live files to <store>/.pre-restore-<ts>/ instead of deleting them, so
      an accidental restore remains recoverable.
-  4. DELETE every *.sqlite-wal and *.sqlite-shm. An old WAL whose salt still
-     matches a restored database could replay newer data over the backup. A
-     clean SIGTERM normally leaves neither file; abrupt stops are the danger.
+  4. MOVE ASIDE every *.sqlite-wal and *.sqlite-shm with the rest of the live
+     root files. An old WAL whose salt still matches a restored database could
+     replay newer data over the backup. A clean SIGTERM normally leaves neither
+     file; abrupt stops are the danger.
   5. The three .sqlite files live at the backup ROOT, while JSON and other store
      files live under store/. Preserve this intentional asymmetry.
   6. APPLICATION MANUALS LIVE IN THE DATABASE. Since 1.0.85 that database is
@@ -3900,9 +4302,16 @@ end;
 procedure RunRestore(const Dir: string; Dry, Confirmed, Forced: Boolean);
 var
   StoreDir, ConfPath, Aside, Stamp, Src, Dst, HubHost, LiveSecret: string;
-  BkConf, BkSecret: string;
+  BkConf, BkSecret, BkStore, Residual, SyncErr: string;
   Info: TSearchRec;
-  n, HubPort: Integer;
+  LiveNames: TStringList;
+  i, n, HubPort, StoreLock: Integer;
+  St: TStat;
+  StoreUid, ConfUid: TUid;
+  StoreGid, ConfGid: TGid;
+const
+  STORE_FILES: array[0..3] of string =
+    ('messages.jsonl', 'state.json', 'tareas.json', 'workflows.json');
 
   procedure Step(const Msg: string);
   begin
@@ -3912,9 +4321,12 @@ var
       Writeln('  ', Msg);
   end;
 
-  procedure CopyOne(const From_, To_: string);
+  procedure CopyOne(const From_, To_: string; OwnerUid: TUid;
+    OwnerGid: TGid);
   var
     FS, TS: TFileStream;
+    TmpPath, Parent: string;
+    H, ErrNo: Integer;
   begin
     if not FileExists(From_) then
     begin
@@ -3928,9 +4340,13 @@ var
     Step('copy ' + ExtractFileName(From_) + ' -> ' + To_);
     if Dry then
       Exit;
+    Parent := ExtractFileDir(ExpandFileName(To_));
+    TmpPath := To_ + '.restore-tmp-' + IntToStr(FpGetpid);
+    if FileExists(TmpPath) then
+      Fail('stale restore temporary file exists: ' + TmpPath);
     FS := TFileStream.Create(From_, fmOpenRead or fmShareDenyNone);
     try
-      TS := TFileStream.Create(To_, fmCreate);
+      TS := TFileStream.Create(TmpPath, fmCreate, &600);
       try
         if FS.Size > 0 then
           TS.CopyFrom(FS, FS.Size);
@@ -3940,16 +4356,103 @@ var
     finally
       FS.Free;
     end;
+    { A restore is commonly run through sudo while the hub runs as a dedicated
+      account. A root-owned 0600 database/config would make the restored hub
+      unbootable. Publish every replacement with the ownership of the live
+      object tree it replaces; non-root callers already create as themselves. }
+    if (FpGeteuid = 0) and (FpChown(TmpPath, OwnerUid, OwnerGid) <> 0) then
+    begin
+      DeleteFile(TmpPath);
+      Fail('cannot set restore ownership on ' + TmpPath);
+    end;
+    if FpChmod(TmpPath, &600) <> 0 then
+    begin
+      DeleteFile(TmpPath);
+      Fail('cannot protect restore temporary ' + TmpPath);
+    end;
+    H := FpOpen(TmpPath, O_RDONLY);
+    if H < 0 then
+    begin
+      DeleteFile(TmpPath);
+      Fail('cannot reopen restore temporary ' + TmpPath);
+    end;
+    try
+      if PzFsync(H) <> 0 then
+      begin
+        ErrNo := fpgeterrno;
+        DeleteFile(TmpPath);
+        Fail('cannot fsync restore temporary: ' + SysErrorMessage(ErrNo));
+      end;
+    finally
+      FpClose(H);
+    end;
+    if not RenameFile(TmpPath, To_) then
+    begin
+      DeleteFile(TmpPath);
+      Fail('cannot publish restored file ' + To_);
+    end;
+    H := FpOpen(Parent, O_RDONLY or O_DIRECTORY);
+    if H < 0 then
+      Fail('cannot open restore parent directory for fsync: ' + Parent);
+    try
+      if PzFsync(H) <> 0 then
+        Fail('cannot fsync restore parent directory ' + Parent);
+    finally
+      FpClose(H);
+    end;
+  end;
+
+  function ConfigStore(const Path: string): string;
+  var
+    HubCfg: TPizarraConfig;
+  begin
+    Result := '';
+    try
+      { Match startup defaults and parsing exactly. A missing store key means
+        PZ_STATE_DIR to the hub; restore must not interpret it as empty. }
+      HubCfg := LoadPizarraConfig(Path);
+      Result := Trim(HubCfg.StoreDir);
+    except
+      on E: Exception do
+        Fail('cannot parse hub config ' + Path + ': ' + E.Message);
+    end;
+    while (Length(Result) > 1) and
+          (Result[Length(Result)] = PathDelim) do
+      Delete(Result, Length(Result), 1);
+    if Result <> '' then
+      Result := ExpandFileName(Result);
   end;
 
 begin
+  StoreLock := -1;
   if not FileExists(IncludeTrailingPathDelimiter(Dir) + 'MANIFEST') then
     Fail('no pizarra backup there (MANIFEST missing): ' + Dir);
   ConfPath := LocalConfPath;
-  StoreDir := IncludeTrailingPathDelimiter(LocalStoreDir);
-  if (StoreDir = '') or (ConfPath = '') then
+  if ConfPath = '' then
     Fail('cannot find the hub config: run this on the hub machine, ' +
       'or point $PIZARRA_CONF at the pizarra.conf you mean to restore');
+  StoreDir := ConfigStore(ConfPath);
+  if (StoreDir = '') or (StoreDir = PathDelim) then
+    Fail('hub config has an unsafe/empty [store] dir: ' + ConfPath);
+  St := Default(TStat);
+  if (FpLStat(StoreDir, St) <> 0) or fpS_ISLNK(St.st_mode) or
+     (not fpS_ISDIR(St.st_mode)) then
+    Fail('refusing unsafe/non-directory restore store: ' + StoreDir);
+  StoreUid := St.st_uid;
+  StoreGid := St.st_gid;
+  St := Default(TStat);
+  if (FpLStat(ConfPath, St) <> 0) or fpS_ISLNK(St.st_mode) or
+     (not fpS_ISREG(St.st_mode)) then
+    Fail('refusing symlink/non-regular hub config target: ' + ConfPath);
+  ConfUid := St.st_uid;
+  ConfGid := St.st_gid;
+  { The listener check below is useful diagnostics but is not mutual
+    exclusion: the hub opens SQLite before it begins listening. Hold the same
+    non-blocking flock as TPizarra for the complete restore/dry-run. }
+  if not PzAcquireHubStoreLock(StoreDir, False, StoreLock, SyncErr) then
+    Fail('the hub/store is still active: ' + SyncErr);
+  try
+  StoreDir := IncludeTrailingPathDelimiter(StoreDir);
   { ResolveConfig discovers the TARGET automatically, so SHOW it before making
     changes: an operator expecting a test hub may be pointing at production.
     This is the project's only command that replaces live state, and therefore
@@ -3986,6 +4489,11 @@ begin
     the operation. Second, checking at the end turned a startup objection into
     another partial operation: restored store, old configuration. }
   BkConf := IncludeTrailingPathDelimiter(Dir) + 'pizarra.conf';
+  BkStore := ConfigStore(BkConf);
+  if ExcludeTrailingPathDelimiter(StoreDir) <> BkStore then
+    Fail('backup [store] dir is ' + BkStore + ' but this hub uses ' +
+      ExcludeTrailingPathDelimiter(StoreDir) + '; migrate the backup/layout ' +
+      'first instead of restoring databases to one path and config to another');
   if FileExists(BkConf) and (ConfPath <> '') then
   begin
     BkSecret := SecretOf(BkConf);
@@ -4023,7 +4531,7 @@ begin
     end;
   end;
   Stamp := FormatDateTime('yyyymmdd-hhnnss', Now);
-  Aside := StoreDir + '.pre-restore-' + Stamp;
+  Aside := StoreDir + '.pre-restore-' + Stamp + '-' + IntToStr(FpGetpid);
   Step('move the current state aside to ' + Aside);
   { Verify the safety net before relying on it. Previously, failure to create
     the directory or move a file did not stop the operation: live state was
@@ -4031,58 +4539,131 @@ begin
     in <Aside>", even if that location was empty or absent. The only command
     capable of losing data must stop when its safety net is unavailable. }
   if not Dry then
+  begin
+    if DirectoryExists(Aside) or FileExists(Aside) then
+      Fail('restore safety directory already exists: ' + Aside);
     if not ForceDirectories(Aside) then
       Fail('cannot create ' + Aside + ' - NOTHING is restored: without that safety copy ' +
         'there is no way back');
+    if (FpGeteuid = 0) and (FpChown(Aside, StoreUid, StoreGid) <> 0) then
+      Fail('cannot set restore safety-directory ownership on ' + Aside +
+        ' - NOTHING is restored');
+    if FpChmod(Aside, &700) <> 0 then
+      Fail('cannot protect ' + Aside + ' - NOTHING is restored: without that safety copy ' +
+        'there is no way back');
+  end;
   n := 0;
-  if FindFirst(StoreDir + '*', faAnyFile, Info) = 0 then
-  begin
-    repeat
-      if (Info.Attr and faDirectory) <> 0 then
-        Continue;
-      Src := StoreDir + Info.Name;
+  LiveNames := TStringList.Create;
+  try
+    { FPC 3.2.2 FindFirst/FindNext is a live opendir/readdir cursor. Renaming
+      entries while traversing it can skip a later name, including a WAL. Take
+      an immutable name snapshot first, close the cursor, then mutate. }
+    if FindFirst(StoreDir + '*', faAnyFile, Info) = 0 then
+    begin
+      try
+        repeat
+          if (Info.Name = '.') or (Info.Name = '..') then
+            Continue;
+          if Info.Name = PZ_HUB_LOCK_NAME then
+            Continue;
+          St := Default(TStat);
+          Src := StoreDir + Info.Name;
+          if FpLStat(Src, St) <> 0 then
+            Fail('cannot inspect live store entry before restore: ' + Src);
+          if not fpS_ISDIR(St.st_mode) then
+            LiveNames.Add(Info.Name);
+        until FindNext(Info) <> 0;
+      finally
+        FindClose(Info);
+      end;
+    end;
+    for i := 0 to LiveNames.Count - 1 do
+    begin
+      Src := StoreDir + LiveNames[i];
       if not Dry then
-        if not RenameFile(Src, IncludeTrailingPathDelimiter(Aside) + Info.Name) then
-        begin
-          FindClose(Info);
-          Fail('cannot move aside ' + Info.Name + ' - NOTHING is restored ' +
+        if not RenameFile(Src, IncludeTrailingPathDelimiter(Aside) + LiveNames[i]) then
+          Fail('cannot move aside ' + LiveNames[i] + ' - NOTHING is restored ' +
             '(what was already moved is in ' + Aside + ')');
-        end;
       Inc(n);
-    until FindNext(Info) <> 0;
-    FindClose(Info);
+    end;
+  finally
+    LiveNames.Free;
+  end;
+  { Defense in depth against cursor omissions and a concurrent stray writer:
+    no root-level file, especially *.sqlite-wal/*-shm, may survive before the
+    verified databases are copied in. Directories such as backups/wfhistory and
+    the safety directory itself are intentionally retained. }
+  if not Dry then
+  begin
+    Residual := '';
+    if FindFirst(StoreDir + '*', faAnyFile, Info) = 0 then
+    begin
+      try
+        repeat
+          if (Info.Name = '.') or (Info.Name = '..') then
+            Continue;
+          if Info.Name = PZ_HUB_LOCK_NAME then
+            Continue;
+          St := Default(TStat);
+          Src := StoreDir + Info.Name;
+          if FpLStat(Src, St) <> 0 then
+          begin
+            Residual := Info.Name;
+            Break;
+          end;
+          if not fpS_ISDIR(St.st_mode) then
+          begin
+            Residual := Info.Name;
+            Break;
+          end;
+        until FindNext(Info) <> 0;
+      finally
+        FindClose(Info);
+      end;
+    end;
+    if Residual <> '' then
+      Fail('live store changed during restore safety move; residual file ' +
+        Residual + ' was NOT overwritten (previous files are in ' + Aside + ')');
+    if not PzSyncDirectory(Aside, SyncErr) then
+      Fail('cannot make restore safety copy durable: ' + SyncErr);
+    if not PzSyncDirectory(StoreDir, SyncErr) then
+      Fail('cannot make emptied store durable: ' + SyncErr);
   end;
   Step(Format('%d file(s) moved aside (including the *-wal and *-shm, which must NOT ' +
     'survive a restore)', [n]));
+  { Preserve the current bootstrap config beside the moved state before the
+    mandatory backup config replaces it. }
+  CopyOne(ConfPath, IncludeTrailingPathDelimiter(Aside) +
+    'pizarra.conf.before-restore', StoreUid, StoreGid);
   { 5. Databases live at the backup root. }
-  CopyOne(IncludeTrailingPathDelimiter(Dir) + 'apps.sqlite', StoreDir + 'apps.sqlite');
-  CopyOne(IncludeTrailingPathDelimiter(Dir) + 'org.sqlite',  StoreDir + 'org.sqlite');
-  CopyOne(IncludeTrailingPathDelimiter(Dir) + 'work.sqlite', StoreDir + 'work.sqlite');
-  { Everything else lives below store/. }
+  CopyOne(IncludeTrailingPathDelimiter(Dir) + 'apps.sqlite',
+    StoreDir + 'apps.sqlite', StoreUid, StoreGid);
+  CopyOne(IncludeTrailingPathDelimiter(Dir) + 'org.sqlite',
+    StoreDir + 'org.sqlite', StoreUid, StoreGid);
+  CopyOne(IncludeTrailingPathDelimiter(Dir) + 'work.sqlite',
+    StoreDir + 'work.sqlite', StoreUid, StoreGid);
+  { Optional JSON/log state is a closed allow-list and is copied only when its
+    exact path was authenticated by MANIFEST. Never enumerate/copy arbitrary
+    backup/store files: an unlisted WAL/SHM must not be replayed. }
   Src := IncludeTrailingPathDelimiter(Dir) + 'store';
-  if DirectoryExists(Src) then
-    if FindFirst(IncludeTrailingPathDelimiter(Src) + '*', faAnyFile, Info) = 0 then
-    begin
-      repeat
-        if (Info.Attr and faDirectory) <> 0 then
-          Continue;
-        CopyOne(IncludeTrailingPathDelimiter(Src) + Info.Name,
-          StoreDir + Info.Name);
-      until FindNext(Info) <> 0;
-      FindClose(Info);
-    end;
+  for i := 0 to High(STORE_FILES) do
+    if BackupManifestHas(Dir, 'store/' + STORE_FILES[i]) then
+      CopyOne(IncludeTrailingPathDelimiter(Src) + STORE_FILES[i],
+        StoreDir + STORE_FILES[i], StoreUid, StoreGid);
   { Finally, restore the configuration. }
   Dst := IncludeTrailingPathDelimiter(Dir) + 'pizarra.conf';
-  if FileExists(Dst) and (ConfPath <> '') then
-    { The secret decision was made ABOVE before moving anything; only the copy
-      remains here. }
-    CopyOne(Dst, ConfPath);
+  { The secret decision was made ABOVE before moving anything; verification
+    guarantees this mandatory file exists. }
+  CopyOne(Dst, ConfPath, ConfUid, ConfGid);
   if Dry then
     Writeln('dry run: NOTHING was touched. Drop --dry-run to do it for real.')
   else
   begin
     Writeln('restored. Start the hub and check: tiza teams / tiza app list');
     Writeln('The previous state is still in ', Aside, ' just in case.');
+  end;
+  finally
+    PzReleaseHubStoreLock(StoreLock);
   end;
 end;
 
@@ -4127,8 +4708,10 @@ begin
     i := 1;
     while i <= ParamCount do
     begin
-      if (ParamStr(i) = '--config') and (i < ParamCount) then
+      if ParamStr(i) = '--config' then
       begin
+        if i >= ParamCount then
+          Fail('--config requires a path');
         ConfigArg := ParamStr(i + 1); Inc(i);
       end
       else if (Positionals.Count = 0) and (ParamStr(i) = '--from') and (i < ParamCount) then

@@ -238,6 +238,7 @@ Before deployment, read [Security](SECURITY.md). In particular:
 
 ## Documentation
 
+- [Complete project wiki](https://github.com/garacil/pizarra/wiki)
 - [Documentation index](docs/README.md)
 - [Architecture](docs/architecture.md)
 - [Quick start](docs/quickstart.md)

@@ -1,0 +1,17 @@
+[Unit]
+Description=pzweb operations console for pizarra
+After=network-online.target pizarra.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pzweb
+Group=pzweb
+UMask=0077
+WorkingDirectory=/usr/local/share/pizarra
+ExecStart=/usr/local/bin/pzweb --config /etc/pzweb/pzweb.conf
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

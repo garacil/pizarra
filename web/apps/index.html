@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Pizarra · visual management</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/feed.css">
+  <link rel="stylesheet" href="/workflow.css">
+  <link rel="stylesheet" href="/manage.css">
+  <link rel="stylesheet" href="/records.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail" aria-label="Pizarra">
+      <a class="brand" href="/" aria-label="Pizarra, live activity">
+        <span class="brand__mark" aria-hidden="true">P</span>
+        <span>
+          <strong>pizarra</strong>
+          <small>visual management</small>
+        </span>
+      </a>
+
+      <nav class="rail__nav" aria-label="Applications">
+        <a class="nav-item nav-item--active" href="#activity" data-nav="activity"
+           aria-current="page">
+          <span class="nav-item__icon" aria-hidden="true">⌁</span>
+          <span>Activity</span>
+        </a>
+        <a class="nav-item" href="#history" data-nav="history">
+          <span class="nav-item__icon" aria-hidden="true">◷</span>
+          <span>History</span>
+        </a>
+        <a class="nav-item" href="#inbox" data-nav="inbox">
+          <span class="nav-item__icon" aria-hidden="true">⌑</span>
+          <span>Inbox</span>
+        </a>
+        <a class="nav-item" href="#files" data-nav="files">
+          <span class="nav-item__icon" aria-hidden="true">▣</span>
+          <span>Files</span>
+        </a>
+        <a class="nav-item" href="#transfers" data-nav="transfers">
+          <span class="nav-item__icon" aria-hidden="true">⇅</span>
+          <span>Transfers</span>
+        </a>
+        <a class="nav-item" href="#workflows" data-nav="workflows">
+          <span class="nav-item__icon nav-item__icon--nodes" aria-hidden="true">◇</span>
+          <span>Workflows</span>
+        </a>
+        <a class="nav-item" href="#tasks" data-nav="tasks">
+          <span class="nav-item__icon" aria-hidden="true">✓</span>
+          <span>Tasks</span>
+        </a>
+        <a class="nav-item" href="#structure" data-nav="structure">
+          <span class="nav-item__icon" aria-hidden="true">⌘</span>
+          <span>Structure</span>
+        </a>
+      </nav>
+
+      <div class="scope-card">
+        <span class="scope-card__label">Scope</span>
+        <strong>All of Pizarra</strong>
+        <p>Durable messages from every team, authorized by the hub.</p>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <section data-app-view="activity">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Real-time monitor</p>
+          <h1>Activity</h1>
+          <p class="lede">Pizarra's pulse, message by message.</p>
+        </div>
+        <div class="activity-actions">
+          <button class="button button--primary" type="button" data-message-action="create">Send message</button>
+          <div id="connection" class="connection connection--connecting"
+               role="status" aria-live="polite">
+            <span class="connection__dot" aria-hidden="true"></span>
+            <span>
+              <strong id="connection-title">Connecting</strong>
+              <small id="connection-detail">Opening the monitoring channel…</small>
+            </span>
+          </div>
+        </div>
+      </header>
+
+      <section id="message-notice" class="manage-notice" role="status" aria-live="polite" hidden></section>
+
+      <section class="metrics" aria-label="This session summary">
+        <article class="metric metric--primary">
+          <span class="metric__label">This session</span>
+          <strong id="metric-total">0</strong>
+          <small>visible messages</small>
+        </article>
+        <article class="metric">
+          <span class="metric__label"><span class="mini-arrow mini-arrow--in">↙</span> Incoming</span>
+          <strong id="metric-in">0</strong>
+          <small>to pzweb</small>
+        </article>
+        <article class="metric">
+          <span class="metric__label"><span class="mini-arrow mini-arrow--out">↗</span> Outgoing</span>
+          <strong id="metric-out">0</strong>
+          <small>from pzweb</small>
+        </article>
+        <article class="metric">
+          <span class="metric__label"><span class="mini-arrow mini-arrow--other">↔</span> Between teams</span>
+          <strong id="metric-other">0</strong>
+          <small>without passing through pzweb</small>
+        </article>
+        <article class="metric">
+          <span class="metric__label">Latest sequence</span>
+          <strong id="metric-seq">—</strong>
+          <small>durable cursor</small>
+        </article>
+      </section>
+
+      <section id="feed-alert" class="feed-alert" role="alert" hidden>
+        <span class="feed-alert__icon" aria-hidden="true">!</span>
+        <div>
+          <strong id="alert-title">This view needs attention</strong>
+          <p id="alert-body"></p>
+        </div>
+        <button id="reload" class="button button--alert" type="button" hidden>
+          Reload view
+        </button>
+      </section>
+
+      <section class="feed-panel" aria-labelledby="feed-title">
+        <header class="feed-panel__header">
+          <div>
+            <p class="section-kicker">Authorized feed</p>
+            <h2 id="feed-title">Messages</h2>
+          </div>
+          <div class="filters" role="group" aria-label="Filter by direction">
+            <button class="filter filter--active" type="button" data-filter="all"
+                    aria-pressed="true">All <span id="filter-all-count">0</span></button>
+            <button class="filter" type="button" data-filter="in"
+                    aria-pressed="false">Incoming <span id="filter-in-count">0</span></button>
+            <button class="filter" type="button" data-filter="out"
+                    aria-pressed="false">Outgoing <span id="filter-out-count">0</span></button>
+            <button class="filter" type="button" data-filter="other"
+                    aria-pressed="false">Other <span id="filter-other-count">0</span></button>
+          </div>
+        </header>
+
+        <div id="empty" class="empty-state">
+          <span class="empty-state__pulse" aria-hidden="true"></span>
+          <h3 id="empty-title">Waiting for activity</h3>
+          <p id="empty-body">New messages will appear here without reloading the page.</p>
+        </div>
+
+        <ol id="feed" class="feed" aria-label="Messages, newest first"></ol>
+      </section>
+
+      <footer class="page-footer">
+        <p>Real-time activity · Sequence gaps are normal; only a structural warning indicates loss and requires a reload.</p>
+        <p id="retention-note">The 300 most recent messages are retained in this tab.</p>
+      </footer>
+      </section>
+
+      <section class="records-app" data-app-view="history" hidden>
+        <header class="topbar records-topbar">
+          <div>
+            <p class="eyebrow">Durable journal</p>
+            <h1>History</h1>
+            <p class="lede">Read the journal page by page; open a headline only when you need the full text.</p>
+          </div>
+          <div class="records-actions">
+            <label class="compact-field"><span>Per page</span><select id="history-limit"><option value="30">30</option><option value="50">50</option><option value="100">100</option><option value="200">200</option></select></label>
+            <button id="history-latest" class="button button--quiet" type="button">Latest</button>
+            <button id="history-next" class="button button--primary" type="button">Next page</button>
+          </div>
+        </header>
+        <section id="history-notice" class="records-notice" role="status" aria-live="polite" hidden></section>
+        <section class="records-panel" aria-label="Message history">
+          <div class="records-panel__head">
+            <div><p class="section-kicker">Durable window</p><h2 id="history-title">Preparing the journal…</h2></div>
+            <span id="history-count" class="count-pill">—</span>
+          </div>
+          <div class="records-layout">
+            <div>
+              <ol id="history-list" class="records-list" aria-busy="true"></ol>
+              <div id="history-loading" class="records-empty" role="status"><strong>Loading history…</strong><span>The journal is requested one page at a time.</span></div>
+              <div id="history-empty" class="records-empty" hidden><strong>No messages in this window</strong><span>Try another page or return to the latest messages.</span></div>
+            </div>
+            <aside id="history-detail" class="records-detail" aria-live="polite"><div class="records-empty"><strong>Select a headline</strong><span>The full text is requested only when you open it.</span></div></aside>
+          </div>
+        </section>
+      </section>
+
+      <section class="records-app" data-app-view="inbox" hidden>
+        <header class="topbar records-topbar">
+          <div>
+            <p class="eyebrow">This console's inbox</p>
+            <h1>Inbox</h1>
+            <p class="lede">Viewing does not consume anything. Acknowledgement is an explicit, visible decision.</p>
+          </div>
+          <div class="records-actions">
+            <button id="inbox-more" class="button button--quiet" type="button" hidden>Load more</button>
+            <button id="inbox-refresh" class="button button--quiet" type="button">Refresh</button>
+            <button id="inbox-ack" class="button button--primary" type="button" disabled>Acknowledge</button>
+          </div>
+        </header>
+        <section id="inbox-notice" class="records-notice" role="status" aria-live="polite" hidden></section>
+        <section class="records-panel" aria-label="Received messages">
+          <div class="records-panel__head">
+            <div><p class="section-kicker">Personal inbox</p><h2 id="inbox-title">Unread messages</h2></div>
+            <label class="toggle-field"><input id="inbox-all" type="checkbox"><span>Include acknowledged</span></label>
+          </div>
+          <div class="records-layout">
+            <div>
+              <ol id="inbox-list" class="records-list" aria-busy="true"></ol>
+              <div id="inbox-loading" class="records-empty" role="status"><strong>Loading inbox…</strong><span>Viewing does not change message state.</span></div>
+              <div id="inbox-empty" class="records-empty" hidden><strong>The inbox is up to date</strong><span>There are no messages in this view.</span></div>
+            </div>
+            <aside id="inbox-detail" class="records-detail" aria-live="polite"><div class="records-empty"><strong>Select a headline</strong><span>You can open the full content without acknowledging it.</span></div></aside>
+          </div>
+        </section>
+      </section>
+
+      <section class="files-app" data-app-view="files" hidden>
+        <header class="topbar files-topbar">
+          <div>
+            <p class="eyebrow">Shared exchange</p>
+            <h1>Files</h1>
+            <p class="lede">The index shows exactly one level of the shared disk; links are never opened.</p>
+          </div>
+          <button id="files-refresh" class="button button--quiet" type="button">Refresh</button>
+        </header>
+        <section id="files-notice" class="records-notice" role="status" aria-live="polite" hidden></section>
+        <section class="files-panel" aria-label="Shared file browser">
+          <aside class="files-teams">
+            <div class="files-panel__head"><div><p class="section-kicker">Teams</p><h2>Directories</h2></div><span id="files-team-count" class="count-pill">—</span></div>
+            <div id="files-team-list" class="files-team-list" aria-busy="true"></div>
+            <div id="files-team-loading" class="records-empty" role="status"><strong>Reading the exchange…</strong><span>Loading from the shared disk.</span></div>
+            <div id="files-team-empty" class="records-empty" hidden><strong>No directories</strong><span>The root is empty or no teams have shared files.</span></div>
+          </aside>
+          <div class="files-contents">
+            <div class="files-panel__head"><div><p class="section-kicker">One level only</p><h2 id="files-title">Select a directory</h2></div><span id="files-path" class="files-path">—</span></div>
+            <div id="files-list" class="files-list" aria-live="polite"><div class="records-empty"><strong>No directory selected</strong><span>Choose a valid directory from the left column.</span></div></div>
+          </div>
+        </section>
+      </section>
+
+      <section class="transfer-app" data-app-view="transfers" hidden>
+        <header class="topbar records-topbar">
+          <div>
+            <p class="eyebrow">Verified copies</p>
+            <h1>Transfers</h1>
+            <p class="lede">Downloads are rebuilt in chunks and delivered only when their final digest matches.</p>
+          </div>
+        </header>
+        <section id="transfer-notice" class="records-notice" role="status" aria-live="polite" hidden></section>
+        <section class="transfer-grid" aria-label="Download or upload a file">
+          <article class="transfer-card">
+            <p class="section-kicker">Download</p>
+            <h2>Retrieve a file</h2>
+            <p>Use a path provided by the index. The browser does not follow links or guess paths.</p>
+            <label class="editor-field"><span>Shared path</span><input id="download-path" type="text" autocomplete="off" placeholder="team/report.pdf"></label>
+            <div class="transfer-card__actions"><button id="download-start" class="button button--primary" type="button">Download and verify</button><button id="download-cancel" class="button button--quiet" type="button" hidden>Cancel</button></div>
+            <progress id="download-progress" max="1" value="0" hidden></progress><p id="download-status" class="transfer-status">Waiting for a path.</p>
+          </article>
+          <article class="transfer-card">
+            <p class="section-kicker">Upload</p>
+            <h2>Send a file</h2>
+            <p>It is sent in chunks and published only after the hub verifies the complete digest.</p>
+            <label class="editor-field"><span>Destination team</span><select id="upload-team"><option value="">Loading directories…</option></select></label>
+            <label class="editor-field"><span>Local file</span><input id="upload-file" type="file"></label>
+            <div class="transfer-card__actions"><button id="upload-start" class="button button--primary" type="button">Upload and verify</button><button id="upload-cancel" class="button button--quiet" type="button" hidden>Cancel</button></div>
+            <progress id="upload-progress" max="1" value="0" hidden></progress><p id="upload-status" class="transfer-status">Choose a team and a file.</p>
+          </article>
+        </section>
+      </section>
+
+      <section class="workflow-app" data-app-view="workflows" hidden>
+        <header class="topbar workflow-topbar">
+          <div>
+            <p class="eyebrow">Design and tracking</p>
+            <h1>Workflows</h1>
+            <p class="lede">Work as a map: dependencies, blockers, and progress in one view.</p>
+          </div>
+          <div class="workflow-actions">
+            <button id="workflow-refresh" class="button button--quiet" type="button">
+              Refresh
+            </button>
+            <button id="workflow-create" class="button button--primary" type="button">
+              New workflow
+            </button>
+          </div>
+        </header>
+
+        <section id="workflow-notice" class="workflow-notice" role="status"
+                 aria-live="polite" hidden>
+          <strong id="workflow-notice-title"></strong>
+          <span id="workflow-notice-body"></span>
+        </section>
+
+        <section class="workflow-browser" aria-label="Workflow browser">
+          <aside class="workflow-index">
+            <div class="workflow-index__head">
+              <div>
+                <p class="section-kicker">Plans</p>
+                <h2>All</h2>
+              </div>
+              <span id="workflow-count" class="count-pill">—</span>
+            </div>
+            <label class="search-field">
+              <span class="sr-only">Search workflows</span>
+              <span aria-hidden="true">⌕</span>
+              <input id="workflow-search" type="search" autocomplete="off"
+                     placeholder="Search by name or group">
+            </label>
+            <div id="workflow-list" class="workflow-list" role="listbox"
+                 aria-label="Workflows" aria-busy="true"></div>
+            <div id="workflow-list-loading" class="workflow-list-empty" role="status">
+              <strong>Loading workflows…</strong>
+              <span>Waiting for the hub.</span>
+            </div>
+            <div id="workflow-list-empty" class="workflow-list-empty" hidden>
+              <strong>No workflows</strong>
+              <span>Create the first one to turn work into a visible map.</span>
+            </div>
+          </aside>
+
+          <div class="workflow-stage">
+            <div id="workflow-welcome" class="workflow-welcome">
+              <span class="workflow-welcome__mark" aria-hidden="true">◇</span>
+              <p class="section-kicker">Execution map</p>
+              <h2 id="workflow-welcome-title">Loading workflows…</h2>
+              <p id="workflow-welcome-body">Waiting for the hub.</p>
+            </div>
+
+            <div id="workflow-detail" hidden>
+              <header class="workflow-detail__head">
+                <div>
+                  <div class="workflow-title-line">
+                    <span id="workflow-state" class="state-badge"></span>
+                    <span id="workflow-group" class="workflow-group"></span>
+                  </div>
+                  <h2 id="workflow-name"></h2>
+                  <p id="workflow-summary"></p>
+                </div>
+                <div id="workflow-command-bar" class="workflow-command-bar">
+                  <button class="button button--quiet" type="button" data-workflow-action="undo">Undo</button>
+                  <button class="button button--danger-quiet" type="button" data-workflow-action="abort">Abort</button>
+                  <button class="button button--primary" type="button" data-workflow-action="start">Start</button>
+                </div>
+              </header>
+
+              <section class="workflow-insight" aria-label="Blocker analysis">
+                <div class="workflow-insight__icon" aria-hidden="true">↗</div>
+                <div>
+                  <span>Primary structural blocker</span>
+                  <strong id="workflow-blocker">—</strong>
+                  <p id="workflow-blocker-detail">Calculated from visible dependencies without inventing deadlines.</p>
+                </div>
+                <div class="workflow-legend" aria-label="Legend">
+                  <span><i class="legend-dot legend-dot--done"></i> Done</span>
+                  <span><i class="legend-dot legend-dot--active"></i> Active</span>
+                  <span><i class="legend-dot legend-dot--pending"></i> Pending</span>
+                  <span><i class="legend-line"></i> Critical path</span>
+                </div>
+              </section>
+
+              <div class="workflow-canvas-shell">
+                <div class="workflow-canvas-toolbar">
+                  <div>
+                    <p class="section-kicker">Dependency graph</p>
+                    <span id="workflow-canvas-caption"></span>
+                  </div>
+                  <button id="workflow-fit" class="icon-button" type="button"
+                          title="Return to the start of the map" aria-label="Return to the start of the map">⌂</button>
+                </div>
+                <div id="workflow-scroll" class="workflow-scroll">
+                  <div id="workflow-canvas" class="workflow-canvas">
+                    <svg id="workflow-edges" class="workflow-edges"
+                         aria-hidden="true"></svg>
+                    <div id="workflow-columns" class="workflow-columns"></div>
+                  </div>
+                </div>
+              </div>
+
+              <p class="workflow-footnote">
+                The highlighted path is the longest pending chain by number of milestones. Without durable deadlines, it is not presented as a time estimate.
+              </p>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="manage-app" data-app-view="tasks" hidden>
+        <header class="topbar manage-topbar">
+          <div>
+            <p class="eyebrow">Coordinated work</p>
+            <h1>Tasks</h1>
+            <p class="lede">What is open, who owns it, and what evidence it left.</p>
+          </div>
+          <div class="manage-actions">
+            <button class="button button--quiet" type="button" data-tasks-action="refresh">Refresh</button>
+            <button class="button button--primary" type="button" data-tasks-action="create">New task</button>
+          </div>
+        </header>
+        <section class="manage-notice" data-tasks-notice role="status" aria-live="polite" hidden></section>
+        <section class="task-board">
+          <header class="task-toolbar">
+            <div class="segmented" role="group" aria-label="Task status">
+              <button type="button" data-task-filter="open" aria-pressed="true">Open</button>
+              <button type="button" data-task-filter="done" aria-pressed="false">Done</button>
+              <button type="button" data-task-filter="all" aria-pressed="false">All</button>
+            </div>
+            <label class="compact-field"><span>Team</span><select id="task-team-filter"><option value="">All</option></select></label>
+            <label class="search-field task-search"><span aria-hidden="true">⌕</span><input id="task-search" type="search" placeholder="Search tasks, milestones, or teams"></label>
+          </header>
+          <div class="task-layout">
+            <div>
+              <div class="board-heading"><div><p class="section-kicker">Queue</p><h2>Visible work</h2></div><span id="task-count" class="count-pill">—</span></div>
+              <div id="task-list" class="task-list" aria-busy="true"></div>
+              <div id="task-loading" class="manage-empty" role="status"><strong>Loading tasks…</strong><span>Waiting for the hub.</span></div>
+              <div id="task-empty" class="manage-empty" hidden><strong>No tasks here</strong><span>Change the filter or create a new task.</span></div>
+            </div>
+            <aside id="task-detail" class="task-detail" aria-live="polite">
+              <div class="manage-empty"><strong>Select a task</strong><span>You will see its status, notes, links, and actions.</span></div>
+            </aside>
+          </div>
+        </section>
+      </section>
+
+      <section class="manage-app" data-app-view="structure" hidden>
+        <header class="topbar manage-topbar">
+          <div>
+            <p class="eyebrow">Organization map</p>
+            <h1>Structure</h1>
+            <p class="lede">Teams, groups, projects, and applications in one model.</p>
+          </div>
+          <div class="manage-actions">
+            <button class="button button--quiet" type="button" data-registry-action="refresh">Refresh</button>
+            <button class="button button--primary" type="button" data-registry-action="create">Create</button>
+          </div>
+        </header>
+        <section class="manage-notice" data-registry-notice role="status" aria-live="polite" hidden></section>
+        <section class="registry-panel">
+          <div class="registry-tabs" role="tablist" aria-label="Registries">
+            <button type="button" role="tab" data-registry="teams" aria-selected="true">Teams <span data-registry-count="teams"></span></button>
+            <button type="button" role="tab" data-registry="groups" aria-selected="false">Groups <span data-registry-count="groups"></span></button>
+            <button type="button" role="tab" data-registry="projects" aria-selected="false">Projects <span data-registry-count="projects"></span></button>
+            <button type="button" role="tab" data-registry="apps" aria-selected="false">Apps <span data-registry-count="apps"></span></button>
+          </div>
+          <div class="registry-toolbar">
+            <div><p class="section-kicker" id="registry-kicker">People and agents</p><h2 id="registry-title">Teams</h2><p id="registry-help">Who does the work and how they relate.</p></div>
+            <label class="search-field registry-search"><span aria-hidden="true">⌕</span><input id="registry-search" type="search" placeholder="Search teams"></label>
+          </div>
+          <div id="registry-grid" class="registry-grid" aria-busy="true"></div>
+          <div id="registry-loading" class="manage-empty" role="status"><strong>Loading structure…</strong><span>Waiting for the hub.</span></div>
+          <div id="registry-empty" class="manage-empty" hidden><strong>No entries</strong><span>Create the first one from this view.</span></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="workflow-dialog" class="editor-dialog">
+    <form id="workflow-form" method="dialog" novalidate>
+      <header class="editor-dialog__head">
+        <div>
+          <p id="workflow-dialog-kicker" class="section-kicker">Edit workflow</p>
+          <h2 id="workflow-dialog-title">Action</h2>
+          <p id="workflow-dialog-help"></p>
+          <p id="workflow-dialog-warning" class="dialog-warning" role="note" hidden></p>
+        </div>
+        <button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button>
+      </header>
+      <div id="workflow-form-fields" class="editor-fields"></div>
+      <p id="workflow-form-error" class="form-error" role="alert" hidden></p>
+      <footer class="editor-dialog__foot">
+        <button class="button button--quiet" value="cancel" type="submit">Cancel</button>
+        <button id="workflow-submit" class="button button--primary" value="confirm" type="submit">Save</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="manage-dialog" class="editor-dialog manage-dialog">
+    <form id="manage-form" method="dialog" novalidate>
+      <header class="editor-dialog__head">
+        <div><p id="manage-dialog-kicker" class="section-kicker">Manage</p><h2 id="manage-dialog-title">Action</h2><p id="manage-dialog-help"></p><p id="manage-dialog-warning" class="dialog-warning" role="note" hidden></p></div>
+        <button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button>
+      </header>
+      <div id="manage-form-fields" class="editor-fields"></div>
+      <p id="manage-form-error" class="form-error" role="alert" hidden></p>
+      <footer class="editor-dialog__foot">
+        <button class="button button--quiet" value="cancel" type="submit">Cancel</button>
+        <button id="manage-submit" class="button button--primary" value="confirm" type="submit">Save</button>
+      </footer>
+    </form>
+  </dialog>
+  <dialog id="files-dialog" class="editor-dialog manage-dialog">
+    <form id="files-form" method="dialog" novalidate>
+      <header class="editor-dialog__head">
+        <div><p id="files-dialog-kicker" class="section-kicker">Permanent deletion</p><h2 id="files-dialog-title">Delete</h2><p id="files-dialog-help"></p><p id="files-dialog-warning" class="dialog-warning" role="note" hidden></p></div>
+        <button class="icon-button" value="cancel" type="button" data-files-cancel aria-label="Close">×</button>
+      </header>
+      <div class="editor-fields"><label class="editor-field"><span id="files-dialog-label">Enter the full name to confirm</span><input id="files-dialog-confirm" name="confirm" autocomplete="off" required></label></div>
+      <p id="files-dialog-error" class="form-error" role="alert" hidden></p>
+      <footer class="editor-dialog__foot">
+        <button class="button button--quiet" value="cancel" type="button" data-files-cancel>Cancel</button>
+        <button id="files-dialog-recursive" class="button button--danger-quiet" value="confirm" type="button" hidden>Delete with contents</button>
+        <button id="files-dialog-submit" class="button button--danger-quiet" value="confirm" type="submit">Delete</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <noscript>This view requires JavaScript to maintain the live activity channel.</noscript>
+  <script src="/shell.js"></script>
+  <script src="/feed.js"></script>
+  <script src="/workflow.js"></script>
+  <script src="/manage.js"></script>
+  <script src="/history.js"></script>
+  <script src="/inbox.js"></script>
+  <script src="/files.js"></script>
+  <script src="/transfer.js"></script>
+</body>
+</html>

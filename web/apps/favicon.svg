@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="pizarra">
+  <rect width="64" height="64" rx="14" fill="#102923"/>
+  <path d="M17 19h30v22H30l-9 7v-7h-4z" fill="none" stroke="#70e1b5" stroke-width="4" stroke-linejoin="round"/>
+  <circle cx="25" cy="30" r="3" fill="#f6c85f"/>
+  <circle cx="32" cy="30" r="3" fill="#f6c85f"/>
+  <circle cx="39" cy="30" r="3" fill="#f6c85f"/>
+</svg>

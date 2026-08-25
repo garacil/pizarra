@@ -1,0 +1,55 @@
+# Local-only quarantine. Nothing below this directory is ever public.
+/.private/
+
+# Hidden local state, credentials, and development-session metadata. Keep only
+# this policy file and GitHub automation.
+/.*
+!/.gitignore
+!/.github/
+!/.github/**
+
+# Compiler and build artifacts
+/build/
+/config.mk
+/pizarra
+/tiza
+/pzweb
+*-debug
+*.o
+*.ppu
+*.compiled
+*.or
+*.a
+link*.res
+ppas.sh
+fpcmade*
+
+# Runtime configuration and secrets (publish examples only)
+/conf/pizarra.conf
+/conf/tiza.conf
+/conf/pzweb.conf
+/conf/*.bak
+/conf/*.pre-*
+/pizarra.conf
+/tiza.conf
+
+# Runtime state, journals, logs, backups, and release artifacts
+/store/
+/conf/store/
+*.log
+/*-console.out
+/pzweb.out
+/releases/
+/inventory.sqlite
+/.nfs*
+
+# Test output and caches
+/tests/
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*~

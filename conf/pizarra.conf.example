@@ -1,0 +1,97 @@
+# pizarra.conf — hub configuration
+#
+# Copy this file to /etc/pizarra/pizarra.conf, set mode 0600, replace every
+# secret, and adapt the example teams. Never commit the real file.
+#
+# The repeated CHANGE-ME sentinel deliberately makes this example invalid:
+# the hub refuses reused credentials until every occurrence is replaced.
+
+[server]
+listen = 127.0.0.1
+port = 7010
+secret = CHANGE-ME-BEFORE-STARTING
+master_console_only = on
+header = short
+# releases = /var/lib/pizarra/releases
+# alarm_max = 3
+# alarm_every = 180
+# group_idle_dwell = 120
+
+# Fine-grained controls for the compact delivery header.
+[header]
+style = on
+orders = on
+tasks = on
+teams = on
+group = own
+project = off
+subs = off
+shared = on
+workflow = on
+manual = first
+# note = A standing instruction included in every delivery.
+
+[log]
+path = /var/log/pizarra/pizarra.log
+
+[store]
+dir = /var/lib/pizarra/store
+
+# Optional shared file exchange. The same path must be visible to every host.
+# Hosts without this mount can use `tiza put` and `tiza get` through the hub.
+#[shared]
+#dir = /var/lib/pizarra/shared
+
+[prompts]
+global = Build the project collaboratively. Communicate through tiza and verify completed work.
+# global_file = prompts/project.txt
+
+# A local team. pizarra creates and supervises its tmux session.
+[team:1]
+name = frontend
+speciality = Browser interface and user experience
+prompt = Produce small, accessible changes and coordinate API contracts with backend.
+secret = CHANGE-ME-BEFORE-STARTING
+tmux_session = pizarra-frontend
+launch = /usr/local/bin/start-ai-agent
+workdir = /srv/example/frontend
+# Set only if the hub may switch operating-system accounts.
+# user = developer
+# parent = coordinator
+# project = example
+# hold_when_blocked = off
+
+# A remote team using the preferred reverse-delivery channel. Its host runs
+# `tiza daemon`, authenticates with this team's credential, and keeps an
+# outbound connection to the hub. No inbound daemon port is required.
+[team:2]
+name = backend
+speciality = Service API, persistence, and integration tests
+prompt = Define explicit contracts, write tests, and report verifiable results.
+secret = CHANGE-ME-BEFORE-STARTING
+dial = on
+# Direct push is also supported: replace `dial` with
+# host = team-host.example.net:7011
+# Direct push requires the remote daemon to hold the hub's master secret;
+# prefer reverse delivery when that wider credential is unnecessary.
+
+# pzweb is an inbox-only service identity. It must have its own unique secret
+# and the complete set of delegated command families required by the web UI.
+[team:3]
+name = pzweb
+speciality = Web operations console
+secret = CHANGE-ME-BEFORE-STARTING
+tmux_session = -
+delegate = team, group, project, app, task, workflow, watch, backup, update, header
+
+# Optional organization metadata.
+#[group:product]
+#project = example
+#boss = frontend
+#members = frontend, backend
+#on_idle = boss
+#on_idle_msg = Continue with the next ready milestone and report progress.
+#on_block = alarm
+#
+#[project:example]
+#boss = frontend

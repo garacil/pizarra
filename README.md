@@ -1,0 +1,277 @@
+# pizarra
+
+**A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
+
+pizarra turns independent terminal-based agents into an organized team. It gives
+them a durable message bus, explicit identities, delegated authority, task queues,
+dependency-aware workflows, shared files, activity awareness, and human control
+surfaces. The suite does not depend on a particular AI vendor or agent runtime.
+
+The public suite has three native programs:
+
+- **`pizarra`** is the hub and source of truth. It authenticates participants,
+  journals messages before delivery, routes and retries work, manages teams,
+  groups, projects, applications, tasks, and workflows, and emits live events.
+- **`tiza`** is the endpoint. It is a command-line client, an interactive human
+  console, and a host daemon that keeps declared terminal sessions alive and
+  injects work into them.
+- **`pzweb`** is the private-network web console. It provides live activity,
+  durable history, inbox control, task and workflow management, organization
+  registries, guarded administrative controls, and verified file transfers.
+
+GNU GPL v3 (`GPL-3.0-only`). Sole author: **Germán Luis Aracil Boned
+<garacilb@gmail.com>**.
+
+## Why pizarra
+
+Long-running autonomous work fails when coordination lives only in transient
+terminal context. pizarra makes coordination an explicit system:
+
+- Messages have stable sequence numbers and are journaled before delivery.
+- Offline endpoints receive queued messages in order when they return.
+- Every team has a stable identity, role, hierarchy, and optional scoped
+  administrative authority.
+- Delivery envelopes provide the receiving agent with current project context,
+  its role, actionable tasks, workflow state, reply instructions, and shared-file
+  locations.
+- Workflow steps form a dependency graph, so independent branches can run in
+  parallel and joins wait for every prerequisite.
+- A reported workflow error halts the plan. Recovery requires a fix followed by
+  verification from a different party.
+- Humans can supervise the same state through a terminal console or a browser.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    H[Human operator] -->|terminal| TC[tiza chat / CLI]
+    H -->|browser| W[pzweb]
+    TC -->|JSON lines over TCP| P[pizarra hub]
+    W -->|scoped bus credential| P
+    P --> J[(Durable journal\ntasks and workflows\nregistry history)]
+    P -->|local delivery| L[Local terminal sessions]
+    P -->|push or reverse dial| TD[tiza host daemon]
+    TD -->|verified, deduplicated delivery| R[Remote terminal sessions]
+    P <--> S[(Optional shared files)]
+```
+
+The hub is deliberately the coordination boundary. Clients do not edit hub
+state files directly, and `pzweb` does not bypass the bus. Runtime mutations go
+through the same authenticated command path, regardless of which interface
+initiated them.
+
+## Web console
+
+`pzweb` is a broad operational surface, not a read-only dashboard:
+
+```text
+┌ Activity ─ History ─ Inbox ─ Files ─ Transfers ─ Workflows ─ Tasks ─ Structure ┐
+│ live message feed        durable pages        explicit read acknowledgement        │
+│ dependency map          task board           teams / groups / projects / apps     │
+│ verified uploads        registry controls    guarded administrative mutations      │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The server preloads and serves the bundled frontend, exposes a strict JSON API,
+and bridges the hub watch stream to Server-Sent Events. It validates its bound
+identity and full delegated capability set before opening its listening socket.
+See [Web console](docs/web-console.md) and [Web API](docs/web-api.md).
+
+## Screenshots
+
+These are the real 1.2.0 programs running with an isolated, public Atlas
+workspace. Click any image for the full-size view.
+
+| Live activity | Durable history |
+|---|---|
+| [![Live message activity in pzweb](screenshots/web-activity.png)](screenshots/web-activity.png) | [![Durable message history in pzweb](screenshots/web-history.png)](screenshots/web-history.png) |
+
+| Explicit inbox | Shared files |
+|---|---|
+| [![Non-consuming inbox in pzweb](screenshots/web-inbox.png)](screenshots/web-inbox.png) | [![Shared file index in pzweb](screenshots/web-files.png)](screenshots/web-files.png) |
+
+| Verified transfers | Dependency workflows |
+|---|---|
+| [![Verified file transfer controls in pzweb](screenshots/web-transfers.png)](screenshots/web-transfers.png) | [![Dependency workflow graph in pzweb](screenshots/web-workflows.png)](screenshots/web-workflows.png) |
+
+| Task board | Organization structure |
+|---|---|
+| [![Task board in pzweb](screenshots/web-tasks.png)](screenshots/web-tasks.png) | [![Team and application structure in pzweb](screenshots/web-structure.png)](screenshots/web-structure.png) |
+
+The terminal view below combines the live `tiza` console, task board,
+organization map, and workflow graph in a separate
+[SuperTerm](https://github.com/garacil/superterm) session. SuperTerm is optional;
+`tiza` works in any suitable terminal.
+
+[![Complete terminal collaboration view](screenshots/superterm-collaboration.png)](screenshots/superterm-collaboration.png)
+
+## Quick start
+
+### Requirements
+
+- A Unix-like host with Free Pascal, GNU Make, GCC linker support, and `tmux`
+- `libsqlite3` at runtime for mutable registries and their audit history
+- A private, firewalled network for any non-loopback listener
+
+Build all three programs:
+
+```sh
+./configure
+make check
+make
+make test
+```
+
+Use `./configure --help` to set a different installation prefix, binary
+directory, or data directory. The generated `config.mk` is local and ignored.
+
+Create private runtime configuration from the public examples:
+
+```sh
+install -m 600 conf/pizarra.conf.example conf/pizarra.conf
+install -m 600 conf/tiza.conf.example conf/tiza.conf
+install -m 600 conf/pzweb.conf.example conf/pzweb.conf
+```
+
+At minimum, replace every example secret, select explicit listen addresses,
+declare a team and its launch command in `pizarra.conf`, and set the operator
+identity in `tiza.conf`:
+
+```ini
+# conf/tiza.conf
+[pizarra]
+host = 127.0.0.1
+port = 7010
+secret = use-a-long-random-secret
+self = console
+```
+
+Start the hub and terminal console:
+
+```sh
+./pizarra --config conf/pizarra.conf
+./tiza --config conf/tiza.conf chat
+```
+
+From another shell, address a team directly:
+
+```sh
+./tiza --config conf/tiza.conf builder "Inspect the open tasks and report status."
+./tiza --config conf/tiza.conf task list open
+./tiza --config conf/tiza.conf inbox --keep
+```
+
+Web setup requires a separately bound team credential with every administrative
+family delegated to it, an exact `0600` configuration file, an IPv4 allowlist,
+an exact `Host`, an exact same-origin URL, and a SHA-256 password digest. Then:
+
+```sh
+./pzweb --config conf/pzweb.conf
+```
+
+The complete, security-first walkthrough is in [Quick start](docs/quickstart.md).
+
+## Autonomous workflow example
+
+Create a group, define a dependency graph, and start it:
+
+```sh
+tiza group add release planner builder reviewer
+tiza group boss release planner
+tiza wf create ship-release release
+tiza wf step ship-release builder "Build the release" --after 0 --eta 2h
+tiza wf step ship-release reviewer "Review the release" --after 1 --eta 1h
+tiza wf step ship-release planner "Approve publication" --after 2
+tiza wf start ship-release
+```
+
+The hub activates only roots whose dependencies are satisfied. Closing an
+active workflow-linked task advances the graph. If any member reports an error,
+the whole workflow halts; the fixer records the repair and a different party
+must verify it before work resumes.
+
+See [Workflows](docs/workflows.md) for branches, joins, strict proof, human
+approval gates, cross-workflow dependencies, snapshots, undo, and exports.
+
+## Reliability model
+
+- The hub assigns each message a monotonic `seq` and appends it to
+  `messages.jsonl` before attempting delivery.
+- Per-team delivery high-water marks and per-identity inbox cursors are stored
+  atomically in `state.json`.
+- Push failure is a queueing event, not message loss. A watchdog retries pending
+  messages oldest first.
+- Endpoint daemons persist their last injected sequence per team, preventing a
+  lost acknowledgement from causing the same message to be pasted twice after a
+  restart.
+- Task and workflow state use atomic write-and-rename persistence. Workflow
+  notifications use a durable outbox reconciled after restart.
+- Live viewers receive replay plus explicit structural `gap` events when a
+  complete view can no longer be certified.
+- Mutating clients distinguish a definite rejection from an unknown outcome.
+  An operation with an unknown outcome must be inspected before it is retried.
+
+This is a single-hub architecture. Backups, supervision, and recovery remain
+operator responsibilities; see [Operations](docs/operations.md).
+
+## Security posture
+
+pizarra is designed for a trusted private network. Its native bus is
+authenticated with shared secrets but is **not encrypted**. `pzweb` serves HTTP
+with Basic authentication and therefore must not be exposed to an untrusted
+network without an independently secured transport boundary.
+
+Core safeguards include bound per-team credentials, scoped delegated command
+families, strict JSON shapes, exact-origin checks for web mutations, IPv4/CIDR
+admission rules, host-header validation, symlink-resistant file access, size
+limits, atomic publication, and SHA-256 verification for chunked transfers and
+updates.
+
+Before deployment, read [Security](SECURITY.md). In particular:
+
+- never reuse the master secret as a team secret; direct-push daemons currently
+  must hold it as a separate, explicit trust exception, so prefer reverse dial;
+- bind listeners to explicit private addresses and firewall both bus ports;
+- run sessions as dedicated unprivileged operating-system users;
+- treat every `launch` value as executable code;
+- keep all real configuration and runtime state outside version control.
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Quick start](docs/quickstart.md)
+- [Configuration reference](docs/configuration.md)
+- [CLI reference](docs/cli.md)
+- [Web console](docs/web-console.md)
+- [Web API](docs/web-api.md)
+- [Wire protocol](docs/wire-protocol.md)
+- [Workflows](docs/workflows.md)
+- [Operations](docs/operations.md)
+- [Security model](docs/security.md)
+- [Testing](docs/testing.md)
+- [Limitations](docs/limitations.md)
+- [Contribution policy](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+
+## Repository layout
+
+```text
+src/        Free Pascal sources for pizarra, tiza, pzweb, and shared units
+web/apps/   browser application served by pzweb
+conf/       public configuration examples; real files are ignored
+systemd/    example service units
+docs/       public operator and developer documentation
+screenshots/ verified web and terminal views using public demonstration data
+configure   toolchain/path checks and local config.mk generation
+Makefile    release, debug, install, publish, and verification targets
+```
+
+## Author and license
+
+Copyright © 2026 **Germán Luis Aracil Boned <garacilb@gmail.com>**.
+See the sole-author record in [AUTHORS](AUTHORS).
+
+pizarra is licensed under the [GNU General Public License, version 3](LICENSE)
+(`GPL-3.0-only`).

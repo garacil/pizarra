@@ -1,0 +1,19 @@
+[Unit]
+Description=tiza team-host delivery daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tiza
+Group=tiza
+UMask=0077
+ExecStart=/usr/local/bin/tiza daemon --config /etc/tiza/tiza.conf
+Restart=always
+RestartSec=3
+
+# Run this service as the account that owns the configured tmux sessions.
+# Do not reuse the hub or pzweb account on a shared host.
+
+[Install]
+WantedBy=multi-user.target

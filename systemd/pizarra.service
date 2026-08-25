@@ -1,0 +1,19 @@
+[Unit]
+Description=pizarra AI-team coordination hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pizarra
+Group=pizarra
+UMask=0077
+ExecStart=/usr/local/bin/pizarra --config /etc/pizarra/pizarra.conf
+Restart=on-failure
+RestartSec=3
+
+# A hub that manages local tmux sessions must run as the account that owns
+# those sessions. Change User/Group here or host the sessions through tiza.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,10 +1,12 @@
 # pizarra
 
-[![Console, masterp, and s-masterp coordinating through Pizarra and Tiza in SuperTerm](screenshots/pizarra-superterm-three-pane-cover.gif)](screenshots/pizarra-superterm-three-pane-cover.gif)
+[![Watch the complete Pizarra, Tiza, and SuperTerm session](screenshots/pizarra-superterm-complete-video-cover.png)](https://github.com/garacil/pizarra/releases/download/v1.1.22/pizarra-superterm-complete-demo.mp4)
 
-*A read-only SuperTerm replay of real Tiza records: console starts the route,
-s-masterp sends, masterp replies, and Pizarra preserves the durable round trip.
-Private runtime instructions are intentionally omitted.*
+[▶ Watch the complete original video (MP4, 3:08, 96 MB)](https://github.com/garacil/pizarra/releases/download/v1.1.22/pizarra-superterm-complete-demo.mp4)
+
+*Complete original 3:08 SuperTerm recording: console, masterp, and s-masterp
+exchange messages through Tiza and Pizarra. Click the poster to watch or
+download the full-quality H.264/AAC video.*
 
 **A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
 

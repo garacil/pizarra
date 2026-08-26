@@ -120,7 +120,8 @@ for attempt in {1..100}; do
 done
 TMUX_TMPDIR="$TEST_ROOT/tmux" tmux has-session -t '=managed' 2>/dev/null ||
   fail 'watchdog did not create the session with a configured launch'
-[[ $(TMUX_TMPDIR="$TEST_ROOT/tmux" tmux show-options -v -t '=managed' @pizarra_team) == managed ]] ||
+TMUX_TMPDIR="$TEST_ROOT/tmux" tmux list-sessions \
+  -F '#{session_name} #{@pizarra_team}' | grep -Fxq 'managed managed' ||
   fail 'watchdog did not tag the managed session'
 ok 'configured launch is created and tagged'
 

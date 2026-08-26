@@ -103,6 +103,7 @@ begin
   Writeln('  tiza cat <shared-path>             print a shared file''s content to stdout');
   Writeln('  tiza manual                        print the embedded agent quick guide');
   Writeln('  tiza ver                           release version (this binary + the hub)');
+  Writeln('  tiza --health [--wait SECONDS]     strict authenticated hub readiness');
   Writeln('  tiza fleet                         every host: release + ONLINE/OFFLINE');
   Writeln('  tiza app add <name> --team <t> [--repo U] [--path P]');
   Writeln('                      [--purpose "one line"] [--detail "what it does"]');
@@ -530,6 +531,7 @@ end;
 procedure TDmnWatchdog.Execute;
 var
   i, waited: Integer;
+  StartWhy: string;
 begin
   while not Terminated do
   begin
@@ -541,20 +543,34 @@ begin
       begin
         FOwner.FLock.Enter;
         try
-          if not SessionExists(FOwner.FCfg.Sessions[i].TmuxSession) then
+          if SessionExists(FOwner.FCfg.Sessions[i].TmuxSession) then
           begin
-            Writeln('tiza: watchdog: recreating session ',
+            { Tag only an existing session. The watchdog never replaces it or
+              invokes its launch command a second time. }
+            TagSessionConf(FOwner.FCfg.Sessions[i].TmuxSession,
+              ConfFromLaunch(FOwner.FCfg.Sessions[i].Launch));
+          end
+          else if Trim(FOwner.FCfg.Sessions[i].Launch) <> '' then
+          begin
+            Writeln('tiza: watchdog: creating missing session ',
               FOwner.FCfg.Sessions[i].TmuxSession);
             Flush(Output);
-            EnsureSession(FOwner.FCfg.Sessions[i].TmuxSession,
+            if EnsureSessionDetailed(FOwner.FCfg.Sessions[i].TmuxSession,
               FOwner.FCfg.Sessions[i].Launch,
               FOwner.FCfg.Sessions[i].Workdir,
-              FOwner.FCfg.Sessions[i].User);
+              FOwner.FCfg.Sessions[i].User, StartWhy) then
+              TagSessionConf(FOwner.FCfg.Sessions[i].TmuxSession,
+                ConfFromLaunch(FOwner.FCfg.Sessions[i].Launch))
+            else
+            begin
+              Writeln(StdErr, 'tiza: watchdog: session ',
+                FOwner.FCfg.Sessions[i].TmuxSession,
+                ' not started: ', StartWhy);
+              Flush(StdErr);
+            end;
           end;
-          { tag the session with its team's config so a bare `tiza` there signs as
-            THIS team by construction, even if the child drops the environment }
-          TagSessionConf(FOwner.FCfg.Sessions[i].TmuxSession,
-            ConfFromLaunch(FOwner.FCfg.Sessions[i].Launch));
+          { Empty launch means manually managed/inject-only. Its absence is not
+            a respawn attempt and must not produce a false success message. }
         finally
           FOwner.FLock.Leave;
         end;
@@ -899,6 +915,7 @@ function TTizaDaemon.DeliverOne(const Team: string; Seq: Int64;
 var
   Sess: TPzSession;
   Last: Int64;
+  StartWhy: string;
 begin
   Result := False;
   if not FindSession(FCfg, Team, Sess) then
@@ -920,9 +937,14 @@ begin
       Exit(True);
     { If the session is missing and cannot be created, do NOT paste. Otherwise
       execution continued and the text landed wherever tmux chose. }
-    if not EnsureSession(Sess.TmuxSession, Sess.Launch, Sess.Workdir,
-      Sess.User) then
+    if not EnsureSessionDetailed(Sess.TmuxSession, Sess.Launch, Sess.Workdir,
+      Sess.User, StartWhy) then
+    begin
+      Writeln(StdErr, 'tiza: delivery queued for ', Team, ': session ',
+        Sess.TmuxSession, ' unavailable: ', StartWhy);
+      Flush(StdErr);
       Exit(False);
+    end;
     if DeliverTmux(Sess.TmuxSession, Text) then
     begin
       FLastSeq.Values[LowerCase(Team)] := IntToStr(Seq);
@@ -1102,62 +1124,65 @@ var
   i: Integer;
   hasActivity: Boolean;
 begin
-  Writeln(Format('tiza daemon: listening on %s:%d, %d session(s)',
-    [FCfg.Listen, FCfg.Port, Length(FCfg.Sessions)]));
-  for i := 0 to High(FCfg.Sessions) do
-    Writeln(Format('  %-12s tmux=%s', [FCfg.Sessions[i].Team,
-      FCfg.Sessions[i].TmuxSession]));
-  Flush(Output);
-
   InstallShutdownHandler;
-  wd := TDmnWatchdog.Create(Self);
-  dial := nil;
-  if FCfg.Dial then
-  begin
-    Writeln(Format('tiza daemon: dial-in mode -> hub %s:%d, keepalive %ds',
-      [FCfg.HubHost, FCfg.HubPort, FCfg.KeepAlive]));
-    Flush(Output);
-    dial := TDialThread.Create(Self);
-  end;
-  { activity sampler: only when at least one session opts in (activity=on) }
-  act := nil;
-  hasActivity := False;
-  for i := 0 to High(FCfg.Sessions) do
-    if FCfg.Sessions[i].Activity then
-      hasActivity := True;
-  if hasActivity then
-  begin
-    Writeln('tiza daemon: activity sampling ON for opt-in session(s)');
-    Flush(Output);
-    act := TActivityThread.Create(Self);
-  end;
+  Server := TPzServer.Create(FCfg.Listen, FCfg.Port, @HandleConn);
   try
-    Server := TPzServer.Create(FCfg.Listen, FCfg.Port, @HandleConn);
+    { A port collision must fail before any watchdog, dial thread, activity
+      sampler, or managed session can start. }
+    Server.Prepare;
+    Writeln(Format('tiza daemon: listening on %s:%d, %d session(s)',
+      [FCfg.Listen, FCfg.Port, Length(FCfg.Sessions)]));
+    for i := 0 to High(FCfg.Sessions) do
+      Writeln(Format('  %-12s tmux=%s', [FCfg.Sessions[i].Team,
+        FCfg.Sessions[i].TmuxSession]));
+    Flush(Output);
+
+    wd := TDmnWatchdog.Create(Self);
+    dial := nil;
+    if FCfg.Dial then
+    begin
+      Writeln(Format('tiza daemon: dial-in mode -> hub %s:%d, keepalive %ds',
+        [FCfg.HubHost, FCfg.HubPort, FCfg.KeepAlive]));
+      Flush(Output);
+      dial := TDialThread.Create(Self);
+    end;
+    { activity sampler: only when at least one session opts in (activity=on) }
+    act := nil;
+    hasActivity := False;
+    for i := 0 to High(FCfg.Sessions) do
+      if FCfg.Sessions[i].Activity then
+        hasActivity := True;
+    if hasActivity then
+    begin
+      Writeln('tiza daemon: activity sampling ON for opt-in session(s)');
+      Flush(Output);
+      act := TActivityThread.Create(Self);
+    end;
     try
       Server.Run;
     finally
-      Server.Free;
+      Writeln('tiza daemon: stopping');
+      wd.Terminate;
+      wd.WaitFor;
+      wd.Free;
+      if dial <> nil then
+      begin
+        dial.Terminate;
+        dial.WaitFor;
+        dial.Free;
+      end;
+      if act <> nil then
+      begin
+        act.Terminate;
+        act.WaitFor;
+        act.Free;
+      end;
+      { an in-flight deliver holds FLock across tmux ops — it must finish
+        before RunDaemon frees this object (freeing a held lock is UB) }
+      WaitConnectionsIdle(5000);
     end;
   finally
-    Writeln('tiza daemon: stopping');
-    wd.Terminate;
-    wd.WaitFor;
-    wd.Free;
-    if dial <> nil then
-    begin
-      dial.Terminate;
-      dial.WaitFor;
-      dial.Free;
-    end;
-    if act <> nil then
-    begin
-      act.Terminate;
-      act.WaitFor;
-      act.Free;
-    end;
-    { an in-flight deliver holds FLock across tmux ops — it must finish
-      before RunDaemon frees this object (freeing a held lock is UB) }
-    WaitConnectionsIdle(5000);
+    Server.Free;
   end;
 end;
 
@@ -4667,6 +4692,172 @@ begin
   end;
 end;
 
+{ Strict, read-only readiness. A transport reply is not success: both protocol
+  replies must be typed, authenticated successes, and the live hub must run the
+  exact same suite release as this client. Caps additionally proves that the
+  credential is bound as configured (or is the unrestricted master credential).
+  Remote endpoints are deliberately outside core hub health. }
+function ProbeHubHealth(const Cfg: TTizaConfig; out HubVer, Why: string): Boolean;
+var
+  Reply, Err: string;
+  Sent: Boolean;
+  Obj: TJSONObject;
+  D: TJSONData;
+  Families: TJSONArray;
+  i: Integer;
+  Bound: string;
+  Unrestricted: Boolean;
+
+  function RequestTyped(const Req, LabelText: string;
+    out Parsed: TJSONObject): Boolean;
+  var
+    OkData: TJSONData;
+  begin
+    Result := False;
+    Parsed := nil;
+    if not RequestLine(Cfg.Host, Cfg.Port, 1000, 1500, Req, Reply, Err, Sent) then
+    begin
+      Why := LabelText + ' transport failed: ' + Err;
+      Exit;
+    end;
+    Parsed := ParseObj(Reply);
+    if Parsed = nil then
+    begin
+      Why := LabelText + ' reply is not a JSON object';
+      Exit;
+    end;
+    OkData := Parsed.Find('ok');
+    if (OkData = nil) or (OkData.JSONType <> jtBoolean) then
+    begin
+      Why := LabelText + ' reply has no boolean ok field';
+      Exit;
+    end;
+    if not OkData.AsBoolean then
+    begin
+      Why := LabelText + ' rejected by hub: ' + Parsed.Get('error', 'unknown');
+      Exit;
+    end;
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  HubVer := '';
+  Why := '';
+  Obj := nil;
+  if not RequestTyped(BuildVer(Cfg.Secret, Cfg.SelfId), 'version', Obj) then
+  begin
+    Obj.Free;
+    Exit;
+  end;
+  try
+    D := Obj.Find('ver');
+    if (D = nil) or (D.JSONType <> jtString) or (Trim(D.AsString) = '') then
+    begin
+      Why := 'version reply has no non-empty string ver field';
+      Exit;
+    end;
+    HubVer := D.AsString;
+    if HubVer <> PizarraVersion then
+    begin
+      Why := 'suite version skew: tiza=' + PizarraVersion + ', hub=' + HubVer;
+      Exit;
+    end;
+  finally
+    Obj.Free;
+  end;
+
+  Obj := nil;
+  if not RequestTyped(BuildCaps(Cfg.Secret, Cfg.SelfId), 'capability', Obj) then
+  begin
+    Obj.Free;
+    Exit;
+  end;
+  try
+    D := Obj.Find('bound');
+    if (D = nil) or (D.JSONType <> jtString) then
+    begin
+      Why := 'capability reply has no string bound field';
+      Exit;
+    end;
+    Bound := D.AsString;
+    D := Obj.Find('unrestricted');
+    if (D = nil) or (D.JSONType <> jtBoolean) then
+    begin
+      Why := 'capability reply has no boolean unrestricted field';
+      Exit;
+    end;
+    Unrestricted := D.AsBoolean;
+    D := Obj.Find('families');
+    if (D = nil) or (D.JSONType <> jtArray) then
+    begin
+      Why := 'capability reply has no array families field';
+      Exit;
+    end;
+    Families := TJSONArray(D);
+    for i := 0 to Families.Count - 1 do
+      if Families.Items[i].JSONType <> jtString then
+      begin
+        Why := 'capability family is not a string';
+        Exit;
+      end;
+    if Unrestricted then
+    begin
+      if Bound <> '' then
+      begin
+        Why := 'hub reports an unrestricted credential bound to ' + Bound;
+        Exit;
+      end;
+    end
+    else if not SameText(Bound, Cfg.SelfId) then
+    begin
+      Why := 'credential is bound to ' + Bound + ', not configured identity ' +
+        Cfg.SelfId;
+      Exit;
+    end;
+  finally
+    Obj.Free;
+  end;
+  Result := True;
+end;
+
+procedure RunHubHealth(const ConfigArg: string; WaitSeconds: Integer);
+var
+  Path, ConfigReason, HubVer, Why: string;
+  Cfg: TTizaConfig;
+  StopAt: QWord;
+begin
+  Path := ResolveConfigStrict(ConfigArg, 'TIZA_CONF', 'tiza.conf', ConfigReason);
+  if Path = '' then
+  begin
+    if ConfigReason <> '' then
+      Fail(ConfigReason)
+    else
+      Fail('no config found (looked for tiza.conf; use --config)');
+  end;
+  try
+    Cfg := LoadTizaConfig(Path);
+  except
+    on E: Exception do
+      Fail(E.Message);
+  end;
+  if Trim(Cfg.SelfId) = '' then
+    Fail('missing identity: the configuration has no self= value');
+  StopAt := GetTickCount64 + QWord(WaitSeconds) * 1000;
+  repeat
+    if ProbeHubHealth(Cfg, HubVer, Why) then
+    begin
+      Writeln(Format('pizarra health: ok hub=%s identity=%s endpoint=%s:%d',
+        [HubVer, Cfg.SelfId, Cfg.Host, Cfg.Port]));
+      Exit;
+    end;
+    if GetTickCount64 >= StopAt then
+      Break;
+    Sleep(200);
+  until False;
+  Fail('health check failed: ' + Why);
+end;
+
 { ======================= main ======================= }
 
 var
@@ -4676,7 +4867,8 @@ var
   Obj, FO: TJSONObject;
   FRows: TJSONArray;
   FTab: TRows;
-  i: Integer;
+  i, HealthWait: Integer;
+  HealthMode: Boolean;
 begin
   { UTF-8 for all AnsiString<->Unicode conversions regardless of LANG — the
     tiza daemon runs under systemd (LANG=C) where fpjson would otherwise mangle
@@ -4691,6 +4883,8 @@ begin
   ConfigArg := '';
   FromArg := '';
   FileArg := '';
+  HealthMode := False;
+  HealthWait := 0;
   Positionals := TStringList.Create;
   try
     { --config/--help are recognized ONLY in leading position (before the
@@ -4717,6 +4911,17 @@ begin
       else if (Positionals.Count = 0) and (ParamStr(i) = '--from') and (i < ParamCount) then
       begin
         FromArg := ParamStr(i + 1); Inc(i);
+      end
+      else if (Positionals.Count = 0) and (ParamStr(i) = '--health') then
+        HealthMode := True
+      else if (Positionals.Count = 0) and (ParamStr(i) = '--wait') then
+      begin
+        if not HealthMode then
+          Fail('--wait is valid only after --health');
+        if (i >= ParamCount) or (not TryStrToInt(ParamStr(i + 1), HealthWait)) or
+           (HealthWait < 0) or (HealthWait > 120) then
+          Fail('--wait requires seconds between 0 and 120');
+        Inc(i);
       end
       else if (Positionals.Count = 0) and (ParamStr(i) = '--version') then
       begin
@@ -4746,6 +4951,14 @@ begin
     if (Trim(ConfigArg) = '') and
        (Trim(GetEnvironmentVariable('TIZA_CONF')) = '') then
       ConfigArg := TmuxSessionConf;   { '' when not tagged / not in tmux }
+
+    if HealthMode then
+    begin
+      if Positionals.Count <> 0 then
+        Fail('--health does not accept a destination or command');
+      RunHubHealth(ConfigArg, HealthWait);
+      Exit;
+    end;
 
     if Positionals.Count = 0 then
       Usage;

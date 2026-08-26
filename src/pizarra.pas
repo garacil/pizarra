@@ -338,6 +338,7 @@ procedure TWatchdog.Execute;
 var
   i, waited: Integer;
   C: TPizarraConfig;
+  StartWhy: string;
 begin
   while not Terminated do
   begin
@@ -350,17 +351,24 @@ begin
       begin
         FOwner.FLock.Enter;
         try
-          if not SessionExists(C.Teams[i].TmuxSession) then
+          if SessionExists(C.Teams[i].TmuxSession) then
+            TagSession(C.Teams[i].TmuxSession, C.Teams[i].Name)
+          else if C.Teams[i].Launch <> '' then
           begin
             FOwner.FLog.Info('watchdog: respawning session ' +
               C.Teams[i].TmuxSession);
             { Start the worker in its own source tree, not the hub directory. }
-            EnsureSession(C.Teams[i].TmuxSession, C.Teams[i].Launch,
-              C.Teams[i].Workdir, C.Teams[i].User);
+            if EnsureSessionDetailed(C.Teams[i].TmuxSession,
+              C.Teams[i].Launch, C.Teams[i].Workdir, C.Teams[i].User,
+              StartWhy) then
+              TagSession(C.Teams[i].TmuxSession, C.Teams[i].Name);
+            if StartWhy <> '' then
+              FOwner.FLog.Info('watchdog: session ' +
+                C.Teams[i].TmuxSession + ' not started: ' + StartWhy);
           end;
-          { Always tag the session, whether newly created or existing. The tmux
-            user option provides cheap, idempotent ownership metadata. }
-          TagSession(C.Teams[i].TmuxSession, C.Teams[i].Name);
+          { An empty launch deliberately describes a manually managed session:
+            deliver/tag it when present, but do not claim a respawn that cannot
+            happen or hammer tmux every tick while it is absent. }
         finally
           FOwner.FLock.Leave;
         end;
@@ -6596,7 +6604,7 @@ function TPizarra.TryDeliver(const C: TPizarraConfig; const Team: TTeam;
   const FromName, Text: string; Seq: Int64; const Ident: string;
   MinimalHdr: Boolean; const ReplyTo: string): Boolean;
 var
-  Full, Reply, Err, Other, HeldWhy: string;
+  Full, Reply, Err, Other, HeldWhy, StartWhy: string;
   HdrWfs: TWorkflowArray;
   HdrClean: TWfStrings;
   HdrBlock: string;
@@ -6687,8 +6695,15 @@ begin
     try
       if FStore.DeliveredMark(Team.Name) >= Seq then
         Exit(True);
-      EnsureSession(Team.TmuxSession, Team.Launch, '', Team.User);
-      Result := DeliverTmux(Team.TmuxSession, Full);
+      if not EnsureSessionDetailed(Team.TmuxSession, Team.Launch,
+        Team.Workdir, Team.User, StartWhy) then
+      begin
+        FLog.Info('delivery queued for ' + Team.Name + ': session ' +
+          Team.TmuxSession + ' unavailable: ' + StartWhy);
+        Result := False;
+      end
+      else
+        Result := DeliverTmux(Team.TmuxSession, Full);
     finally
       FLock.Leave;
     end;
@@ -7986,68 +8001,79 @@ begin
     FLog.Info('config: ' + CfgWarns[i]);
   FLog.Info(Format('pizarra starting: listen=%s port=%d teams=%d',
     [FCfg.Listen, FCfg.Port, Length(FCfg.Teams)]));
-  Writeln(Format('pizarra: listening on %s:%d, %d team(s)',
-    [FCfg.Listen, FCfg.Port, Length(FCfg.Teams)]));
-  for i := 0 to High(FCfg.Teams) do
-  begin
-    if FCfg.Teams[i].Host <> '' then
-      Where := Format('push %s:%d', [FCfg.Teams[i].Host, FCfg.Teams[i].Port])
-    else
-      Where := 'tmux ' + FCfg.Teams[i].TmuxSession;
-    Writeln(Format('  [%d] %-12s %-24s %s',
-      [FCfg.Teams[i].Id, FCfg.Teams[i].Name, Where, FCfg.Teams[i].Speciality]));
-  end;
-  Flush(Output);
-
-  { refresh the manual with this build's text }
-  if FCfg.SharedDir <> '' then
-    { unlink removes this exact directory entry and never follows a symlink;
-      unlike FileExists it also catches a dangling link planted in the 1777
-      exchange before the exclusive/no-follow recreation below. }
-    FpUnlink(FCfg.SharedDir + '/' + SHARED_MANUAL);
-  EnsureSharedDirs;
-  { finish any workflow work the previous shutdown interrupted }
-  try
-    WfMaintain;
-  except
-    on E: Exception do
-      FLog.Info('startup: workflow reconcile error: ' + E.Message);
-  end;
   InstallShutdownHandler;
-  wd := TWatchdog.Create(Self);
+  FServer := TPzServer.Create(FCfg.Listen, FCfg.Port, @HandleConnect);
   try
-    FServer := TPzServer.Create(FCfg.Listen, FCfg.Port, @HandleConnect);
+    { Binding is the startup commit point. Nothing below may launch a managed
+      session or claim that the hub is listening until both bind(2) and
+      listen(2) have succeeded. }
+    FServer.Prepare;
+    Writeln(Format('pizarra: listening on %s:%d, %d team(s)',
+      [FCfg.Listen, FCfg.Port, Length(FCfg.Teams)]));
+    for i := 0 to High(FCfg.Teams) do
+    begin
+      if FCfg.Teams[i].Host <> '' then
+        Where := Format('push %s:%d', [FCfg.Teams[i].Host, FCfg.Teams[i].Port])
+      else
+        Where := 'tmux ' + FCfg.Teams[i].TmuxSession;
+      Writeln(Format('  [%d] %-12s %-24s %s',
+        [FCfg.Teams[i].Id, FCfg.Teams[i].Name, Where, FCfg.Teams[i].Speciality]));
+    end;
+    Flush(Output);
+
+    { Refresh the manual only after the listener is owned. A failed bind must
+      be a read-only startup failure. }
+    if FCfg.SharedDir <> '' then
+      { unlink removes this exact directory entry and never follows a symlink;
+        unlike FileExists it also catches a dangling link planted in the 1777
+        exchange before the exclusive/no-follow recreation below. }
+      FpUnlink(FCfg.SharedDir + '/' + SHARED_MANUAL);
+    EnsureSharedDirs;
+    { finish any workflow work the previous shutdown interrupted }
+    try
+      WfMaintain;
+    except
+      on E: Exception do
+        FLog.Info('startup: workflow reconcile error: ' + E.Message);
+    end;
+    wd := TWatchdog.Create(Self);
     try
       FServer.Run;
     finally
-      FServer.Free;
+      FLog.Info('pizarra: shutting down');
+      Writeln('pizarra: shutting down');
+      wd.Terminate;
+      wd.WaitFor;
+      wd.Free;
+      { Detached connection threads (watch loops exit on ShutdownRequested within
+        ~200 ms; a send handler is bounded by its I/O timeouts and the 2 s remote-
+        push deadline) must finish before TPizarra state is freed. The listen
+        socket is already closed, so no new connection can arrive. Give a generous
+        window; if a handler is still running, exit the process rather than free
+        state it is using (a shutdown use-after-free). }
+      if not WaitConnectionsIdle(30000) then
+      begin
+        FLog.Info('pizarra: handlers still active at shutdown; exiting now');
+        Writeln('pizarra: handlers still active; exiting now');
+        Flush(Output);
+        Halt(0);
+      end;
     end;
   finally
-    FLog.Info('pizarra: shutting down');
-    Writeln('pizarra: shutting down');
-    wd.Terminate;
-    wd.WaitFor;
-    wd.Free;
-    { Detached connection threads (watch loops exit on ShutdownRequested within
-      ~200 ms; a send handler is bounded by its I/O timeouts and the 2 s remote-
-      push deadline) must finish before TPizarra state is freed. The listen
-      socket is already closed, so no new connection can arrive. Give a generous
-      window; if a handler is still running, exit the process rather than free
-      state it is using (a shutdown use-after-free). }
-    if not WaitConnectionsIdle(30000) then
-    begin
-      FLog.Info('pizarra: handlers still active at shutdown; exiting now');
-      Writeln('pizarra: handlers still active; exiting now');
-      Flush(Output);
-      Halt(0);
-    end;
+    FreeAndNil(FServer);
   end;
 end;
 
 { ---------- entry point ---------- }
 
+function ShellQuote(const Value: string): string;
+begin
+  Result := '''' + StringReplace(Value, '''', '''\''''', [rfReplaceAll]) + '''';
+end;
+
 var
-  ConfigArg, Path, SqlV, ConfigReason: string;
+  ConfigArg, Path, SqlV, ConfigReason, HostSession, HostLaunch,
+    HostStartWhy, SelfExe: string;
   i: Integer;
   App: TPizarra;
   MigrateOnly: Boolean;
@@ -8067,6 +8093,7 @@ begin
   if WATCHDOG_INTERVAL < 1 then
     WATCHDOG_INTERVAL := 1;
   ConfigArg := '';
+  HostSession := '';
   MigrateOnly := False;
   i := 1;
   while i <= ParamCount do
@@ -8094,9 +8121,20 @@ begin
     end
     else if ParamStr(i) = '--migrate-only' then
       MigrateOnly := True
+    else if ParamStr(i) = '--host-session' then
+    begin
+      if i >= ParamCount then
+      begin
+        Writeln(StdErr, 'pizarra: --host-session requires a tmux session name');
+        Halt(1);
+      end;
+      HostSession := Trim(ParamStr(i + 1));
+      Inc(i);
+    end
     else if ParamStr(i) = '--help' then
     begin
-      Writeln('usage: pizarra [--config PATH] [--migrate-only] [--version]');
+      Writeln('usage: pizarra [--config PATH] [--migrate-only] ' +
+        '[--host-session NAME] [--version]');
       Halt(0);
     end;
     Inc(i);
@@ -8128,6 +8166,36 @@ begin
     else
       Writeln('pizarra: no config found (looked for pizarra.conf; use --config)');
     Halt(1);
+  end;
+
+  { Optional outer launcher for deployments that deliberately keep the hub in
+    a visible tmux pane instead of systemd. Pizarra itself performs the single
+    create-if-missing operation. An existing session always wins: it is never
+    killed, replaced, renamed, or sent another launch command. The child omits
+    --host-session, so it becomes the actual hub rather than recursing. }
+  if HostSession <> '' then
+  begin
+    if MigrateOnly then
+    begin
+      Writeln(StdErr, 'pizarra: --host-session and --migrate-only are mutually exclusive');
+      Halt(1);
+    end;
+    if HostSession = '-' then
+    begin
+      Writeln(StdErr, 'pizarra: refusing --host-session=-');
+      Halt(1);
+    end;
+    SelfExe := ExpandFileName(ParamStr(0));
+    HostLaunch := 'exec ' + ShellQuote(SelfExe) + ' --config ' + ShellQuote(Path);
+    if not EnsureSessionDetailed(HostSession, HostLaunch,
+      ExtractFileDir(SelfExe), '', HostStartWhy) then
+    begin
+      Writeln(StdErr, 'pizarra: host session was not started: ', HostStartWhy);
+      Halt(1);
+    end;
+    Writeln('pizarra: host session ', HostSession,
+      ' exists; existing sessions are always preserved');
+    Halt(0);
   end;
 
   try

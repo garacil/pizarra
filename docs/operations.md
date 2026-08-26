@@ -53,9 +53,9 @@ configuration and state outside the source checkout.
 ```sh
 ./configure --prefix=/usr/local
 make check
-make
+make test
 sudo make install
-sudo /usr/local/bin/pizarra --migrate-only
+sudo /usr/local/bin/tiza --config /etc/pizarra/tiza.conf --health
 ```
 
 With no explicit `--config` or `PIZARRA_CONF`, a missing canonical
@@ -66,6 +66,18 @@ config/state/log directories, a mode-`0700`
 SQLite registry. The generated hub config selects that canonical release root.
 It never overwrites an existing file. Explicit and environment-selected paths
 are strict and do not trigger this behavior.
+
+First-run publication is resumable. A private mode-`0600` journal is protected
+by a live advisory lock rather than by pathname existence. If the process dies
+after publishing only one of the matching credential files, the next run
+verifies that file against the journal and creates only its missing peer. A
+stale unlocked journal cannot permanently block startup, and an unrelated
+pre-existing identity is never adopted or overwritten.
+
+`make install` accepts only the artifacts certified by `make test`, performs
+the migration-only validation before starting anything, enables the tmux
+boundary and hub units, and returns only after authenticated hub health passes.
+Do not run a second `--migrate-only` against the now-running store.
 
 The shipped services and migration defaults use `root:root`. That is deliberate
 for the current deployment: the hub and daemon must control the already
@@ -109,22 +121,24 @@ old hub is stopped. A conservative cutover is:
 
 ```sh
 make check
-make
-sudo make install
+make test
 
 # Optional live preflight/snapshot; inspect every selected source printed.
 sudo scripts/migrate-to-system-layout.sh --dry-run
 sudo scripts/migrate-to-system-layout.sh
 
-# Human-controlled quiescence: use the real old service/process name here.
+# Human-controlled quiescence: use the real old service/process name here. If
+# the legacy hub lives in tmux, inspect and stop only that service session as
+# described below; do not stop agent sessions.
 sudo systemctl stop pizarra.service
 
 # Capture final writes. Reuse explicit --source-config/--source-store options
 # and --source-releases if the first run used them.
 sudo scripts/migrate-to-system-layout.sh
 
-# Import/verify legacy registry sections and exit before opening any listener.
-sudo /usr/local/bin/pizarra \
+# Import/verify legacy registry sections with the already verified checkout
+# binary and exit before opening any listener.
+sudo ./pizarra \
   --config /etc/pizarra/pizarra.conf --migrate-only
 
 sudo sqlite3 -readonly \
@@ -143,7 +157,22 @@ sudo scripts/migrate-to-system-layout.sh \
   --source-releases /var/lib/pizarra/releases \
   --source-pzweb /etc/pizarra/pzweb.conf
 
-sudo systemctl start pizarra.service
+# Record the EXACT remaining agent-session inventory. Adoption refuses a
+# mismatch and never accepts a broad wildcard or implicit confirmation.
+tmux list-sessions -F '#{session_name}'
+
+# First manifest-backed cutover from the stopped legacy installation. Replace
+# the example list with the exact reviewed comma-separated output above. With
+# no remaining sessions, omit PIZARRA_ADOPT_TMUX_SESSIONS entirely.
+sudo PIZARRA_ADOPT_TMUX_SESSIONS='agent-main,agent-review' make adopt
+
+# `adopt` installs the verified payload and rendered units, snapshots the
+# canonical state, preserves the reviewed tmux server, enables the hub and its
+# tmux boundary, starts the hub, and commits its manifest only after strict
+# authenticated health succeeds. A failure restores payload, state, and unit
+# enablement/running state.
+sudo systemctl --no-pager --full status pizarra-tmux.service pizarra.service
+sudo /usr/local/bin/tiza --config /etc/pizarra/tiza.conf --health
 sudo /usr/local/bin/tiza team list
 sudo /usr/local/bin/tiza group list
 sudo /usr/local/bin/tiza app list
@@ -163,31 +192,33 @@ the root-owned migration lineage record after `--migrate-only` changes the INI
 and database schemas, and makes future no-argument migration audits independent
 of repository-local paths that retirement will remove.
 
-The command block above shows the shipped systemd service. For a deployment
-still supervised by tmux, first inspect the exact sessions and start commands:
+The command block above cuts over to the shipped systemd service. For a
+deployment still supervised by tmux, first inspect the exact sessions and start
+commands:
 
 ```sh
 tmux list-panes -a -F '#{session_name}\t#{pane_start_command}\t#{pane_current_command}'
 ```
 
-Stop only the old `pizarra` and `pzweb` service sessions, never agent sessions
-such as `agent-main` or `agent-review`. If their verified names are exactly
-`pizarra` and `pzweb`, the equivalent cutover commands are:
+Quiesce only the hub and web processes through their own clean shutdown
+interfaces. Never destroy their tmux containers, and never stop, signal, rename,
+or replace agent sessions such as `agent-main` or `agent-review`. After the
+canonical migration, choose exactly one supervisor:
 
 ```sh
-tmux kill-session -t pzweb
-tmux kill-session -t pizarra
-# Run the final migration, migrate-only, SQLite checks, and canonical-source
-# pass shown above while the store is quiescent.
-tmux new-session -d -s pizarra \
-  '/usr/local/bin/pizarra --config /etc/pizarra/pizarra.conf'
-tmux new-session -d -s pzweb \
-  '/usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf'
+# Standard unattended deployment: the transactional installer enables systemd.
+sudo PIZARRA_ADOPT_TMUX_SESSIONS='agent-main,agent-review' make adopt
+
+# Visible-pane alternative (do not also start pizarra.service): Pizarra itself
+# preserves an existing pane or creates the missing one exactly once.
+sudo /usr/local/bin/pizarra --config /etc/pizarra/pizarra.conf \
+  --host-session pizarra
 ```
 
-Confirm both panes use only canonical paths before running the retirement
-script. The exclusive store lock refuses an accidental second hub, but it is
-not a substitute for inspecting which supervisor owns the production process.
+The visible-pane command never replaces an existing session. Confirm the active
+process uses only canonical paths before running the retirement script. The
+exclusive store lock refuses an accidental second hub, but it is not a
+substitute for inspecting which supervisor owns the production process.
 
 Those commands use `root` because that is the shipped/current tmux deployment
 default. If the migrator was run with `PIZARRA_OWNER=pizarra`, run

@@ -57,13 +57,19 @@ privileges it creates private `/etc/pizarra`, `/var/lib/pizarra`,
 `pizarra.conf` and `tiza.conf` credentials. The generated hub file points
 `[server] releases` at that canonical artifact root. Existing files are never
 overwritten. Explicit and environment paths never trigger this bootstrap.
+Publication of the two credential files is crash-resumable: a private
+mode-`0600` journal holds the generated secret under an exclusive live lock.
+After an interruption, the next run verifies any already-published peer and
+creates only the missing file. Pathname existence alone is never treated as a
+lock, so a dead initializer cannot permanently block startup.
 
 Every selected credential-bearing INI is opened once through a descriptor that
 is kept for the complete parse. The final file must be a regular mode-`0600`
-file, no path component may be a symbolic link, and group/other-writable
-ancestors are rejected except for a root-owned sticky directory such as
-`/tmp`. Parsing remains pinned to the opened inode if its pathname is replaced,
-and quoted values have the same stripping semantics in every typed loader.
+file owned by the runtime uid, no path component may be a symbolic link, and
+group/other-writable ancestors are rejected except for a root-owned sticky
+directory such as `/tmp`. Parsing remains pinned to the opened inode if its
+pathname is replaced, and quoted values have the same stripping semantics in
+every typed loader.
 
 For `tiza`, `[pizarra] self` is the identity. A normal `--from` argument is
 ignored. Use one configuration per identity, especially on a multi-team host.

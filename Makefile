@@ -22,6 +22,7 @@ BUILD_TINY    = $(BUILD)/tiny
 PREFIX    ?= /usr/local
 BINDIR    ?= $(PREFIX)/bin
 DATADIR   ?= $(PREFIX)/share/pizarra
+UNITDIR   ?= /etc/systemd/system
 RELEASEDIR ?= /var/lib/pizarra/releases
 
 # Detect the release architecture.
@@ -41,25 +42,48 @@ TARGET_OS := $(shell uname -s | tr 'A-Z' 'a-z')
 
 # Treat compiler warnings as errors. The GCC library directory supplies the
 # startup objects expected by the linker on GNU/Linux.
-GCCLIB := $(shell dirname `gcc -print-file-name=crtbeginS.o` 2>/dev/null)
+# Keep toolchain discovery lazy: privileged `make install` must only publish an
+# already-certified payload and must not execute gcc, fpc, strip, or a linker.
+GCCLIB = $(shell dirname `gcc -print-file-name=crtbeginS.o` 2>/dev/null)
 
 # Base flags: smartlink for small binaries, variant-specific units, executables
 # in the repository root.
-FPC_BASE    = -XX -CX -Sc -Sew -Fu$(SRC) -FE. $(if $(GCCLIB),-Fl$(GCCLIB))
+FPC_BASE    = -XX -CX -Sc -Sew -Fu$(SRC) -Fi$(BUILD) -dPZ_CONFIGURED_PATHS -FE. $(if $(GCCLIB),-Fl$(GCCLIB))
 FPC_RELEASE = $(FPC_BASE) -FU$(BUILD_RELEASE) -O3 -Os
 FPC_DEBUG   = $(FPC_BASE) -FU$(BUILD_DEBUG) -g -gl -O1 -Ci -Co -Cr -Ct
 FPC_TINY    = $(FPC_BASE) -FU$(BUILD_TINY) -O3 -Os -CfSSE2 -OoREGVAR -OoPEEPHOLE
 
-.PHONY: all release debug static tiny clean distclean install publish check test info help
+.PHONY: all release debug static tiny clean distclean install install-service adopt uninstall health publish check test info help
 
 all: release
 
 $(BUILD_RELEASE) $(BUILD_DEBUG) $(BUILD_TINY):
 	@mkdir -p "$@"
 
+# Compile runtime defaults from the same configured paths the transactional
+# installer later verifies and publishes. The configured path grammar excludes
+# Pascal string delimiters, so these generated literals are unambiguous.
+PATH_CONFIG_DEPS = Makefile $(wildcard config.mk)
+$(BUILD)/pzbuildpaths.inc: $(PATH_CONFIG_DEPS)
+	@mkdir -p "$(BUILD)"
+	@{ printf "  PZ_INSTALL_BINDIR = '%s';\n" '$(BINDIR)'; \
+	   printf "  PZ_INSTALL_DATADIR = '%s';\n" '$(DATADIR)'; \
+	 } > "$@.tmp"
+	@cmp -s "$@.tmp" "$@" 2>/dev/null || mv -f "$@.tmp" "$@"
+	@rm -f "$@.tmp"
+
+$(BUILD)/install.paths: $(PATH_CONFIG_DEPS)
+	@mkdir -p "$(BUILD)"
+	@{ printf 'BINDIR\t%s\n' '$(BINDIR)'; \
+	   printf 'DATADIR\t%s\n' '$(DATADIR)'; \
+	 } > "$@.tmp"
+	@cmp -s "$@.tmp" "$@" 2>/dev/null || mv -f "$@.tmp" "$@"
+	@rm -f "$@.tmp"
+
 # Standard optimized + stripped build (default)
-release: $(BUILD_RELEASE)
+release: $(BUILD_RELEASE) $(BUILD)/pzbuildpaths.inc $(BUILD)/install.paths
 	@echo "Compiling pizarra, tiza, and pzweb (release)..."
+	@rm -f -- $(BUILD_RELEASE)/verified.manifest
 	$(FPC) $(FPC_RELEASE) -opizarra    $(SRC)/pizarra.pas
 	$(FPC) $(FPC_RELEASE) -otiza       $(SRC)/tiza.pas
 	$(FPC) $(FPC_RELEASE) -opzweb      $(SRC)/pzweb.pas
@@ -67,7 +91,7 @@ release: $(BUILD_RELEASE)
 	@echo "Built: $$(du -h pizarra | cut -f1) pizarra, $$(du -h tiza | cut -f1) tiza, $$(du -h pzweb | cut -f1) pzweb"
 
 # Debug build with checks
-debug: $(BUILD_DEBUG)
+debug: $(BUILD_DEBUG) $(BUILD)/pzbuildpaths.inc $(BUILD)/install.paths
 	@echo "Compiling debug..."
 	$(FPC) $(FPC_DEBUG) -opizarra-debug    $(SRC)/pizarra.pas
 	$(FPC) $(FPC_DEBUG) -otiza-debug       $(SRC)/tiza.pas
@@ -81,7 +105,7 @@ static:
 	@exit 1
 
 # Ultra-compact (experimental)
-tiny: $(BUILD_TINY)
+tiny: $(BUILD_TINY) $(BUILD)/pzbuildpaths.inc $(BUILD)/install.paths
 	@echo "Compiling tiny..."
 	$(FPC) $(FPC_TINY) -opizarra    $(SRC)/pizarra.pas
 	$(FPC) $(FPC_TINY) -otiza       $(SRC)/tiza.pas
@@ -100,16 +124,23 @@ clean:
 distclean: clean
 	rm -f -- config.mk
 
-# Install the hub and web console on the control host and tiza wherever needed.
-# All service bootstrap configuration lives under /etc/pizarra; see examples.
-install: release
-	@echo "Installing binaries and web assets..."
-	install -D -m0755 pizarra $(DESTDIR)$(BINDIR)/pizarra
-	install -D -m0755 tiza    $(DESTDIR)$(BINDIR)/tiza
-	install -D -m0755 pzweb   $(DESTDIR)$(BINDIR)/pzweb
-	install -d -m0755 $(DESTDIR)$(DATADIR)/web/apps
-	install -m0644 web/apps/* $(DESTDIR)$(DATADIR)/web/apps/
-	@echo "Installed binaries in $(BINDIR) and web assets in $(DATADIR)/web/apps"
+# The privileged install consumes only artifacts previously verified by
+# `make test`; it never invokes the compiler. With DESTDIR it stages a package
+# image and performs no bootstrap, process, session, or systemd operation.
+install install-service:
+	@BINDIR='$(BINDIR)' DATADIR='$(DATADIR)' UNITDIR='$(UNITDIR)' DESTDIR='$(DESTDIR)' \
+	  scripts/install-service.sh install
+
+adopt:
+	@BINDIR='$(BINDIR)' DATADIR='$(DATADIR)' UNITDIR='$(UNITDIR)' DESTDIR='$(DESTDIR)' \
+	  scripts/install-service.sh adopt
+
+uninstall:
+	@BINDIR='$(BINDIR)' DATADIR='$(DATADIR)' UNITDIR='$(UNITDIR)' DESTDIR='$(DESTDIR)' \
+	  scripts/install-service.sh uninstall
+
+health:
+	@$(BINDIR)/tiza --config /etc/pizarra/tiza.conf --health
 
 # Publish release artifacts for the daemon self-update channel (cmd=upget).
 # [server] releases uses RELEASEDIR. RUN THIS AFTER COMMITTING:
@@ -149,6 +180,15 @@ test: release
 	@./pizarra --version
 	@./tiza --version
 	@./pzweb --version
+	@{ printf 'pizarra-verified-artifacts-v2\n'; \
+	   ./pizarra --version | sed -n '1p'; \
+	   sha256sum $(BINS) Makefile configure scripts/install-service.sh \
+	     $(BUILD)/pzbuildpaths.inc $(BUILD)/install.paths; \
+	   find src web/apps examples systemd -type f -print | LC_ALL=C sort | \
+	     while IFS= read -r path; do sha256sum "$$path"; done; \
+	 } > $(BUILD_RELEASE)/verified.manifest.tmp
+	@mv -f -- $(BUILD_RELEASE)/verified.manifest.tmp $(BUILD_RELEASE)/verified.manifest
+	@echo "Verified install artifacts: $(BUILD_RELEASE)/verified.manifest"
 
 info:
 	@for b in $(BINS); do \
@@ -161,4 +201,5 @@ info:
 
 help:
 	@echo "Configure: ./configure [--prefix=PATH] [--bindir=PATH] [--datadir=PATH]"
-	@echo "Targets: release (default) | debug | tiny | clean | distclean | install | publish | check | test | info"
+	@echo "Targets: release (default) | debug | tiny | clean | distclean | install | adopt | uninstall | health | publish | check | test | info"
+	@echo "Install requires a prior successful make test; DESTDIR stages without activation."

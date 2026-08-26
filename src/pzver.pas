@@ -10,7 +10,7 @@ unit pzver;
 interface
 
 const
-  PizarraVersion = '1.1.22';
+  PizarraVersion = '1.1.23';
 
 { dotted numeric compare (1.0.10 > 1.0.9); missing parts count as 0 }
 function VerNewer(const A, B: string): Boolean;

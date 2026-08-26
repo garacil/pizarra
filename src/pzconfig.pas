@@ -1469,7 +1469,7 @@ begin
     Result.SelfId    := Ini.ReadString('pizarra', 'self', '');
     Result.AutoUpdate := IniFlag(Ini, 'daemon', 'autoupdate', False);
     Result.UpdatePath := Ini.ReadString('daemon', 'update_path',
-      '/usr/local/bin/tiza');
+      PZ_TIZA_BIN_PATH);
     Result.UpdateSudo := IniFlag(Ini, 'daemon', 'update_sudo', False);
     Result.UpdateFpc  := Ini.ReadString('daemon', 'update_fpc', 'fpc');
 

@@ -37,6 +37,10 @@ type
     constructor Create(const AListen: string; APort: Word;
       AHandler: TPzLineHandler; AIOTimeoutMs: Integer = 10000);
     destructor Destroy; override;
+    { Bind and listen without entering the blocking accept loop. Callers use
+      this as the startup commit point before launching background work or
+      announcing readiness. }
+    procedure Prepare;
     procedure Run;   { blocks until shutdown is requested }
   end;
 
@@ -192,9 +196,16 @@ begin
     FServer.StopAccepting;
 end;
 
+procedure TPzServer.Prepare;
+begin
+  if not FServer.Bound then
+    FServer.Listen;
+  GListenFd := FServer.Socket;
+end;
+
 procedure TPzServer.Run;
 begin
-  GListenFd := FServer.Socket;
+  Prepare;
   { half a second: short enough that stopping feels immediate to a human or a
     supervisor, long enough not to spin }
   FServer.AcceptIdleTimeOut := 500;

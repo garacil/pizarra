@@ -66,7 +66,10 @@ A team resolves to exactly one delivery mode:
 Terminal delivery uses a named buffer, bracketed paste, and one explicit Enter.
 This preserves multiline messages as one input. A watchdog ensures declared
 sessions exist, but it never kills sessions merely because configuration
-changes.
+changes. The existence check is the complete replacement policy: an existing
+session wins unconditionally and never receives a second launch command. An
+absent session is created only when its registry entry has a non-empty reviewed
+`launch`; manual/inject-only entries remain absent without a false respawn loop.
 
 ## Message lifecycle
 

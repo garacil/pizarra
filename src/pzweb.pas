@@ -5146,28 +5146,102 @@ begin
       Fail('[web] malformed allow_from rule: ' + Cfg.AllowFrom[i]);
 end;
 
+function ProbeWebListener(out Why: string): Boolean;
+var
+  Sock: TInetSocket;
+begin
+  Result := False;
+  Why := '';
+  Sock := nil;
+  try
+    try
+      { A completed TCP connect proves that the configured address and port are
+        actually bound. The server may immediately reject this internal probe
+        through allow_from; admission and authentication remain normal request
+        boundaries and are not weakened for readiness. }
+      Sock := TInetSocket.Create(Cfg.Listen, Word(Cfg.WebPort), 1000);
+      Result := True;
+    except
+      on E: Exception do
+        Why := E.Message;
+    end;
+  finally
+    Sock.Free;
+  end;
+end;
+
+procedure RunWebHealth(WaitSeconds: Integer);
+var
+  StopAt: QWord;
+  Why: string;
+begin
+  StopAt := GetTickCount64 + QWord(WaitSeconds) * 1000;
+  repeat
+    if ProbeWebListener(Why) then
+    begin
+      Writeln(Format('pzweb health: ok endpoint=http://%s:%d',
+        [Cfg.Listen, Cfg.WebPort]));
+      Exit;
+    end;
+    if GetTickCount64 >= StopAt then
+      Break;
+    Sleep(200);
+  until False;
+  Fail('health check failed: cannot connect to ' + Cfg.Listen + ':' +
+    IntToStr(Cfg.WebPort) + ': ' + Why);
+end;
+
 { ---------------------------------------------------------------------- main }
 
 var
   Srv: TPzWebServer;
   CfgPath, ConfigArg, ConfigReason: string;
+  i, HealthWait: Integer;
+  HealthMode: Boolean;
 begin
   { Match the hub and tiza: without this setting fpjson converts decoded text
     through the system code page (often LANG=C under systemd/tmux), producing
     Latin-1 bytes inside a response declared as UTF-8. The browser then receives
     invalid bytes and JSON.parse fails. }
   SetMultiByteConversionCodePage(CP_UTF8);
-  if (ParamCount >= 1) and ((ParamStr(1) = '--version') or (ParamStr(1) = '-v')) then
-  begin
-    Writeln('pzweb ', PizarraVersion);
-    Halt(0);
-  end;
   ConfigArg := '';
-  if (ParamCount >= 1) and (ParamStr(1) = '--config') then
+  HealthMode := False;
+  HealthWait := 0;
+  i := 1;
+  while i <= ParamCount do
   begin
-    if ParamCount < 2 then
-      Fail('--config requires a path');
-    ConfigArg := ParamStr(2);
+    if (ParamStr(i) = '--version') or (ParamStr(i) = '-v') then
+    begin
+      Writeln('pzweb ', PizarraVersion);
+      Halt(0);
+    end
+    else if ParamStr(i) = '--config' then
+    begin
+      if i >= ParamCount then
+        Fail('--config requires a path');
+      ConfigArg := ParamStr(i + 1);
+      Inc(i);
+    end
+    else if ParamStr(i) = '--health' then
+      HealthMode := True
+    else if ParamStr(i) = '--wait' then
+    begin
+      if not HealthMode then
+        Fail('--wait is valid only after --health');
+      if (i >= ParamCount) or
+         (not TryStrToInt(ParamStr(i + 1), HealthWait)) or
+         (HealthWait < 0) or (HealthWait > 120) then
+        Fail('--wait requires seconds between 0 and 120');
+      Inc(i);
+    end
+    else if ParamStr(i) = '--help' then
+    begin
+      Writeln('usage: pzweb [--config PATH] [--health [--wait SECONDS]] [--version]');
+      Halt(0);
+    end
+    else
+      Fail('unknown option: ' + ParamStr(i));
+    Inc(i);
   end;
   CfgPath := ResolveConfigStrict(ConfigArg, 'PZWEB_CONF', 'pzweb.conf',
     ConfigReason);
@@ -5181,6 +5255,11 @@ begin
   end;
 
   LoadCfg(CfgPath);
+  if HealthMode then
+  begin
+    RunWebHealth(HealthWait);
+    Halt(0);
+  end;
   Writeln('pzweb ', PizarraVersion, ' starting');
 
   { DELIBERATE ORDER: prove that the credential binds first, then open network
@@ -5211,7 +5290,11 @@ begin
     Admit := TAdmit.Create;
     Srv.OnAllowConnect := @Admit.Allow;
     Srv.OnRequest := @Srv.Handle;
-    Writeln('pzweb: listening on http://', Cfg.Listen, ':', Cfg.WebPort, '/');
+    { Active=True performs bind/listen and then blocks in the accept loop. Do
+      not claim readiness before that call: systemd's authenticated post-start
+      probe is the positive readiness signal. }
+    Writeln('pzweb: starting HTTP listener on http://', Cfg.Listen, ':',
+      Cfg.WebPort, '/');
     { With output redirected to a file, FPC buffers it until the process exits.
       A daemon that never exits therefore had an ALWAYS empty log, including
       the startup checks that had just passed. Evidence nobody can read proves

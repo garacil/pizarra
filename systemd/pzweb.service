@@ -2,6 +2,7 @@
 Description=pzweb operations console for pizarra
 After=network-online.target pizarra.service
 Wants=network-online.target
+Requires=pizarra.service
 
 [Service]
 Type=simple
@@ -10,6 +11,8 @@ Group=root
 UMask=0077
 WorkingDirectory=/usr/local/share/pizarra
 ExecStart=/usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf
+ExecStartPost=/usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf --health --wait 30
+TimeoutStartSec=45
 Restart=on-failure
 RestartSec=3
 

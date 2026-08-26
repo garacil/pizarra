@@ -11,7 +11,7 @@ also available.*
 
 **A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
 
-[![Release: 1.1.22](https://img.shields.io/badge/release-1.1.22-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.22)
+[![Release: 1.1.23](https://img.shields.io/badge/release-1.1.23-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.23)
 
 pizarra turns independent terminal-based agents into an organized team. It gives
 them a durable message bus, explicit identities, delegated authority, task queues,
@@ -159,37 +159,45 @@ Build all three programs:
 ```sh
 ./configure
 make check
-make
 make test
 ```
 
 Use `./configure --help` to set a different installation prefix, binary
 directory, or data directory. The generated `config.mk` is local and ignored.
 
-Install the binaries and browser assets:
+Install the certified binaries, browser assets, and systemd units:
 
 ```sh
 sudo make install
 ```
 
-On a new machine, one implicit migration-only run securely creates the canonical
+On a new machine, the transactional installer securely creates the canonical
 directories, matching random hub/console credentials, and an empty SQLite
-registry. It opens no listener or watchdog:
+registry. It enables the dedicated tmux boundary and hub services and returns
+only after authenticated health succeeds:
 
 ```sh
-sudo /usr/local/bin/pizarra --migrate-only
+sudo systemctl --no-pager --full status pizarra-tmux.service pizarra.service
+sudo /usr/local/bin/tiza --config /etc/pizarra/tiza.conf --health
 ```
 
-Start the hub in one terminal and register a team from another:
+Register a team through the running service:
 
 ```sh
-# terminal 1
-sudo /usr/local/bin/pizarra
-
-# terminal 2
 sudo /usr/local/bin/tiza team add builder \
   "Builds and verifies changes" --session pizarra-builder
 ```
+
+Operators who deliberately prefer a visible hub pane may disable the hub unit
+and ask Pizarra itself to preserve or create that one session:
+
+```sh
+sudo /usr/local/bin/pizarra --config /etc/pizarra/pizarra.conf \
+  --host-session pizarra
+```
+
+This mode never replaces an existing session. Local team sessions follow the
+same rule: create only when absent and only with a configured launch command.
 
 Give the team a unique secret with
 `tiza team set builder secret --file ...` and install the matching mode-`0600`
@@ -214,10 +222,12 @@ sudo /usr/local/bin/tiza inbox --keep
 
 Web setup requires a separately bound team credential with every administrative
 family delegated to it, an exact `0600` configuration file, an IPv4 allowlist,
-an exact `Host`, an exact same-origin URL, and a SHA-256 password digest. Then:
+an exact `Host`, an exact same-origin URL, and a SHA-256 password digest. Then
+enable the opt-in service and verify its listener:
 
 ```sh
-sudo /usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf
+sudo systemctl enable --now pzweb.service
+sudo /usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf --health
 ```
 
 ## Autonomous workflow example

@@ -10,6 +10,7 @@ Group=root
 UMask=0077
 StateDirectory=pizarra
 StateDirectoryMode=0700
+WorkingDirectory=/
 ExecStart=/usr/local/bin/tiza daemon --config /etc/pizarra/tiza.conf
 Restart=always
 RestartSec=3

@@ -40,3 +40,14 @@ jobs:
           scripts/test-pzshare-symlink.sh
           scripts/test-migrate-release-layout.sh
           scripts/test-retire-repo-runtime-conf.sh
+          scripts/test-install-service.sh
+          scripts/test-pzweb-readiness.sh
+          scripts/test-session-preservation.sh
+          scripts/test-watchdog-session.sh
+
+      - name: Verify a non-default installation prefix
+        run: |
+          make clean
+          ./configure --prefix=/opt/pizarra
+          make test
+          scripts/test-install-service.sh

@@ -20,7 +20,6 @@ Check the compiler and build the suite:
 ```sh
 ./configure
 make check
-make
 make test
 ```
 
@@ -32,19 +31,20 @@ The build creates `pizarra`, `tiza`, and `pzweb` in the repository root.
 
 ## 2. Install and initialize the canonical layout
 
-Install binaries and browser assets:
+Install the certified binaries, browser assets, and systemd units:
 
 ```sh
 sudo make install
 ```
 
-For a new machine, the first **implicit** root run creates the protected Unix
-layout, generates one random master credential, and writes matching hub and
-console files. `--migrate-only` performs that initialization and verifies the
-empty SQLite registry without opening a listener or watchdog:
+For a new machine, the transactional installer creates the protected Unix
+layout, generates one random master credential, writes matching hub and console
+files, performs migration-only validation, enables `pizarra-tmux.service` and
+`pizarra.service`, and waits for authenticated health:
 
 ```sh
-sudo /usr/local/bin/pizarra --migrate-only
+sudo systemctl --no-pager --full status pizarra-tmux.service pizarra.service
+sudo /usr/local/bin/tiza --config /etc/pizarra/tiza.conf --health
 ```
 
 The result is:
@@ -72,15 +72,9 @@ the directories/files must retain their documented modes.
 `[project:*]`, or `[app:*]` sections; current organization state lives only in
 `org.sqlite` and is changed through the hub.
 
-## 3. Start the hub and register a local agent team
+## 3. Register a local agent team
 
-Start the hub in one terminal:
-
-```sh
-sudo /usr/local/bin/pizarra
-```
-
-In another terminal, create the team through the generated console identity:
+Create the team through the generated console identity and running hub service:
 
 ```sh
 sudo /usr/local/bin/tiza team add builder \
@@ -117,10 +111,25 @@ sudo /usr/local/bin/tiza team set builder launch \
   "bash -lc 'export TIZA_CONF=/etc/pizarra/agents/builder.conf; exec /usr/local/bin/start-ai-agent'"
 ```
 
-The hub watchdog creates `pizarra-builder` on its next pass and starts the agent
-in the configured `workdir`. `launch` is executable code; use only a reviewed
-command. If the hub/session uses another operating-system account, change the
-file ownership, service `User`/`Group`, and registry `user` coherently.
+The hub watchdog creates `pizarra-builder` inside the dedicated tmux boundary
+on its next pass and starts the agent in the configured `workdir`. `launch` is
+executable code; use only a reviewed command. If the hub/session uses another
+operating-system account, change the file ownership, service `User`/`Group`,
+and registry `user` coherently.
+
+For an operator-controlled deployment that deliberately keeps the hub itself
+in a visible pane, disable the hub service and let Pizarra preserve or create
+that one session:
+
+```sh
+sudo systemctl disable --now pizarra.service
+sudo /usr/local/bin/pizarra --config /etc/pizarra/pizarra.conf \
+  --host-session pizarra
+```
+
+Do not combine the two supervisors. The host-session launcher never replaces
+an existing session, and local agent sessions follow the same existing-wins
+rule.
 
 ## 4. Use the human console
 
@@ -185,10 +194,12 @@ password_sha256 = <64-lowercase-hex-sha256-of-the-password>
 ```
 
 The file must be a regular, non-symlinked file with permissions exactly `0600`.
-Start it and open `http://127.0.0.1:7080/`:
+Enable the opt-in service, verify its real listener, and open
+`http://127.0.0.1:7080/`:
 
 ```sh
-sudo /usr/local/bin/pzweb
+sudo systemctl enable --now pzweb.service
+sudo /usr/local/bin/pzweb --config /etc/pizarra/pzweb.conf --health
 ```
 
 The browser uses the original HTTP password, not its digest. `pzweb` does not

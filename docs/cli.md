@@ -9,22 +9,28 @@ and scripts, prefer `--config /absolute/path`.
 ## `pizarra`
 
 ```text
-pizarra [--config PATH] [--migrate-only] [--version]
+pizarra [--config PATH] [--migrate-only] [--host-session NAME] [--version]
 ```
 
 | Command | Effect |
 |---|---|
 | `pizarra --config PATH` | Run the hub with an explicit INI file |
 | `pizarra --migrate-only` | Initialize/upgrade/import and verify SQLite, then exit without a listener or watchdog |
+| `pizarra --host-session NAME` | Preserve an existing tmux session or create it once with the hub inside; the launcher then exits |
 | `pizarra --version` | Print suite version and SQLite availability |
 | `pizarra --help` | Print the compact usage line |
 
-The hub remains in the foreground and handles SIGINT/SIGTERM cleanly.
+The hub normally remains in the foreground and handles SIGINT/SIGTERM cleanly.
+`--host-session` is the opt-in deployment alternative for an operator who wants
+a visible hub pane instead of systemd. Pizarra itself performs the check and
+creation. An existing session always wins: it is never killed, replaced, or
+given a second launch command.
 
 ## `tiza` global behavior
 
 ```text
 tiza [--config PATH] <command-or-destination> ...
+tiza --config PATH --health [--wait SECONDS]
 ```
 
 - Identity always comes from `[pizarra] self` in the selected configuration.
@@ -38,6 +44,9 @@ tiza [--config PATH] <command-or-destination> ...
 - Human-readable tables are used on a terminal; redirected output is plain.
 - A command that reaches the hub is still subject to its identity and authority
   checks.
+- `--health` requires authenticated version and capability replies, verifies
+  the credential binding, and rejects suite-version skew. `--wait` accepts
+  zero through 120 seconds.
 
 ## Messaging and inbox
 

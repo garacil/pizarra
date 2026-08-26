@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${PIZARRA_FAKE_TMUX_STATE:?missing PIZARRA_FAKE_TMUX_STATE}"
+: "${PIZARRA_FAKE_TMUX_LOG:?missing PIZARRA_FAKE_TMUX_LOG}"
+
+printf '%s\n' "$*" >>"$PIZARRA_FAKE_TMUX_LOG"
+
+case ${1:-} in
+  has-session)
+    [[ -e $PIZARRA_FAKE_TMUX_STATE ]]
+    ;;
+  new-session)
+    if [[ ${PIZARRA_FAKE_TMUX_FAIL:-0} == 1 ]]; then
+      printf '%s\n' 'synthetic new-session failure' >&2
+      exit 42
+    fi
+    : >"$PIZARRA_FAKE_TMUX_STATE"
+    ;;
+  *)
+    printf 'unexpected fake tmux command: %s\n' "${1:-}" >&2
+    exit 64
+    ;;
+esac

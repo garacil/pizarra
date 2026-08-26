@@ -1,0 +1,15 @@
+[Unit]
+Description=tmux process boundary for pizarra-managed agent sessions
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/tmux -f /usr/local/share/pizarra/systemd/tmux.conf start-server
+
+# The tmux server and every session it creates remain in this unit's cgroup.
+# Restarting pizarra.service therefore cannot terminate managed agent sessions.
+# Stop this unit only after every managed session has been reviewed and stopped.
+
+[Install]
+WantedBy=multi-user.target

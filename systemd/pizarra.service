@@ -1,7 +1,8 @@
 [Unit]
 Description=pizarra AI-team coordination hub
-After=network-online.target
+After=network-online.target pizarra-tmux.service
 Wants=network-online.target
+Requires=pizarra-tmux.service
 
 [Service]
 Type=simple
@@ -14,7 +15,10 @@ StateDirectory=pizarra
 StateDirectoryMode=0700
 LogsDirectory=pizarra
 LogsDirectoryMode=0700
+WorkingDirectory=/
 ExecStart=/usr/local/bin/pizarra
+ExecStartPost=/usr/local/bin/tiza --config /etc/pizarra/tiza.conf --health --wait 30
+TimeoutStartSec=45
 Restart=on-failure
 RestartSec=3
 

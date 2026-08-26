@@ -48,9 +48,14 @@ disposable temporary tree, below `/tmp` in the default environment:
 ```sh
 scripts/test-bootstrap-layout.sh
 scripts/test-private-config.sh
+scripts/test-group-onblock.sh
 scripts/test-pzshare-symlink.sh
 scripts/test-migrate-release-layout.sh
 scripts/test-retire-repo-runtime-conf.sh
+scripts/test-install-service.sh
+scripts/test-pzweb-readiness.sh
+scripts/test-session-preservation.sh
+scripts/test-watchdog-session.sh
 ```
 
 The bootstrap harness compiles the real Pascal layout implementation and checks
@@ -77,6 +82,24 @@ including canonical release-path validation. Run them whenever migration,
 canonical paths, source archival, release publication, or retirement checks
 change. None operates on `/etc/pizarra`, `/var/lib/pizarra`, the checkout's
 `.private` tree, or live tmux sessions.
+
+The installer harness stages only below a disposable `DESTDIR`. It verifies
+that configured binary/data paths reach compiled defaults, rendered examples,
+and systemd units; rejects a publication path different from the certified
+build; checks idempotent reinstall; injects a post-payload failure and compares
+the restored bytes and metadata; checks manifest-driven uninstall; and proves
+that explicit first-cutover adoption can replace and record a pre-existing
+payload inside the disposable root. The
+web-readiness harness starts an isolated loopback hub and web console, proves
+that health fails before bind and succeeds after a real TCP connection, then
+proves a second server fails promptly on the occupied port without claiming it
+is listening. The watchdog-session harness uses a private tmux socket and proves
+that a configured launch is created and ownership-tagged while an absent manual
+session with no launch is neither fabricated nor falsely logged as respawning.
+The session-preservation harness is stricter and entirely hermetic: a fake
+`tmux` executable proves that `pizarra --host-session` creates an absent hub
+session exactly once, performs only an existence probe on the second call, and
+has no destructive command path. It never connects to any tmux server.
 
 ## Isolated integration environment
 

@@ -21,7 +21,7 @@ interface
 
 uses
   SysUtils, Classes, BaseUnix, termio, ssockets, fpjson, base64,
-  pzproto, pzconfig, pznet, pzshare, pzansi, pzver, pzbox;
+  pzproto, pzconfig, pzlayout, pznet, pzshare, pzansi, pzver, pzbox;
 
 procedure RunChat(const ACfg: TTizaConfig; APlain: Boolean);
 
@@ -1033,7 +1033,8 @@ begin
   else if (T = 'daemon') or (T = 'demonio') then
   begin
     FeedLine('remote team hosts (tiza daemon):');
-    FeedLine('  1. copy the tiza binary:  scp tiza host:/usr/local/bin/');
+    FeedLine('  1. copy the tiza binary:  scp tiza host:' +
+      PZ_INSTALL_BINDIR + '/');
     FeedLine('  2. /etc/pizarra/tiza.conf there: [pizarra] hub ip/port/secret, self=<team>');
     FeedLine('     [daemon] listen/port(7011)/secret + [session:<team>] tmux_session/launch');
     FeedLine('  3. enable systemd/tiza.service (or run: tiza daemon)');

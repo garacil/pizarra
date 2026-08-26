@@ -45,6 +45,11 @@ function ClassifyPane(const Pane, ExtraIdle, ExtraBlock: string): string;
 function EnsureSession(const Session, Launch: string;
   const Workdir: string = ''; const User: string = ''): Boolean;
 
+{ Diagnostic variant used by the hub and daemon watchdogs. An existing session
+  is success and is never replaced, killed, or given a second launch command. }
+function EnsureSessionDetailed(const Session, Launch, Workdir, User: string;
+  out Why: string): Boolean;
+
 { Deliver FullText into the session (bracketed paste + Enter). }
 function DeliverTmux(const Session, FullText: string): Boolean;
 
@@ -292,24 +297,48 @@ begin
   Result := Q + StringReplace(S, Q, Q + '\' + Q + Q, [rfReplaceAll]) + Q;
 end;
 
-function EnsureSession(const Session, Launch: string;
-  const Workdir, User: string): Boolean;
+function DiagnosticLine(const S: string): string;
 var
-  Cmd: string;
+  i: Integer;
 begin
-  if Session = '' then
-    Exit(False);
+  Result := Trim(S);
+  for i := 1 to Length(Result) do
+    if Result[i] in [#0..#31] then
+      Result[i] := ' ';
+  while Pos('  ', Result) > 0 do
+    Result := StringReplace(Result, '  ', ' ', [rfReplaceAll]);
+  if Length(Result) > 512 then
+    Result := Copy(Result, 1, 509) + '...';
+end;
+
+function EnsureSessionDetailed(const Session, Launch, Workdir, User: string;
+  out Why: string): Boolean;
+var
+  Cmd, Outp: string;
+  Status: Integer;
+begin
+  Result := False;
+  Why := '';
+  if (Trim(Session) = '') or (Trim(Session) = '-') then
+  begin
+    Why := 'refusing an unnamed tmux target';
+    Exit;
+  end;
+  { The existing session wins unconditionally. Never restart a healthy agent
+    because launch/workdir changed, and never replace it during a create race. }
   if SessionExists(Session) then
     Exit(True);
-  if Launch = '' then
-    Exit(False);
+  if Trim(Launch) = '' then
+  begin
+    Why := 'session is absent and has no launch command (manual/inject-only)';
+    Exit;
+  end;
   if (Workdir <> '') and (not DirectoryExists(Workdir)) then
   begin
-    { a configured workdir that is not there yet (NFS not mounted, typo) —
-      do NOT launch in the wrong dir; the watchdog retries next tick }
-    Writeln(StdErr, 'tiza: workdir not present, deferring session ',
-      Session, ': ', Workdir);
-    Exit(False);
+    { Do not silently launch in the wrong directory when a mount is absent or
+      the configured path is misspelled. The watchdog may retry later. }
+    Why := 'workdir not present: ' + Workdir;
+    Exit;
   end;
   { When a user is set, run the launch AS that user via a login shell (su -,
     so HOME/env are the user's), cd-ing into the workdir. This
@@ -322,15 +351,42 @@ begin
       Cmd := 'cd ' + ShQuote(Workdir) + ' && exec ' + Launch;
     Cmd := 'su - ' + User + ' -c ' + ShQuote(Cmd);
     if Workdir <> '' then
-      RunStatus('tmux', ['new-session', '-d', '-s', Session, '-c', Workdir, Cmd])
+      Status := RunCapture('tmux',
+        ['new-session', '-d', '-s', Session, '-c', Workdir, Cmd], Outp)
     else
-      RunStatus('tmux', ['new-session', '-d', '-s', Session, Cmd]);
+      Status := RunCapture('tmux',
+        ['new-session', '-d', '-s', Session, Cmd], Outp);
   end
   else if Workdir <> '' then
-    RunStatus('tmux', ['new-session', '-d', '-s', Session, '-c', Workdir, Launch])
+    Status := RunCapture('tmux',
+      ['new-session', '-d', '-s', Session, '-c', Workdir, Launch], Outp)
   else
-    RunStatus('tmux', ['new-session', '-d', '-s', Session, Launch]);
+    Status := RunCapture('tmux',
+      ['new-session', '-d', '-s', Session, Launch], Outp);
+
+  { Another creator may have won after our initial check. In that case the
+    existing session is success even if our new-session command returned the
+    duplicate-session error. It must never be removed to make our launch win. }
   Result := SessionExists(Session);
+  if Result then
+    Exit;
+  Outp := DiagnosticLine(Outp);
+  if Status = 0 then
+    Why := 'session disappeared immediately; the launch command exited'
+  else if Outp <> '' then
+    Why := Format('tmux new-session failed (exit %d): %s', [Status, Outp])
+  else if Status < 0 then
+    Why := 'could not execute tmux'
+  else
+    Why := Format('tmux new-session failed (exit %d)', [Status]);
+end;
+
+function EnsureSession(const Session, Launch: string;
+  const Workdir, User: string): Boolean;
+var
+  IgnoreWhy: string;
+begin
+  Result := EnsureSessionDetailed(Session, Launch, Workdir, User, IgnoreWhy);
 end;
 
 { Remove C0 control bytes that could break out of the bracketed paste (a raw

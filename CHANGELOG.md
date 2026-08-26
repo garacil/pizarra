@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.1.23 — Crash-safe startup and session preservation
+
+### Session lifecycle
+
+- Local hub and daemon watchdogs now treat an existing tmux session as final:
+  they never replace it, never issue its launch command again, and only refresh
+  ownership metadata. A missing session is created only when a reviewed,
+  non-empty launch command exists.
+- Failed creates retain the durable delivery and log a bounded diagnostic from
+  tmux. Missing work directories and manual/inject-only sessions are reported
+  accurately instead of producing false respawn success every watchdog tick.
+- Local delivery now uses the configured team work directory when it must
+  create a missing session.
+- `pizarra --host-session NAME` provides an opt-in visible-pane supervisor. The
+  Pizarra binary itself preserves an existing session or creates the missing
+  hub session exactly once; it has no replacement or destructive path.
+- The systemd deployment uses a dedicated tmux-server boundary with
+  `exit-empty off`, preventing a hub service restart or failed transactional
+  upgrade from collecting live agent sessions into the hub service cgroup.
+
+### Startup, configuration, and health
+
+- Hub and daemon listeners bind before watchdogs, dial threads, workflow
+  reconciliation, shared-file publication, or readiness output can run. A port
+  collision is now a read-only startup failure.
+- `tiza --health [--wait SECONDS]` validates authenticated typed version and
+  capability replies, credential binding, and exact suite-version agreement.
+  `pzweb --health` proves that its configured TCP listener is reachable.
+- Private configuration loading now requires the final mode-`0600` file to be
+  owned by the runtime uid both before and after its descriptor-pinned open.
+- First-run credential publication now uses a private, flock-protected recovery
+  journal. Interrupted client-first or hub-first publication resumes with the
+  original secret; a stale unlocked journal is recoverable, while an unrelated
+  existing identity is never overwritten or guessed.
+- Configure-time binary and data directories are compiled into runtime defaults
+  and verified during packaging, including non-default prefixes.
+
+### Installation and verification
+
+- `make install` is now transactional and accepts only artifacts certified by
+  `make test`. It stages and hashes the payload, snapshots prior files, state,
+  modes, ownership, and service state, migrates before startup, and commits its
+  manifest only after authenticated health succeeds.
+- Explicit `make adopt` performs the first manifest-backed cutover from a
+  stopped legacy deployment after matching an exact reviewed tmux inventory.
+  Rollback preserves the tmux boundary whenever any session exists.
+- Manifest-driven uninstall refuses modified payload and refuses to stop the
+  tmux boundary while managed sessions remain. `DESTDIR` installation is a
+  host-isolated packaging path with no service, state, or session effects.
+- New regression coverage exercises transactional installation, custom
+  prefixes, bind-before-ready behavior, crash-resumable first run, watchdog
+  handling of manual sessions, and a fully hermetic proof that host-session
+  launch is create-once and non-destructive.
+- README, CLI, architecture, quick-start, operations, and testing references now
+  document the same installer, health, recovery, and session-preservation
+  contracts in English.
+
 ## 1.1.22 — Pizarra 1.1 (first GitHub release)
 
 This is the first tagged public release of the `pizarra`, `tiza`, and `pzweb`

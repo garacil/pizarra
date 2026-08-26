@@ -1,5 +1,11 @@
 # pizarra
 
+[![Console, masterp, and s-masterp coordinating through Pizarra and Tiza in SuperTerm](screenshots/pizarra-superterm-three-pane-cover.gif)](screenshots/pizarra-superterm-three-pane-cover.gif)
+
+*A read-only SuperTerm replay of real Tiza records: console starts the route,
+s-masterp sends, masterp replies, and Pizarra preserves the durable round trip.
+Private runtime instructions are intentionally omitted.*
+
 **A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
 
 [![Release: 1.1.22](https://img.shields.io/badge/release-1.1.22-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.22)

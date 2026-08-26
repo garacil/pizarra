@@ -66,6 +66,12 @@ choose_port() {
 
 HUB_PORT=$(choose_port) || fail 'could not choose a hub port'
 install -d -m 0700 "$TEST_ROOT/store" "$TEST_ROOT/log" "$TEST_ROOT/tmux"
+cat >"$TEST_ROOT/tmux.conf" <<'EOF'
+# Make this disposable server independent of runner/user tmux defaults. Keeping
+# an empty server alive also mirrors the shipped pizarra-tmux.service boundary.
+set-option -g exit-empty off
+EOF
+TMUX_TMPDIR="$TEST_ROOT/tmux" tmux -f "$TEST_ROOT/tmux.conf" start-server
 cat >"$TEST_ROOT/pizarra.conf" <<EOF
 [server]
 listen = 127.0.0.1
@@ -84,7 +90,7 @@ name = managed
 speciality = Synthetic managed session
 secret = synthetic-managed-secret
 tmux_session = managed
-launch = exec sleep 30
+launch = exec /bin/sleep 120
 workdir = $TEST_ROOT
 
 [team:2]

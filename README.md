@@ -1,12 +1,13 @@
 # pizarra
 
-[![Watch the complete Pizarra, Tiza, and SuperTerm session](screenshots/pizarra-superterm-complete-video-cover.png)](https://github.com/garacil/pizarra/releases/download/v1.1.22/pizarra-superterm-complete-demo.mp4)
+[![Open the complete Pizarra, Tiza, and SuperTerm video player](screenshots/pizarra-superterm-complete-video-cover.png)](https://garacil.github.io/pizarra/video.html)
 
-[▶ Watch the complete original video (MP4, 3:08, 96 MB)](https://github.com/garacil/pizarra/releases/download/v1.1.22/pizarra-superterm-complete-demo.mp4)
+[▶ Open the video player](https://garacil.github.io/pizarra/video.html) · [Download the original MP4 (96 MB)](https://github.com/garacil/pizarra/releases/download/v1.1.22/pizarra-superterm-complete-demo.mp4)
 
 *Complete original 3:08 SuperTerm recording: console, masterp, and s-masterp
-exchange messages through Tiza and Pizarra. Click the poster to watch or
-download the full-quality H.264/AAC video.*
+exchange messages through Tiza and Pizarra. Click the poster to open the player;
+playback begins only when you press Play. The full-quality H.264/AAC download is
+also available.*
 
 **A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
 

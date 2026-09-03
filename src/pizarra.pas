@@ -2505,13 +2505,13 @@ var
 
   function SyncPath(const P: string; IsDir: Boolean; out Why: string): Boolean;
   var
-    H, Flags: Integer;
+    H: Integer;
   begin
     Result := False;
-    Flags := O_RDONLY;
     if IsDir then
-      Flags := Flags or O_DIRECTORY;
-    H := FpOpen(P, Flags);
+      H := PzOpenDirFd(P)
+    else
+      H := FpOpen(P, O_RDONLY);
     if H < 0 then
     begin
       Why := 'cannot open ' + P + ' for fsync: ' +
@@ -3726,10 +3726,10 @@ var
     if FpMkDir(P, &1777) <> 0 then
       if fpgeterrno <> ESysEEXIST then
         Exit;
-    OpenFlags := O_RDONLY or O_DIRECTORY or O_NOFOLLOW;
+    OpenFlags := O_NOFOLLOW;
     {$IFDEF LINUX}OpenFlags := OpenFlags or O_CLOEXEC;{$ENDIF}
     repeat
-      DirFd := FpOpen(P, OpenFlags);
+      DirFd := PzOpenDirFd(P, OpenFlags);
     until (DirFd >= 0) or (fpgeterrno <> ESysEINTR);
     if DirFd < 0 then
       Exit;
@@ -3778,10 +3778,10 @@ begin
     We never ForceDirectories or chmod this configured root. }
   if C.SharedDir = PathDelim then
     Exit;
-  ManualFlags := O_RDONLY or O_DIRECTORY or O_NOFOLLOW;
+  ManualFlags := O_NOFOLLOW;
   {$IFDEF LINUX}ManualFlags := ManualFlags or O_CLOEXEC;{$ENDIF}
   repeat
-    RootFd := FpOpen(C.SharedDir, ManualFlags);
+    RootFd := PzOpenDirFd(C.SharedDir, ManualFlags);
   until (RootFd >= 0) or (fpgeterrno <> ESysEINTR);
   if RootFd < 0 then
     Exit;
@@ -6325,8 +6325,7 @@ begin
   { With the file open, verify its resolved descriptor path is still within the
     resolved shared root. This closes the race between the earlier component
     walk and open in writable team directories. }
-  FdR := FpOpen(ExcludeTrailingPathDelimiter(C.SharedDir),
-                O_RDONLY or O_DIRECTORY);
+  FdR := PzOpenDirFd(ExcludeTrailingPathDelimiter(C.SharedDir));
   if FdR < 0 then
   begin
     FpClose(FdG);
@@ -8076,7 +8075,7 @@ var
     HostStartWhy, SelfExe: string;
   i: Integer;
   App: TPizarra;
-  MigrateOnly: Boolean;
+  MigrateOnly, HostCreated: Boolean;
 begin
   { treat all AnsiStrings as UTF-8 regardless of the ambient locale — under a
     non-UTF-8 LANG (systemd/tmux default LANG=C) fpjson's parser would otherwise
@@ -8187,14 +8186,21 @@ begin
     end;
     SelfExe := ExpandFileName(ParamStr(0));
     HostLaunch := 'exec ' + ShellQuote(SelfExe) + ' --config ' + ShellQuote(Path);
-    if not EnsureSessionDetailed(HostSession, HostLaunch,
-      ExtractFileDir(SelfExe), '', HostStartWhy) then
+    if not EnsureSessionReported(HostSession, HostLaunch,
+      ExtractFileDir(SelfExe), '', HostCreated, HostStartWhy) then
     begin
       Writeln(StdErr, 'pizarra: host session was not started: ', HostStartWhy);
       Halt(1);
     end;
-    Writeln('pizarra: host session ', HostSession,
-      ' exists; existing sessions are always preserved');
+    { Say which of the two things actually happened. One message for both was
+      a launcher that reported 'exists' about a session it had just created —
+      it reads as 'someone else is already running the hub'. }
+    if HostCreated then
+      Writeln('pizarra: host session ', HostSession,
+        ' created with the hub inside')
+    else
+      Writeln('pizarra: host session ', HostSession,
+        ' already exists; existing sessions are always preserved');
     Halt(0);
   end;
 

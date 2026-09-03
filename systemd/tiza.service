@@ -14,6 +14,9 @@ WorkingDirectory=/
 ExecStart=/usr/local/bin/tiza daemon --config /etc/pizarra/tiza.conf
 Restart=always
 RestartSec=3
+# A daemon restart must never propagate a stop signal to the tmux server or its
+# agent panes. The watchdog recreates only missing sessions on its next pass.
+KillMode=process
 
 # Run this service as the account that owns the configured tmux sessions. Root
 # matches the existing deployment. StateDirectory owns /var/lib/pizarra, so a

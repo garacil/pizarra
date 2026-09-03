@@ -4416,7 +4416,7 @@ const
       DeleteFile(TmpPath);
       Fail('cannot publish restored file ' + To_);
     end;
-    H := FpOpen(Parent, O_RDONLY or O_DIRECTORY);
+    H := PzOpenDirFd(Parent);
     if H < 0 then
       Fail('cannot open restore parent directory for fsync: ' + Parent);
     try

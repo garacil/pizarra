@@ -1273,7 +1273,7 @@ end;
 
 { Empty an already opened directory before removing it. Recursive deletion is
   available only through an explicit request. Never follow links: open each
-  level with O_NOFOLLOW+O_DIRECTORY and traverse through the stable descriptor,
+  level with PzOpenDirFd+O_NOFOLLOW and traverse through the stable descriptor,
   unlinking links themselves. A deliberate depth cap bounds destructive work. }
 function EmptyDirectory(const Path: string; Depth: Integer;
   out Reason: string): Boolean;
@@ -1294,7 +1294,7 @@ begin
     Reason := Format('the tree is deeper than %d levels', [MAX_DEPTH]);
     Exit;
   end;
-  Fd := FpOpen(Path, O_RDONLY or O_DIRECTORY or O_NOFOLLOW);
+  Fd := PzOpenDirFd(Path, O_NOFOLLOW);
   if Fd < 0 then
   begin
     Reason := 'could not open a directory inside it';
@@ -1385,9 +1385,9 @@ begin
   end;
 
   { Pin the directory and delete through its descriptor. O_NOFOLLOW rejects
-    links and O_DIRECTORY rejects non-directories; once open, the inode remains
+    links and PzOpenDirFd rejects non-directories; once open, the inode remains
     stable even if the external name changes. }
-  Fd := FpOpen(Base, O_RDONLY or O_DIRECTORY or O_NOFOLLOW);
+  Fd := PzOpenDirFd(Base, O_NOFOLLOW);
   if Fd < 0 then
   begin
     St := Default(Stat);
@@ -4556,11 +4556,11 @@ begin
         { CHECKING AND THEN OPENING BY NAME IS A RACE. Between an lstat that
           says "not a link" and traversal, anyone able to write in the 1777
           tree could replace the entry with a link and make the listing escape.
-          Open with O_NOFOLLOW+O_DIRECTORY, which FAILS for links and non-
+          Open with PzOpenDirFd+O_NOFOLLOW, which FAILS for links and non-
           directories, then traverse the open DESCRIPTOR through /proc/self/fd.
           The descriptor pins the inode, so changing its name later does not
           change what is read. }
-        FdD := FpOpen(AtS, O_RDONLY or O_DIRECTORY or O_NOFOLLOW);
+        FdD := PzOpenDirFd(AtS, O_NOFOLLOW);
         if FdD < 0 then
         begin
           { Obtain the exact diagnostic from a SEPARATE lstat. O_NOFOLLOW has

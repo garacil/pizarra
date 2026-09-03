@@ -42,6 +42,19 @@ function PzDefaultConfigPath(const BaseName: string): string;
 function PzFsync(Fd: Integer): Integer;
 function PzSyncDirectory(const Path: string; out Why: string): Boolean;
 
+{ Open Path and return a descriptor PROVEN to be a directory, or -1 with errno
+  set (ENOTDIR when the target is not one). ExtraFlags carries the caller's own
+  intent, e.g. O_NOFOLLOW or O_CLOEXEC.
+
+  O_DIRECTORY exists ONLY in FPC's Linux RTL (rtl/linux/ostypes.inc:263, 277,
+  289 - nothing under rtl/darwin or rtl/bsd defines it), and the macOS endpoint
+  compiles this very source during its own self-update, so naming the flag
+  unconditionally makes that build fail with "Identifier not found". Where the
+  flag is absent the proof is made on the OPEN DESCRIPTOR with fstat, which is
+  the same guarantee: the inode is already pinned, so nothing can swap it
+  between the answer and its use. }
+function PzOpenDirFd(const Path: string; ExtraFlags: LongInt = 0): Integer;
+
 { Open a credential-bearing INI for reading without following symbolic links.
   Every ancestor is checked before the open; group/other-writable ancestors are
   rejected except for a root-owned sticky directory such as /tmp. The final
@@ -748,12 +761,43 @@ begin
   Result := True;
 end;
 
+function PzOpenDirFd(const Path: string; ExtraFlags: LongInt): Integer;
+{$IFNDEF LINUX}
+var
+  St: TStat;
+  SaveErr: Integer;
+{$ENDIF}
+begin
+{$IFDEF LINUX}
+  Result := FpOpen(Path, O_RDONLY or O_DIRECTORY or ExtraFlags);
+{$ELSE}
+  Result := FpOpen(Path, O_RDONLY or ExtraFlags);
+  if Result < 0 then
+    Exit;
+  St := Default(TStat);
+  if FpFStat(Result, St) <> 0 then
+  begin
+    { keep fstat's own reason: FpClose would overwrite errno }
+    SaveErr := fpgeterrno;
+    FpClose(Result);
+    fpseterrno(SaveErr);
+    Exit(-1);
+  end;
+  if not fpS_ISDIR(St.st_mode) then
+  begin
+    FpClose(Result);
+    fpseterrno(ESysENOTDIR);
+    Exit(-1);
+  end;
+{$ENDIF}
+end;
+
 function PzSyncDirectory(const Path: string; out Why: string): Boolean;
 var
   H, ErrNo: Integer;
 begin
   Result := False;
-  H := FpOpen(Path, O_RDONLY or O_DIRECTORY);
+  H := PzOpenDirFd(Path);
   if H < 0 then
   begin
     ErrNo := fpgeterrno;

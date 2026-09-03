@@ -1,6 +1,37 @@
 # Changelog
 
+## 1.1.25 - Portable directory opens (macOS endpoint build fix)
+
+- `pzlayout.PzOpenDirFd` replaces every direct `O_DIRECTORY` open. The flag is
+  defined only in FPC's Linux RTL (`rtl/linux/ostypes.inc`), and the macOS
+  endpoint compiles the shipped source during its own self-update, so naming it
+  unconditionally aborted that build with `Identifier not found "O_DIRECTORY"`
+  and left the host on its previous release. Where the flag is absent the
+  primitive proves the type on the OPEN DESCRIPTOR with `fstat`, which pins the
+  inode exactly as the flag does, and reports `ENOTDIR` for a non-directory.
+
+## 1.1.24 - Truthful host-session report
+
+- `pizarra --host-session NAME` now says which of the two things happened:
+  `created with the hub inside`, or `already exists; existing sessions are
+  always preserved`. One unconditional message for both cases read as "another
+  supervisor is already running the hub".
+- `pztmux.EnsureSessionReported` reports creation from the status of our own
+  `new-session`, so a session another creator won the race for is not claimed;
+  it costs no extra tmux probe and `EnsureSessionDetailed` is unchanged for
+  every watchdog call site.
+
 ## 1.1.23 — Crash-safe startup and session preservation
+
+### Console and Telegram group messaging
+
+- `tiza chat` accepts `/msg @group` and bare `@group` as the same multi-line
+  composition flow used for a team; `.` sends and `/cancel` discards. The
+  existing `@group: text` shorthand remains an immediate group broadcast.
+- The Telegram bridge provides the same group composition flow with independent
+  per-user drafts, so two phone operators cannot mix or send each other's text.
+- Interactive `/help commands` now uses framed, alias-aware command tables and
+  makes the group forms explicit; redirected output remains script-friendly.
 
 ### Session lifecycle
 

@@ -83,6 +83,7 @@ type
     procedure SubmitLine;
     procedure ExecuteLine(const RawLine: string);
     procedure DoSendTo(const Dest, Text: string);
+    procedure StartCompose(const Dest: string);
     procedure RefreshTeams(Quiet: Boolean);
     function  KnownTeam(const Key: string): Boolean;
     function  KnownDest(const Key: string): Boolean;
@@ -770,16 +771,23 @@ begin
 end;
 
 { Valid send destination: a team, a group (bare name — the hub gives a team
-  the win on a clash), or the reserved broadcast name 'all'. }
+  the win on a clash), an explicit group (@name always means the group), or
+  the reserved broadcast name 'all'. }
 function TChat.KnownDest(const Key: string): Boolean;
 var
   i: Integer;
+  GroupName: string;
 begin
   Result := SameText(Key, 'all') or KnownTeam(Key);
   if Result then
     Exit;
+  GroupName := Key;
+  if (GroupName <> '') and (GroupName[1] = '@') then
+    Delete(GroupName, 1, 1);
+  if GroupName = '' then
+    Exit(False);
   for i := 0 to High(FGroupNames) do
-    if SameText(FGroupNames[i], Key) then
+    if SameText(FGroupNames[i], GroupName) then
       Exit(True);
 end;
 
@@ -808,6 +816,17 @@ begin
   end;
 end;
 
+{ Keep every multi-line destination on the same state machine.  In particular,
+  an explicit group must get the same exact '.' and /cancel semantics as a
+  direct team selected through /msg. }
+procedure TChat.StartCompose(const Dest: string);
+begin
+  FCompose := True;
+  FComposeTo := Dest;
+  FComposeLines.Clear;
+  FeedLine('(composing for ' + Dest + ': a "." line sends, /cancel aborts)');
+end;
+
 { Topic-based help presents the canonical English interface. Legacy aliases
   remain accepted by the parser for compatibility. }
 procedure TChat.CmdHelp(const Arg: string);
@@ -825,9 +844,11 @@ begin
     FeedBlock(Table(TCells.Create('talk', 'what it does'),
       TRows.Create(
         TCells.Create('team: text', 'send (all: text = everyone)'),
-        TCells.Create('group: text', 'the whole group (@group: forces group)'),
+        TCells.Create('group: text', 'send to a group (team wins a name clash)'),
+        TCells.Create('@group: text', 'send one line; @ always forces the group'),
+        TCells.Create('@group', 'multi-line group ("." sends, /cancel aborts)'),
         TCells.Create('/send', 'send, naming the destination'),
-        TCells.Create('/msg', 'multi-line ("." sends, /cancel aborts)'),
+        TCells.Create('/msg team|@group', 'multi-line ("." sends, /cancel aborts)'),
         TCells.Create('/file', 'send a file as the message body'),
         TCells.Create('/inbox', 'my unread messages'),
         TCells.Create('/log [n]', 'bus history'),
@@ -895,31 +916,72 @@ begin
   end
   else if (T = 'commands') or (T = 'comandos') then
   begin
-    FeedLine('commands:');
-    FeedLine('  /send team text             send one line');
-    FeedLine('  /msg team                   multi-line compose; "." sends; /cancel aborts');
-    FeedLine('  /file team path             send file contents');
-    FeedLine('  /teams                      team index with specialities');
-    FeedLine('  /task <subcommand>          see /help tasks');
-    FeedLine('  /workflow | /wf [name|<subcommand>]  see /help workflow');
-    FeedLine('  /inbox                      my unread messages (marks them read)');
-    FeedLine('  /log [n]                    last n events of the whole bus (30)');
-    FeedLine('  /full seq                   complete text of message #seq');
-    FeedLine('  /tree                       team hierarchy tree');
-    FeedLine('  /share team file [note]     shared-directory file exchange');
-    FeedLine('  /files [team]               list shared files');
-    FeedLine('  /team <subcommand>          add, remove, set, list, or show');
-    FeedLine('  /clear                      clear screen');
-    FeedLine('  /help [topic]               this help; /help index for topics');
-    FeedLine('  /quit                       exit the console (also Ctrl-D)');
-    FeedLine('shorthand: "team: text" sends; "all: text" broadcasts to every team');
+    { Keep the complete command index scannable.  Table renders a proper box
+      on a terminal but deliberately stays parser-friendly when redirected.
+      The destination column names the group form explicitly: it must not look
+      like /msg accepts only a numeric team id or a single team. }
+    FeedBlock(Frame('commands',
+      'English command | Spanish alias — both always work.'#10 +
+      'A destination may be a team name or ID; @group always addresses the group.',
+      TermWidth - 2));
+    FeedBlock(Table(TCells.Create('message command', 'use', 'what it does'),
+      TRows.Create(
+        TCells.Create('/send | /enviar', '<team|@group> text',
+          'send one line (all = every team)'),
+        TCells.Create('/msg | /mensaje', '<team|@group>',
+          'compose multiple lines; . sends, /cancel aborts'),
+        TCells.Create('@group', 'no colon',
+          'same multi-line group compose shortcut'),
+        TCells.Create('@group: text', 'with colon',
+          'send one line to that group immediately'),
+        TCells.Create('/file | /fichero', '<team|@group> path',
+          'send a file as the message body'),
+        TCells.Create('/inbox | /buzon', '',
+          'my unread messages (marks them read)'),
+        TCells.Create('/log | /registro', '[n]',
+          'last n events from the whole bus (30)'),
+        TCells.Create('/full | /completo', '<seq>',
+          'complete text of message #seq')),
+      TermWidth - 2));
+    FeedBlock(Table(TCells.Create('work and structure', 'use', 'what it does'),
+      TRows.Create(
+        TCells.Create('/teams | /equipos', '', 'team index with specialities'),
+        TCells.Create('/tree | /arbol', '', 'team hierarchy tree'),
+        TCells.Create('/task | /tarea', '<subcommand>', 'see /help tasks'),
+        TCells.Create('/workflow | /wf | /flujo', '[name|subcommand]',
+          'milestone plans; see /help workflow'),
+        TCells.Create('/team | /equipo', '<subcommand>',
+          'add, remove, set, list, or show teams'),
+        TCells.Create('/group | /grupo', '<subcommand>',
+          'manage persisted groups and their members'),
+        TCells.Create('/project | /proyecto', '<subcommand>',
+          'manage projects and their administrator'),
+        TCells.Create('/app | /aplicacion', '<subcommand>',
+          'manage applications and manuals')),
+      TermWidth - 2));
+    FeedBlock(Table(TCells.Create('console and files', 'use', 'what it does'),
+      TRows.Create(
+        TCells.Create('/share | /compartir', '<team|@group> file [note]',
+          'shared-directory file exchange'),
+        TCells.Create('/files | /ficheros', '[team]', 'list shared files'),
+        TCells.Create('/help | /ayuda', '[topic]',
+          'this help; /help index lists topics'),
+        TCells.Create('/clear | /limpiar', '', 'clear the screen'),
+        TCells.Create('/quit | /salir', '', 'exit the console (also Ctrl-D)')),
+      TermWidth - 2));
+    FeedBlock(Frame('shortcuts',
+      'team: text sends to a team; all: text broadcasts to every team.'#10 +
+      'group: text sends to a group when no team has that name; use @group to force it.',
+      TermWidth - 2));
   end
   else if (T = 'send') or (T = 'enviar') then
   begin
     FeedLine('sending messages:');
     FeedLine('  api: review the plan               -> one line to team api');
     FeedLine('  all: meeting in 5 minutes          -> broadcast to EVERY team');
-    FeedLine('  /msg api                           -> multi-line: type lines, "." sends');
+    FeedLine('  /msg api | /msg @group            -> multi-line: type lines, "." sends');
+    FeedLine('  @group                             -> same multi-line group compose');
+    FeedLine('  @group: one line                   -> immediate group send');
     FeedLine('  /file api /tmp/spec.txt            -> send a whole file');
     FeedLine('from any shell (as the human): tiza api "text"');
     FeedLine('  tiza all "text"        broadcast   |   tiza <team> --file f  (- = stdin)');
@@ -1061,7 +1123,7 @@ begin
     FeedLine('  Ctrl-U        delete the whole line     Ctrl-W   delete last word');
     FeedLine('  Ctrl-D        quit (empty line) / cancel compose');
     FeedLine('  Enter         send the line');
-    FeedLine('compose mode (/msg team): type lines freely — blank lines and');
+    FeedLine('compose mode (/msg team, /msg @group, or @group): type lines freely — blank lines and');
     FeedLine('  indentation are kept; a line with only "." sends; /cancel aborts');
     FeedLine('more: docs/cli.md (Human terminal console)');
   end
@@ -3140,13 +3202,9 @@ begin
     else if (Cmd = '/msg') or (Cmd = '/m') or (Cmd = '/mensaje') then
     begin
       if KnownDest(Rest) then
-      begin
-        FCompose := True;
-        FComposeTo := Rest;
-        FeedLine('(composing for ' + Rest + ': a "." line sends, /cancel aborts)');
-      end
+        StartCompose(Rest)
       else
-        FeedLine('usage: /msg team   (known team)');
+        FeedLine('usage: /msg team|@group   (known destination)');
     end
     else if (Cmd = '/file') or (Cmd = '/f') or (Cmd = '/fichero') then
       CmdFile(Rest)
@@ -3180,6 +3238,18 @@ begin
       CmdFiles(Rest)
     else
       FeedLine('unknown command (see /help)');
+    Exit;
+  end;
+
+  { Bare @group enters the same compose mode as /msg.  A colon remains the
+    unambiguous one-line shorthand, so existing '@group: text' input is kept
+    as an immediate send. }
+  if (Length(Line) > 1) and (Line[1] = '@') and (Pos(':', Line) = 0) then
+  begin
+    if KnownDest(Line) then
+      StartCompose(Line)
+    else
+      FeedLine('error: unknown group ''' + Line + '''');
     Exit;
   end;
 

@@ -614,7 +614,7 @@ begin
   Result := False;
   Why := '';
   Dir := ExtractFileDir(ExpandFileName(Path));
-  H := FpOpen(Dir, O_RDONLY or O_DIRECTORY);
+  H := PzOpenDirFd(Dir);
   if H < 0 then
   begin
     ErrNo := fpgeterrno;

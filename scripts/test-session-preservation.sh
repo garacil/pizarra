@@ -49,6 +49,8 @@ grep -q '^new-session -d -s pizarra-test ' "$CALLS" ||
 if grep -Eq '(^| )kill-(session|server|window|pane)( |$)' "$CALLS"; then
   fail 'launcher issued a destructive tmux operation'
 fi
+grep -q 'host session pizarra-test created with the hub inside' "$OUTPUT" ||
+  fail 'the create path did not report that it created the session'
 ok 'a missing hub session is created once by Pizarra itself'
 
 run_launcher >>"$OUTPUT" 2>&1 || fail 'existing host session was not accepted'
@@ -56,6 +58,10 @@ run_launcher >>"$OUTPUT" 2>&1 || fail 'existing host session was not accepted'
   fail 'existing session received a second launch command'
 [[ $(grep -c '^has-session ' "$CALLS") == 3 ]] ||
   fail 'unexpected probe sequence around create/existing checks'
+grep -q 'host session pizarra-test already exists; existing sessions are always preserved' "$OUTPUT" ||
+  fail 'the existing-session path did not report that it preserved the session'
+[[ $(grep -c 'created with the hub inside' "$OUTPUT") == 1 ]] ||
+  fail 'a session that was already there was reported as created'
 ok 'an existing session always wins and is never relaunched'
 
 printf 'all session-preservation tests passed\n'

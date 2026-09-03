@@ -50,6 +50,13 @@ function EnsureSession(const Session, Launch: string;
 function EnsureSessionDetailed(const Session, Launch, Workdir, User: string;
   out Why: string): Boolean;
 
+{ As EnsureSessionDetailed, and it also reports whether THIS call is the one
+  that created the session. Created is True only when our own new-session
+  succeeded: a session that was already there, or one another creator won the
+  race for, reports False. Costs no extra tmux probe. }
+function EnsureSessionReported(const Session, Launch, Workdir, User: string;
+  out Created: Boolean; out Why: string): Boolean;
+
 { Deliver FullText into the session (bracketed paste + Enter). }
 function DeliverTmux(const Session, FullText: string): Boolean;
 
@@ -297,27 +304,14 @@ begin
   Result := Q + StringReplace(S, Q, Q + '\' + Q + Q, [rfReplaceAll]) + Q;
 end;
 
-function DiagnosticLine(const S: string): string;
+function EnsureSessionReported(const Session, Launch, Workdir, User: string;
+  out Created: Boolean; out Why: string): Boolean;
 var
-  i: Integer;
-begin
-  Result := Trim(S);
-  for i := 1 to Length(Result) do
-    if Result[i] in [#0..#31] then
-      Result[i] := ' ';
-  while Pos('  ', Result) > 0 do
-    Result := StringReplace(Result, '  ', ' ', [rfReplaceAll]);
-  if Length(Result) > 512 then
-    Result := Copy(Result, 1, 509) + '...';
-end;
-
-function EnsureSessionDetailed(const Session, Launch, Workdir, User: string;
-  out Why: string): Boolean;
-var
-  Cmd, Outp: string;
+  Cmd: string;
   Status: Integer;
 begin
   Result := False;
+  Created := False;
   Why := '';
   if (Trim(Session) = '') or (Trim(Session) = '-') then
   begin
@@ -351,34 +345,45 @@ begin
       Cmd := 'cd ' + ShQuote(Workdir) + ' && exec ' + Launch;
     Cmd := 'su - ' + User + ' -c ' + ShQuote(Cmd);
     if Workdir <> '' then
-      Status := RunCapture('tmux',
-        ['new-session', '-d', '-s', Session, '-c', Workdir, Cmd], Outp)
+      Status := RunStatus('tmux',
+        ['new-session', '-d', '-s', Session, '-c', Workdir, Cmd])
     else
-      Status := RunCapture('tmux',
-        ['new-session', '-d', '-s', Session, Cmd], Outp);
+      Status := RunStatus('tmux',
+        ['new-session', '-d', '-s', Session, Cmd]);
   end
   else if Workdir <> '' then
-    Status := RunCapture('tmux',
-      ['new-session', '-d', '-s', Session, '-c', Workdir, Launch], Outp)
+    Status := RunStatus('tmux',
+      ['new-session', '-d', '-s', Session, '-c', Workdir, Launch])
   else
-    Status := RunCapture('tmux',
-      ['new-session', '-d', '-s', Session, Launch], Outp);
+    Status := RunStatus('tmux',
+      ['new-session', '-d', '-s', Session, Launch]);
 
   { Another creator may have won after our initial check. In that case the
     existing session is success even if our new-session command returned the
     duplicate-session error. It must never be removed to make our launch win. }
   Result := SessionExists(Session);
   if Result then
+  begin
+    { Only our own successful new-session proves WE created it; a non-zero
+      status with the session present means someone else won the race. }
+    Created := Status = 0;
     Exit;
-  Outp := DiagnosticLine(Outp);
+  end;
   if Status = 0 then
     Why := 'session disappeared immediately; the launch command exited'
-  else if Outp <> '' then
-    Why := Format('tmux new-session failed (exit %d): %s', [Status, Outp])
   else if Status < 0 then
     Why := 'could not execute tmux'
   else
     Why := Format('tmux new-session failed (exit %d)', [Status]);
+end;
+
+function EnsureSessionDetailed(const Session, Launch, Workdir, User: string;
+  out Why: string): Boolean;
+var
+  IgnoreCreated: Boolean;
+begin
+  Result := EnsureSessionReported(Session, Launch, Workdir, User,
+    IgnoreCreated, Why);
 end;
 
 function EnsureSession(const Session, Launch: string;

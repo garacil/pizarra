@@ -2004,7 +2004,7 @@ function TPzDb.BackupTo(const OutDir: string; out Err: string): Boolean;
     H, ErrNo: Integer;
   begin
     Result := False;
-    H := FpOpen(OutDir, O_RDONLY or O_DIRECTORY);
+    H := PzOpenDirFd(OutDir);
     if H < 0 then
     begin
       ErrNo := fpgeterrno;

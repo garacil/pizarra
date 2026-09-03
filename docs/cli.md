@@ -81,15 +81,30 @@ Sending:
 ```text
 builder: short message
 @release: message to the group
-/send builder short message
-/msg builder
+/msg @release
 first line
 second line
 .
+@release
+another multi-line message
+.
+/send builder short message
+/msg builder
+draft to discard
+/cancel
 /file builder /path/to/message.txt
 ```
 
-In compose mode, a line containing only `.` sends and `/cancel` aborts.
+`/msg team`, `/msg @group`, and a bare `@group` enter multi-line composition.
+A line containing only `.` sends; `/cancel` discards without sending.
+`team: text` is the fast shorthand. `@group: text` remains the one-line form
+and forces a group when a group and team share a name.
+
+In an interactive terminal, `/help commands` presents the command reference in
+framed tables. It shows the English command and Spanish alias together, and
+separates the three group-send forms: `/msg @group` and bare `@group` compose a
+multi-line message, while `@group: text` sends immediately. Redirected console
+output remains plain text for scripts and logs.
 
 Principal console commands:
 

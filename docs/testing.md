@@ -49,6 +49,7 @@ disposable temporary tree, below `/tmp` in the default environment:
 scripts/test-bootstrap-layout.sh
 scripts/test-private-config.sh
 scripts/test-group-onblock.sh
+scripts/test-chat-group-compose.sh
 scripts/test-pzshare-symlink.sh
 scripts/test-migrate-release-layout.sh
 scripts/test-retire-repo-runtime-conf.sh
@@ -101,6 +102,13 @@ The session-preservation harness is stricter and entirely hermetic: a fake
 session exactly once, performs only an existence probe on the second call, and
 has no destructive command path. It never connects to any tmux server.
 
+The chat-group-compose harness starts an isolated loopback hub with inbox-only
+members. It proves that `/msg @group` and a bare `@group` both use the existing
+multi-line state machine, preserve all lines until `.` sends, and that
+`/cancel` leaves no durable group message. It also checks that `/help commands`
+distinguishes group composition from the immediate `@group: text` shorthand.
+It never starts or contacts tmux.
+
 ## Isolated integration environment
 
 Use a temporary directory, loopback-only listeners, new disposable secrets,
@@ -140,6 +148,8 @@ test is complete.
 - `ack` advances only to an eligible sequence and rejects a value above it.
 - A group broadcast creates one durable entry per selected destination and
   reports partial delivery accurately.
+- In `tiza chat`, `/msg @group` and bare `@group` compose until `.`; `/cancel`
+  must not create a group message, while `@group: text` remains immediate.
 - Restarting the hub preserves journal order and cursor state.
 
 ### Terminal delivery

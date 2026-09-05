@@ -274,12 +274,30 @@ ln -s -- "$VALID_CONF" "$TEST_ROOT/final-link.conf"
 expect_rejected "$TEST_ROOT/final-link.conf" 'symbolic link' \
   'symbolic-link final component'
 
+# A TRUSTED ancestor link is resolved, not refused: the platform's own layout
+# may be built from links (on macOS /etc and /var are links into /private), and
+# every rule is applied to the resolved location instead.
 mkdir -m 0700 "$TEST_ROOT/real-parent"
 cp -- "$VALID_CONF" "$TEST_ROOT/real-parent/ancestor.conf"
 chmod 0600 "$TEST_ROOT/real-parent/ancestor.conf"
 ln -s -- "$TEST_ROOT/real-parent" "$TEST_ROOT/linked-parent"
-expect_rejected "$TEST_ROOT/linked-parent/ancestor.conf" 'symbolic link' \
-  'symbolic-link ancestor'
+if ! "$HARNESS_BIN" load "$TEST_ROOT/linked-parent/ancestor.conf" \
+     >"$TEST_ROOT/linked-parent.out" 2>&1; then
+  printf '%s\n' "$(cat "$TEST_ROOT/linked-parent.out")" >&2
+  fail 'a credential behind a trusted ancestor link was rejected'
+fi
+ok 'a credential behind a trusted ancestor link is accepted'
+
+# An ancestor link owned by another user is still refused, by uid. Needs root
+# to create it, so it is skipped for an unprivileged run.
+if [[ $(id -u) -eq 0 ]] && id nobody >/dev/null 2>&1; then
+  ln -s -- "$TEST_ROOT/real-parent" "$TEST_ROOT/foreign-parent"
+  chown -h nobody "$TEST_ROOT/foreign-parent"
+  expect_rejected "$TEST_ROOT/foreign-parent/ancestor.conf" \
+    'neither root nor the runtime uid' 'ancestor link owned by another user'
+else
+  printf 'skip: foreign-owned ancestor link needs root and a nobody account\n'
+fi
 
 cp -- "$VALID_CONF" "$TEST_ROOT/permissive.conf"
 chmod 0644 "$TEST_ROOT/permissive.conf"

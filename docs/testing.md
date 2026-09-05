@@ -48,6 +48,7 @@ disposable temporary tree, below `/tmp` in the default environment:
 ```sh
 scripts/test-bootstrap-layout.sh
 scripts/test-private-config.sh
+scripts/test-trusted-path-resolution.sh
 scripts/test-group-onblock.sh
 scripts/test-chat-group-compose.sh
 scripts/test-pzshare-symlink.sh
@@ -58,6 +59,14 @@ scripts/test-pzweb-readiness.sh
 scripts/test-session-preservation.sh
 scripts/test-watchdog-session.sh
 ```
+
+The trusted-path harness proves the credential rules against a tree shaped like
+macOS: a directory reached through an ancestor symbolic link. It asserts that
+such a credential loads (failing later at the transport, never at the
+credential check), that a credential which is itself a link is refused, that an
+ancestor link owned by another user is refused by uid, and that a
+group/other-writable ancestor is still refused and named by its RESOLVED path.
+The uid case is skipped when the suite does not run as root.
 
 The bootstrap harness compiles the real Pascal layout implementation and checks
 mode `0711` configuration, mode `0700` state/release/log directories, matching

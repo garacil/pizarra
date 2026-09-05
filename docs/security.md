@@ -88,12 +88,21 @@ Authentication without confidential transport is not sufficient protection.
 
 All typed hub, client, daemon, and web loaders parse a selected
 credential-bearing INI from one descriptor held for the complete read. The
-final file must be regular with mode exactly `0600`; symbolic links in any path
-component and group/other-writable ancestors are rejected, except for a
-root-owned sticky directory such as `/tmp`. Comparing the pre-open path metadata
-with the opened descriptor and then parsing only that descriptor prevents a
-pathname replacement from redirecting the read. Quoted INI values are stripped
-consistently across loaders.
+final file must be regular with mode exactly `0600`, and group/other-writable
+ancestors are rejected, except for a root-owned sticky directory such as
+`/tmp`. Comparing the pre-open path metadata with the opened descriptor and then
+parsing only that descriptor prevents a pathname replacement from redirecting
+the read. Quoted INI values are stripped consistently across loaders.
+
+Ancestor symbolic links are resolved before validation, and only when the link
+is owned by `root` or the runtime uid; a link owned by another user, or a chain
+longer than 32, is refused. The final component is never followed, so a
+credential file that is a symbolic link is rejected. The threat this addresses
+is redirection by an attacker, and resolving does not weaken it: to redirect a
+resolved path an attacker needs write access to a directory that the
+group/other-writable rule already refuses. Runtime state directories are
+validated the same way, which is what allows a canonical `/var/lib/pizarra`
+on systems where `/var` is itself a link.
 
 ## Web safeguards
 

@@ -65,11 +65,24 @@ lock, so a dead initializer cannot permanently block startup.
 
 Every selected credential-bearing INI is opened once through a descriptor that
 is kept for the complete parse. The final file must be a regular mode-`0600`
-file owned by the runtime uid, no path component may be a symbolic link, and
-group/other-writable ancestors are rejected except for a root-owned sticky
-directory such as `/tmp`. Parsing remains pinned to the opened inode if its
-pathname is replaced, and quoted values have the same stripping semantics in
-every typed loader.
+file owned by the runtime uid, and group/other-writable ancestors are rejected
+except for a root-owned sticky directory such as `/tmp`. Parsing remains pinned
+to the opened inode if its pathname is replaced, and quoted values have the same
+stripping semantics in every typed loader.
+
+Ancestor symbolic links are resolved before those rules are applied, and every
+requirement is then enforced on the resolved location. A link is followed only
+when it is owned by `root` or by the runtime uid; one owned by anybody else is
+refused by name, as is a chain deeper than 32 links. **The final component is
+never followed**: a credential that is itself a symbolic link is refused.
+
+This matters on any platform whose own layout is built from links. On macOS
+`/etc` and `/var` are symbolic links into `/private`, so a literal
+"no symbolic link in any path component" rule made every canonical path
+illegal there and an endpoint could only start with a hand-written `--config`.
+Resolving first keeps the protection — redirecting a resolved path still
+requires write access to a directory the ancestor rules already refuse — while
+allowing the platform's own layout.
 
 For `tiza`, `[pizarra] self` is the identity. A normal `--from` argument is
 ignored. Use one configuration per identity, especially on a multi-team host.
@@ -332,6 +345,48 @@ must remain only on the control host.
 
 `auto_enter` accepts the terminal's highlighted default. Enable it only for a
 trusted session where that behavior is explicitly intended.
+
+Every team whose delivery route is this daemon needs a block here. A team the hub
+knows with a `host` pointing at this machine but with no matching
+`[session:TEAM]` is refused at the application level: the daemon replies
+`session not declared: TEAM`, the hub reads only the `ok` field of that reply and
+records an ordinary queueing event, and the messages accumulate in order for as
+long as the omission lasts. The transport succeeded, so no push failure is
+logged; the hub log shows only `queued seq=N for TEAM`, which is what an offline
+host looks like too. Meanwhile `tiza fleet` keeps reporting the host `ONLINE`,
+because reachability is a property of the daemon, not of the missing block. The
+distinguishing symptom is a delivery high-water mark that never leaves zero.
+Prove a newly registered team with one real message rather than assuming that
+registering it on the hub completed the deployment.
+
+`launch` runs with the environment of the tmux server, which is not a login
+session. When the daemon is the first thing on the host to touch tmux it forks
+that server itself, and a pane created afterwards inherits an empty `HOME`. A
+`bash -lc` login shell then expands `$HOME` to nothing while building `PATH`, so
+a bare command name installed under a home directory is not found and the
+session exits at once; the watchdog reports `session disappeared immediately;
+the launch command exited` on every pass. For an agent installed below a home
+directory, the difference is the whole failure:
+
+```text
+HOME unset           -> PATH=/.local/bin:...               -> command not found
+HOME=/home/builder   -> PATH=/home/builder/.local/bin:...  -> found
+```
+
+Give `launch` an absolute binary path and set `HOME` explicitly. On a host that
+carries more than one team, also export that team's own credential: it is what
+the daemon reads back to tag the session with `@pizarra_conf`, so a bare `tiza`
+in that pane keeps the intended identity instead of inheriting the file-level
+`[pizarra] self` of the host.
+
+```ini
+launch = bash -lc 'export HOME=/home/builder; export TIZA_CONF=/etc/pizarra/agents/builder.conf; exec /home/builder/.local/bin/start-ai-agent'
+```
+
+Point `launch` at a stable symbolic link rather than a versioned binary, so the
+agent's own self-update cannot invalidate the line. An empty `launch`
+deliberately describes a manually managed session: it is delivered to and tagged
+while it exists, and is never recreated when it is absent.
 
 ## Web: `pzweb.conf`
 

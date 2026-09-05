@@ -59,6 +59,23 @@ function PzOpenDirFd(const Path: string; ExtraFlags: LongInt = 0): Integer;
   Every ancestor is checked before the open; group/other-writable ancestors are
   rejected except for a root-owned sticky directory such as /tmp. The final
   file must be regular and mode 0600 exactly. The caller owns Handle. }
+{ Resolve the symbolic links in every ANCESTOR of Path and return the canonical
+  location, refusing any link that is not trusted (it must be owned by root or
+  by the runtime uid; the directory holding it is separately required to be
+  non-group/other-writable by the callers below).
+
+  The FINAL component is never followed: a credential file, or a runtime
+  directory, must be the real object and not a link to one.
+
+  This exists because "no symbolic link anywhere in the path" cannot be
+  satisfied on macOS at all: /etc and /var are themselves symbolic links into
+  /private, so the literal rule outlawed every canonical path on that platform
+  and a Mac endpoint could only run with a hand-written --config. Enforcing
+  ownership and mode on the RESOLVED location gives the same protection - an
+  attacker-controlled link cannot redirect us, because redirecting requires
+  write access to a directory the walk already refuses. }
+function PzResolveTrustedPath(const Path: string; out Canon, Why: string): Boolean;
+
 function PzOpenPrivateConfig(const Path: string; out Handle: Integer;
   out ResolvedPath, Why: string): Boolean;
 
@@ -128,10 +145,102 @@ begin
   Result := (Pos('/./', Wrapped) > 0) or (Pos('/../', Wrapped) > 0);
 end;
 
+function PzResolveTrustedPath(const Path: string; out Canon, Why: string): Boolean;
+const
+  MAX_LINKS = 32;
+var
+  Rest, Part, Target: string;
+  Head: string;
+  St: TStat;
+  Links, P: Integer;
+begin
+  Result := False;
+  Canon := '';
+  Why := '';
+  Rest := ExpandFileName(Trim(Path));
+  if (Rest = '') or (Rest[1] <> PathDelim) then
+  begin
+    Why := 'cannot normalize path ' + Path;
+    Exit;
+  end;
+  Delete(Rest, 1, 1);            { the leading separator is carried by Canon }
+  Links := 0;
+  while Rest <> '' do
+  begin
+    P := Pos(PathDelim, Rest);
+    if P = 0 then
+    begin
+      Part := Rest;
+      Rest := '';
+    end
+    else
+    begin
+      Part := Copy(Rest, 1, P - 1);
+      Delete(Rest, 1, P);
+    end;
+    if Part = '' then
+      Continue;                  { collapse repeated separators }
+    Head := Canon + PathDelim + Part;
+    St := Default(TStat);
+    if FpLStat(Head, St) <> 0 then
+    begin
+      { A component that does not exist cannot be a link. Hand the literal
+        remainder back so the caller reports its own, more specific error. }
+      Canon := Head;
+      if Rest <> '' then
+        Canon := Canon + PathDelim + Rest;
+      Exit(True);
+    end;
+    if not fpS_ISLNK(St.st_mode) then
+    begin
+      Canon := Head;
+      Continue;
+    end;
+    if Rest = '' then
+    begin
+      { The final component is returned unresolved on purpose: the caller
+        decides whether a link is acceptable there, and for credentials and
+        runtime directories it is not. }
+      Canon := Head;
+      Exit(True);
+    end;
+    if (St.st_uid <> 0) and (St.st_uid <> FpGeteuid) then
+    begin
+      Why := Head + ' is a symbolic link owned by uid ' + IntToStr(St.st_uid) +
+        ', which is neither root nor the runtime uid';
+      Exit;
+    end;
+    Inc(Links);
+    if Links > MAX_LINKS then
+    begin
+      Why := 'too many symbolic links while resolving ' + Path;
+      Exit;
+    end;
+    Target := fpReadLink(Head);
+    if Target = '' then
+    begin
+      Why := 'cannot read symbolic link ' + Head + ': ' + ErrText(fpgeterrno);
+      Exit;
+    end;
+    if Target[1] = PathDelim then
+    begin
+      Canon := '';
+      Delete(Target, 1, 1);
+    end;
+    if Rest = '' then
+      Rest := Target
+    else
+      Rest := Target + PathDelim + Rest;
+  end;
+  if Canon = '' then
+    Canon := PathDelim;
+  Result := True;
+end;
+
 function PzOpenPrivateConfig(const Path: string; out Handle: Integer;
   out ResolvedPath, Why: string): Boolean;
 var
-  Full, Acc, Part: string;
+  Full, Acc, Part, Canon: string;
   StartAt, StopAt, Flags, ErrNo: Integer;
   BeforeOpen, AfterOpen: TStat;
   IsFinal, UnsafeWritable, SafeSticky: Boolean;
@@ -157,6 +266,13 @@ begin
     Why := 'cannot normalize configuration path ' + Path;
     Exit;
   end;
+  { Follow trusted ancestor links FIRST, then enforce everything on the
+    resolved location. Refusing a literal link outlawed /etc and /var on macOS,
+    where both are links into /private. The final component stays unresolved,
+    so a credential that is itself a link is still refused below. }
+  if not PzResolveTrustedPath(Full, Canon, Why) then
+    Exit;
+  Full := Canon;
 
   Acc := '';
   StartAt := 2;
@@ -253,7 +369,7 @@ function EnsureDir(const Path: string; CreateMode: Cardinal;
   PrivateContents, AllowCreate, AllowRootForeignOwner: Boolean;
   out Why: string): Boolean;
 var
-  Clean: string;
+  Clean, Resolved: string;
   St: TStat;
   ErrNo: Integer;
   UnsafeMask: Cardinal;
@@ -270,6 +386,12 @@ begin
     Why := 'refusing unsafe runtime directory path "' + Path + '"';
     Exit;
   end;
+  { Same rule as the credential walk: trusted ancestor links are resolved (a
+    state directory under /var is normal, and on macOS /var is a link), while
+    the directory itself must be real, which the check below still enforces. }
+  if not PzResolveTrustedPath(Clean, Resolved, Why) then
+    Exit;
+  Clean := Resolved;
   St := Default(TStat);
   if FpLStat(Clean, St) = 0 then
   begin

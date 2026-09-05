@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.1.26 - Trusted ancestor links (macOS endpoint runtime fix)
+
+- `pzlayout.PzResolveTrustedPath` resolves ancestor symbolic links before the
+  credential and runtime-directory rules are applied, and every rule is then
+  enforced on the resolved location. A link is followed only when it is owned by
+  `root` or the runtime uid; one owned by anybody else is refused by uid, as is
+  a chain deeper than 32. The final component is never followed, so a credential
+  that is itself a symbolic link is still refused.
+- Why: `/etc` and `/var` are themselves symbolic links into `/private` on macOS,
+  so the previous literal rule - no symbolic link in any path component - made
+  every canonical path illegal on that platform. An endpoint there loaded no
+  configuration, exited, was restarted by its supervisor and looped every few
+  seconds; only a hand-written `--config` pointing at `/private/...` avoided it.
+- The protection is unchanged: redirecting a resolved path still requires write
+  access to a directory that the group/other-writable rule refuses, and refusals
+  now name the resolved path, which is the one that actually failed.
+- New harness `scripts/test-trusted-path-resolution.sh` covers all four cases.
+- Endpoint documentation for two silent misconfigurations. A team whose host has
+  no `[session:TEAM]` block is refused by the daemon, recorded by the hub as an
+  ordinary queueing event and never reported, so its deliveries accumulate while
+  `tiza fleet` still reports the host `ONLINE` and only a delivery high-water
+  mark stuck at zero shows it. And a `launch` command needs an absolute binary
+  path plus an explicit `HOME`, because a pane the daemon creates inherits an
+  empty one and a login shell then builds `PATH` without the agent's own
+  directory, so the session exits immediately on every watchdog pass.
+
 ## 1.1.25 - Portable directory opens (macOS endpoint build fix)
 
 - `pzlayout.PzOpenDirFd` replaces every direct `O_DIRECTORY` open. The flag is

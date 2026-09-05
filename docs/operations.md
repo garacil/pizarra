@@ -357,6 +357,10 @@ Operational warning signs include:
 - a persistent version mismatch;
 - a dial team remaining offline;
 - queued messages that do not drain after an endpoint returns;
+- a team that never receives anything while `tiza fleet` reports its host
+  `ONLINE`, which usually means the endpoint has no `[session:TEAM]` block for
+  it: the daemon refuses each delivery, the hub records it as an ordinary
+  queueing event, and only the delivery high-water mark stuck at zero shows it;
 - repeated structural `gap` events for live observers;
 - an active workflow step with no linked task;
 - repeated stalled-step or blocked-activity alarms;

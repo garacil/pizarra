@@ -4,7 +4,7 @@
 
 [▶ Open the video player](https://garacil.github.io/pizarra/video.html) · [Download the original MP4 (96 MB)](https://github.com/garacil/pizarra/releases/download/v1.1.22/pizarra-superterm-complete-demo.mp4)
 
-*Complete original 3:08 SuperTerm recording: console, masterp, and s-masterp
+*Complete original 3:08 SuperTerm recording: a human console and two agent teams
 exchange messages through Tiza and Pizarra. Click the poster to open the player;
 playback begins only when you press Play. The full-quality H.264/AAC download is
 also available.*

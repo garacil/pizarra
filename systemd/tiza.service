@@ -2,6 +2,13 @@
 Description=tiza team-host delivery daemon
 After=network-online.target
 Wants=network-online.target
+# Restart=always would loop forever on a config the daemon refuses at startup
+# (a wrong-owner /etc/pizarra/tiza.conf restored by a `cp -p` rollback did ~196
+# restarts at RestartSec=5 on one host). Stop after 5 failed starts in 60 s so a
+# bad config surfaces as a failed unit instead of a tight loop; a transient
+# failure that recovers within a couple of restarts is unaffected.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

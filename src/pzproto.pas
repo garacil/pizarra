@@ -21,6 +21,24 @@ const
     themselves only when one reader accepts a message that the other truncates. }
   MAX_LINE_BYTES = 1048576;   { 1 MB: no legitimate message is bigger }
 
+  { tiza attach (1.2.0): a raw terminal into a team's tmux session, relayed by
+    the hub. After the JSON handshake the connection carries terminal bytes
+    verbatim - the third stream upgrade after watch and dial. }
+  CMD_ATTACH      = 'attach';       { client -> hub; and hub -> push daemon }
+  CMD_ATTACH_OPEN = 'attach_open';  { hub -> dial daemon, as a control line:
+                                      dial back a dedicated connection }
+  CMD_ATTACH_JOIN = 'attach_join';  { dial daemon -> hub: that connection,
+                                      paired to the waiting client by token }
+
+  { tiza shell (1.1.33): an interactive LOGIN SHELL on a team's HOST, relayed
+    by the hub over the same three routes. Same stream upgrade as attach, but
+    the far side is a shell rather than a tmux client, so there is no
+    read-only mode and the pty is sized to the viewer, not to a session.
+    Named 'shell', never 'console': `tiza console <text>` already means SEND
+    to the operator identity, the fleet's documented reply idiom. }
+  CMD_SHELL      = 'shell';        { client -> hub; and hub -> push daemon }
+  CMD_SHELL_OPEN = 'shell_open';   { hub -> dial daemon, as a control line }
+  CMD_SHELL_JOIN = 'shell_join';   { dial daemon -> hub: that connection }
   CMD_SEND    = 'send';
   CMD_INBOX   = 'inbox';
   CMD_ACK     = 'ack';       { advance the sender's inbox cursor to 'upto' }
@@ -100,6 +118,65 @@ procedure WriteLine(AStream: TStream; const S: string);
 { JSON helpers. ParseObj returns nil when the text is not a JSON object. }
 function ParseObj(const S: string): TJSONObject; overload;
 function ParseObj(const S: string; out Reason: string): TJSONObject; overload;
+
+{ tiza attach handshake (1.2.0). The request names the team and asks for
+  write; the hub decides. Term is the viewer's TERM, exported to the tmux
+  client on the far side. }
+function BuildAttach(const Secret, From, Team: string; Write: Boolean;
+  const Term: string): string;
+{ The hub's acceptance: the mode actually granted and the session's real
+  size, so the viewer can warn when its own terminal is smaller. After this
+  line the connection is raw bytes. For a push or dial target this line is
+  emitted by the DAEMON and relayed verbatim through the hub, so the viewer
+  reads one shape regardless of route. }
+function ReplyAttachOk(const Team: string; Write: Boolean;
+  Cols, Rows: Integer): string;
+
+{ Hub -> dial daemon, pushed down the reverse channel as a control line (no
+  secret: the channel is already the authenticated dial connection). It asks
+  the daemon to dial BACK a dedicated connection for this attach, tagged with
+  Token so the hub can pair that connection to the waiting viewer. }
+function BuildAttachOpen(const Token, From, Team: string; Write: Boolean;
+  const Term: string): string;
+{ Dial daemon -> hub on that dedicated connection. Token pairs it to the
+  waiting viewer; the bus secret and from re-authenticate the daemon on a
+  fresh connection. After this line the daemon writes ReplyAttachOk and the
+  connection is raw terminal bytes. }
+function BuildAttachJoin(const Secret, From, Token: string): string;
+
+{ tiza shell handshake (1.1.33). No write flag: a shell is always interactive,
+  so authorization is all-or-nothing. Cols/Rows are the VIEWER's terminal size
+  - unlike attach, the pty belongs to this one caller, so it is created at the
+  caller's size (fixed at creation; the raw stream carries no resize channel). }
+function BuildShell(const Secret, From, Team, Term: string;
+  Cols, Rows: Integer): string;
+{ The endpoint's acceptance. User is the account the login shell actually runs
+  as, so the viewer can state it and the operator knows who he is before
+  running sudo su. Emitted by the DAEMON on push/dial and relayed verbatim, so
+  the viewer reads one shape regardless of route. }
+function ReplyShellOk(const Team, User, Host: string;
+  Cols, Rows: Integer): string;
+{ Hub -> dial daemon down the reverse channel (no secret: that channel is
+  already authenticated). Token pairs the dial-back to the waiting viewer.
+  From is the CALLING team: without it the host can log that a shell was
+  opened but not by whom, which on a fleet where many identities may connect
+  is an audit trail only the hub holds. Reported by a host owner in 1.1.33. }
+function BuildShellOpen(const Token, From, Team, Term: string;
+  Cols, Rows: Integer): string;
+{ Dial daemon -> hub on that dedicated connection. }
+function BuildShellJoin(const Secret, From, Token: string): string;
+
+{ A viewer-supplied window size on its way to openpty's winsize. Anything
+  outside 1..1000 is not a terminal size; fall back to 80x24 rather than
+  refuse, exactly as SafeTerm falls back for an exotic TERM. Shared by the hub
+  (local route) and the daemon (push and dial routes). }
+procedure SafeWinSize(InCols, InRows: Integer; out Cols, Rows: Word);
+
+{ TERM reaches a child's environment. Keep it to what a terminfo name looks
+  like; anything else becomes the safe default rather than an error, because a
+  viewer with an exotic TERM should still get a terminal. Shared by the hub
+  (local route) and the daemon (push and dial routes). }
+function SafeTerm(const S: string): string;
 
 { Message <-> JSON (journal lines and inbox entries share one shape). }
 function MsgToJson(const M: TPzMsg): string;
@@ -643,6 +720,177 @@ begin
   finally
     O.Free;
   end;
+end;
+
+function BuildAttach(const Secret, From, Team: string; Write: Boolean;
+  const Term: string): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('secret', Secret);
+    O.Add('cmd', CMD_ATTACH);
+    O.Add('from', From);
+    O.Add('team', Team);
+    O.Add('write', Write);
+    O.Add('term', Term);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+function ReplyAttachOk(const Team: string; Write: Boolean;
+  Cols, Rows: Integer): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('ok', True);
+    O.Add('team', Team);
+    O.Add('write', Write);
+    O.Add('cols', Cols);
+    O.Add('rows', Rows);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+function BuildAttachOpen(const Token, From, Team: string; Write: Boolean;
+  const Term: string): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('cmd', CMD_ATTACH_OPEN);
+    O.Add('token', Token);
+    O.Add('from', From);
+    O.Add('team', Team);
+    O.Add('write', Write);
+    O.Add('term', Term);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+function BuildAttachJoin(const Secret, From, Token: string): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('secret', Secret);
+    O.Add('cmd', CMD_ATTACH_JOIN);
+    O.Add('from', From);
+    O.Add('token', Token);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+function BuildShell(const Secret, From, Team, Term: string;
+  Cols, Rows: Integer): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('secret', Secret);
+    O.Add('cmd', CMD_SHELL);
+    O.Add('from', From);
+    O.Add('team', Team);
+    O.Add('term', Term);
+    O.Add('cols', Cols);
+    O.Add('rows', Rows);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+function ReplyShellOk(const Team, User, Host: string;
+  Cols, Rows: Integer): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('ok', True);
+    O.Add('team', Team);
+    O.Add('user', User);
+    O.Add('host', Host);
+    O.Add('cols', Cols);
+    O.Add('rows', Rows);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+function BuildShellOpen(const Token, From, Team, Term: string;
+  Cols, Rows: Integer): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('cmd', CMD_SHELL_OPEN);
+    O.Add('token', Token);
+    O.Add('from', From);
+    O.Add('team', Team);
+    O.Add('term', Term);
+    O.Add('cols', Cols);
+    O.Add('rows', Rows);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+function BuildShellJoin(const Secret, From, Token: string): string;
+var
+  O: TJSONObject;
+begin
+  O := TJSONObject.Create;
+  try
+    O.Add('secret', Secret);
+    O.Add('cmd', CMD_SHELL_JOIN);
+    O.Add('from', From);
+    O.Add('token', Token);
+    Result := O.AsJSON;
+  finally
+    O.Free;
+  end;
+end;
+
+procedure SafeWinSize(InCols, InRows: Integer; out Cols, Rows: Word);
+begin
+  if (InCols < 1) or (InCols > 1000) then
+    Cols := 80
+  else
+    Cols := Word(InCols);
+  if (InRows < 1) or (InRows > 1000) then
+    Rows := 24
+  else
+    Rows := Word(InRows);
+end;
+
+function SafeTerm(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := Trim(S);
+  if (Result = '') or (Length(Result) > 64) then
+    Exit('xterm-256color');
+  for i := 1 to Length(Result) do
+    if not (Result[i] in ['A'..'Z', 'a'..'z', '0'..'9', '.', '_', '+', '-']) then
+      Exit('xterm-256color');
 end;
 
 function BuildAck(const Secret, From: string; UpTo: Int64): string;

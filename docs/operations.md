@@ -326,6 +326,17 @@ terminal sessions it manages. A hub that does not manage local sessions should
 use a dedicated, unprivileged service account with access only to its config,
 store, log, optional shared directory, and network sockets.
 
+No supervisor operation ends a session. Every shipped unit that can hold a
+tmux server in its control group (`pizarra.service`, `pizarra-tmux.service`,
+`tiza.service`) carries `KillMode=process`, so `systemctl stop` or `restart` of
+any of them signals only that unit's own main process. The hub and the daemon
+have no command that kills, replaces, renames or relaunches a session, and no
+configuration key enables one: a watchdog creates a session only when it is
+absent, and an existing session always wins, whatever its launch command or
+work directory say now. A hub that stops leaves every session open; a hub that
+starts uses the sessions it finds. `scripts/test-no-destructive-tmux.sh` fails
+the suite if such a path is ever added.
+
 Start order is normally:
 
 1. hub;

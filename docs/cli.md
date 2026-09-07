@@ -65,6 +65,58 @@ Message files are capped at 256 KiB. The native line frame is capped at 1 MiB.
 When a destination is temporarily unavailable, a successful send reports
 `queued`; retry is automatic.
 
+## Attach: a raw terminal into a team
+
+```sh
+tiza attach <team>            # read-only: watch the team's live tmux pane
+tiza attach <team> --write    # drive it too (console credential only)
+```
+
+`tiza attach` relays a raw terminal into a team's tmux session through the hub,
+whatever route reaches that team: a local team on the hub host, a push team on
+its daemon, or a dial-in team behind NAT. The client only needs to reach the
+hub, so it runs from any host. Detach with `Ctrl-]` then `q`; the session is
+never resized to fit the viewer.
+
+It is read-only by default and off entirely unless the owner opted in: a local
+team needs `[server] attach_local = on` on the hub, a remote team needs
+`[session:TEAM] attach = on` on its host. By default write requires the console credential and a delegated team is
+read-only; where the operator sets `[server] attach_trust` (or `= all`), the
+named teams attach and write with their OWN credential, so you drive any team
+from any team without a shared console secret. At most 8 attaches may be open on a
+hub and 2 per team.
+
+## Shell: a login shell on a host
+
+```sh
+tiza shell <team>             # a shell on the MACHINE where <team> runs
+```
+
+`tiza shell` opens an interactive login shell on the host where a team runs -
+the machine, not the team's tmux session. Two teams on one host are two names
+for the same shell, and a host with no declared session at all can still be
+reached, which is the point: the dial-in endpoints have no inbound route, so
+the shell rides the reverse channel they already hold open to the hub.
+
+The shell always opens as an ordinary configured account, never root. Become
+root inside it with `sudo su`, which leaves the escalation in that host's own
+sudo trail. Leave with `exit` or Ctrl-D; `Ctrl-]` then `q` is an emergency
+escape for a wedged shell, and Ctrl-b is an ordinary keystroke here, so tmux
+works normally inside.
+
+It is off everywhere by default and needs BOTH ends to opt in, independently of
+attach: the hub needs `[server] shell_local = on` plus `[server] shell_user` for
+its own machine, or `[server] shell_trust` naming who may reach other hosts; the
+target host needs `[daemon] shell = on` plus `[daemon] shell_user` in its
+`tiza.conf`. The host's decision is final - the hub cannot override a machine
+that has the shell off. Enabling attach never grants a shell, and vice versa.
+At most 4 shells may be open on a hub and 2 per target host.
+
+Two limits worth knowing. The far terminal is sized once, when the shell opens,
+and does not follow a later resize: run `stty rows R cols C` inside if you
+resize the window. And a job started in the shell dies when you disconnect -
+use `nohup`, `setsid` or `systemd-run` for anything that must outlive it.
+
 ## Human terminal console
 
 ```sh

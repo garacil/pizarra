@@ -160,16 +160,15 @@ begin
     Result := '> ';
 end;
 
-const
-  TIOCGWINSZ_REQ = $5413;   { Linux TIOCGWINSZ, per FPC rtl-console crt.pp }
-type
-  TWinSz = record ws_row, ws_col, ws_xpixel, ws_ypixel: Word; end;
-
-{ terminal width in columns; 80 if it cannot be queried }
+{ terminal width in columns; 80 if it cannot be queried.
+  TIOCGWINSZ and TWinSize come from termio, which carries each platform's own
+  request number (Linux $5413, Darwin $40087468). A hardcoded Linux value
+  used to live here, so on the macOS endpoint the ioctl failed silently and
+  the console always fell back to 80 columns. }
 function TermWidth: Integer;
-var ws: TWinSz;
+var ws: TWinSize;
 begin
-  if fpIOCtl(1, TIOCGWINSZ_REQ, @ws) >= 0 then
+  if fpIOCtl(1, TIOCGWINSZ, @ws) >= 0 then
     Result := ws.ws_col
   else
     Result := 0;

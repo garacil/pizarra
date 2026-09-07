@@ -55,9 +55,13 @@ grep -Fq ";update_path = $BINDIR/tiza" \
 grep -Fq "ExecStart=$BINDIR/pizarra" \
   "$DEST_ROOT$UNITDIR/pizarra.service" ||
   fail 'hub unit did not receive configured BINDIR'
-strings "$REPO_ROOT/pzweb" | grep -Fq "$DATADIR/web/apps" ||
+# grep without -q, output discarded: under `set -o pipefail`, `grep -q` exits on
+# the first match and closes the pipe, so `strings` on a large binary can die
+# with SIGPIPE and the pipeline reports failure even though the match was found.
+# Draining all of `strings` makes the check deterministic.
+strings "$REPO_ROOT/pzweb" | grep -F "$DATADIR/web/apps" >/dev/null ||
   fail 'pzweb binary does not contain its configured asset default'
-strings "$REPO_ROOT/tiza" | grep -Fq "$BINDIR/tiza" ||
+strings "$REPO_ROOT/tiza" | grep -F "$BINDIR/tiza" >/dev/null ||
   fail 'tiza binary does not contain its configured update default'
 ok 'configured paths reach binaries, examples, units, and staged payload'
 

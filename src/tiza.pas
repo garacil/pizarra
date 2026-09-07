@@ -20,7 +20,8 @@ uses
   SyncObjs, fpjson,
   base64, process, ctypes, sqlite3dyn,
   pzproto, pzconfig, pztmux, pznet, pzshare, pzmanual, pzchat, pzver,
-  pzupdate, pzbox, pzsha256, termio, pzansi, pzlayout;
+  pzupdate, pzbox, pzsha256, termio, pzansi, pzlayout, pzattach, pzpty,
+  pzshell;
 
 procedure Fail(const Msg: string);
 begin
@@ -31,6 +32,18 @@ end;
 
 { True if Flag appears as a standalone token in P. Command-scoped flags are
   matched only in the right command, never inside a message body. }
+{ The first positional at or after index From that is not a --flag, or ''.
+  `tiza attach --write team` and `tiza attach team --write` both name team. }
+function FirstNonFlag(P: TStringList; From: Integer): string;
+var
+  k: Integer;
+begin
+  Result := '';
+  for k := From to P.Count - 1 do
+    if Copy(P[k], 1, 2) <> '--' then
+      Exit(P[k]);
+end;
+
 function HasFlag(P: TStringList; const Flag: string): Boolean;
 var i: Integer;
 begin
@@ -137,6 +150,10 @@ begin
   Writeln('  tiza <group> <message...>          bare group name works too (team wins clash)');
   Writeln('  tiza daemon                        run the team-host delivery daemon');
   Writeln('  tiza chat [--plain]                the human console (live feed + commands)');
+  Writeln('  tiza attach <team> [--write]       raw terminal into a team''s tmux session');
+  Writeln('                                     (read-only by default; detach: Ctrl-] then q)');
+  Writeln('  tiza shell <team>                  login shell on the HOST where <team> runs');
+  Writeln('                                     (the machine, not its session; exit / Ctrl-D)');
   Writeln('  options: --config PATH   (identity is the config self=; --from is ignored)');
   Halt(0);
 end;
@@ -294,6 +311,38 @@ type
     constructor Create(AOwner: TTizaDaemon);
   end;
 
+  { DIAL-route attach: when the hub pushes an attach_open control line down the
+    reverse channel, the daemon cannot be reached inbound, so it dials the hub
+    BACK on a dedicated connection (tagged with Token so the hub pairs it to the
+    waiting viewer) and serves the attach over that connection. One short-lived
+    thread per attach, so the dial receive loop keeps flowing deliveries. }
+  TAttachDialThread = class(TThread)
+  private
+    FOwner: TTizaDaemon;
+    FToken, FTeam, FTerm, FCaller: string;
+    FWrite: Boolean;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AOwner: TTizaDaemon; const AToken, ACaller, ATeam,
+      ATerm: string; AWrite: Boolean);
+  end;
+
+  { The same dial-back, for a login shell on THIS host rather than an attach
+    into one of its sessions. Carries the viewer's window size instead of a
+    write flag: a shell is always interactive and is sized to its one caller. }
+  TShellDialThread = class(TThread)
+  private
+    FOwner: TTizaDaemon;
+    FToken, FTeam, FTerm, FCaller: string;
+    FCols, FRows: Integer;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AOwner: TTizaDaemon; const AToken, ACaller, ATeam,
+      ATerm: string; ACols, ARows: Integer);
+  end;
+
   { Samples the pane of each activity=on session ~1/s, diffs it against the last
     frame, and reports moving/quiet TRANSITIONS to the hub. Read-only: it only
     captures panes, never injects. Opt-in per session (default off), so a daemon
@@ -332,6 +381,22 @@ type
       False when the session is unavailable. Shared by push (HandleConn) and the
       dial channel (TDialThread). }
     function DeliverOne(const Team: string; Seq: Int64; const Text: string): Boolean;
+    { Serve a `tiza attach` on Stream: spawn `tmux attach-session` for Team's
+      local session under a pty and relay it over Stream, exactly as the hub
+      does for its own local teams. Used for the PUSH route (the hub connects to
+      this daemon, HandleConn) and the DIAL route (this daemon dials the hub back
+      on a fresh connection, TAttachDialThread). Emits ReplyAttachOk (or ReplyErr)
+      as the first line; the hub relays it verbatim to the viewer. }
+    procedure ServeAttach(Stream: TSocketStream; const Caller, Team, Term: string;
+      Write: Boolean);
+    { Serve a `tiza shell` on Stream: spawn a LOGIN SHELL for [daemon]
+      shell_user under a pty and relay it. Needs NO [session:] block and never
+      consults the session table - a shell belongs to this HOST, not to a team,
+      so a pure infrastructure box with no declared session can still be
+      administered. Team is an audit label only. Emits ReplyShellOk (or
+      ReplyErr) as the first line; the hub relays it verbatim. }
+    procedure ServeShell(Stream: TSocketStream; const Caller, Team, Term: string;
+      Cols, Rows: Integer);
   public
     procedure RetrySeqState;
     constructor Create(const ACfg: TTizaDaemonConfig; const StatePath: string);
@@ -863,6 +928,34 @@ begin
             False);
         end;
       end
+      else if Cmd = CMD_ATTACH then
+      begin
+        { PUSH route: the hub reached this daemon inbound and asks for a raw
+          terminal into one of its sessions. Only the hub may: the bus secret
+          (checked above) is on every host, so require the hub's peer address
+          too, as update does. ServeAttach then owns the connection - it emits
+          ReplyAttachOk/ReplyErr and relays, so this handler writes nothing
+          more. }
+        if not FromHub(Stream, FCfg.HubHost) then
+          WriteLine(Stream, ReplyErr('attach: only the hub may open a ' +
+            'terminal on this host'))
+        else
+          ServeAttach(Stream, Obj.Get('from', ''), Obj.Get('team', ''), Obj.Get('term', ''),
+            Obj.Get('write', False));
+      end
+      else if Cmd = CMD_SHELL then
+      begin
+        { PUSH route for a login shell on this machine. Same reasoning as
+          attach, and it matters more here: the bus secret is on every host,
+          so the hub's peer address is required too. ServeShell then owns the
+          connection. }
+        if not FromHub(Stream, FCfg.HubHost) then
+          WriteLine(Stream, ReplyErr('shell: only the hub may open a ' +
+            'shell on this host'))
+        else
+          ServeShell(Stream, Obj.Get('from', ''), Obj.Get('team', ''), Obj.Get('term', ''),
+            Obj.Get('cols', 0), Obj.Get('rows', 0));
+      end
       else
         WriteLine(Stream, ReplyErr('unknown cmd'));
     finally
@@ -977,6 +1070,216 @@ begin
   end;
 end;
 
+{ The requesting team, for the host's OWN audit line. Two host owners reported
+  in 1.1.33 that the daemon logged only the local account, so with a permissive
+  trust list every caller looked identical from the machine being entered and
+  the trail existed only on the hub. Never empty: an unnamed caller is logged
+  as such rather than silently omitted. }
+function CallerLabel(const Caller: string): string;
+begin
+  Result := Trim(Caller);
+  if Result = '' then
+    Result := 'unnamed';
+end;
+
+procedure TTizaDaemon.ServeAttach(Stream: TSocketStream; const Caller, Team, Term: string;
+  Write: Boolean);
+var
+  Sess: TPzSession;
+  Exe, Mode, PathV, HomeV, TmpV: string;
+  Cols, Rows: Integer;
+  Child: TPtyChild;
+  Err: string;
+  Argv, Env: array of string;
+  FromViewer, FromPty: Int64;
+begin
+  Child.Pid := 0;
+  Child.Master := -1;
+  if not FindSession(FCfg, Team, Sess) then
+  begin
+    WriteLine(Stream, ReplyErr('attach: no session declared for ' + Team));
+    Exit;
+  end;
+  { Per-session consent: the host owner opts a pane in with [session:TEAM]
+    attach = on, exactly as with activity sampling and auto_enter. Off by
+    default; the hub cannot override it. }
+  if not Sess.Attach then
+  begin
+    WriteLine(Stream, ReplyErr('attach: not enabled for ' + Team +
+      ' on its host (set [session:' + Team + '] attach = on, or [daemon] ' +
+      'attach = on for every session on the host, in tiza.conf)'));
+    Exit;
+  end;
+  if (Trim(Sess.TmuxSession) = '') or (Sess.TmuxSession = '-') then
+  begin
+    WriteLine(Stream, ReplyErr('attach: ' + Team + ' has no terminal session'));
+    Exit;
+  end;
+  if not SessionExists(Sess.TmuxSession) then
+  begin
+    WriteLine(Stream, ReplyErr(Format('attach: session %s of %s is not running',
+      [Sess.TmuxSession, Team])));
+    Exit;
+  end;
+  Exe := TmuxPath;
+  if Exe = '' then
+  begin
+    WriteLine(Stream, ReplyErr('attach: tmux binary not found on the team host'));
+    Exit;
+  end;
+  { The pty is sized to the SESSION; -r/ignore-size means a viewer of any size
+    cannot resize it. }
+  if not SessionSize(Sess.TmuxSession, Cols, Rows) then
+  begin
+    Cols := 80;
+    Rows := 24;
+  end;
+  if Write then
+  begin
+    SetLength(Argv, 7);
+    Argv[0] := 'tmux'; Argv[1] := '-u'; Argv[2] := 'attach-session';
+    Argv[3] := '-f'; Argv[4] := 'ignore-size'; Argv[5] := '-t';
+    Argv[6] := Sess.TmuxSession;
+    Mode := 'write';
+  end
+  else
+  begin
+    { -r is read-only + ignore-size: only detach/switch keys have any effect. }
+    SetLength(Argv, 6);
+    Argv[0] := 'tmux'; Argv[1] := '-u'; Argv[2] := 'attach-session';
+    Argv[3] := '-r'; Argv[4] := '-t'; Argv[5] := Sess.TmuxSession;
+    Mode := 'read-only';
+  end;
+  { The environment mirrors the daemon's OWN, minus TMUX. pztmux reaches the
+    agent's tmux server through the daemon's environment when it delivers, so
+    the attach client must use the same to reach the same server. TMUX must be
+    absent or a tmux client SWITCHES the daemon's own client instead of
+    attaching (pzpty rule 3). }
+  PathV := GetEnvironmentVariable('PATH');
+  if PathV = '' then
+    PathV := '/usr/local/bin:/usr/bin:/bin';
+  HomeV := GetEnvironmentVariable('HOME');
+  if HomeV = '' then
+    HomeV := '/root';
+  TmpV := GetEnvironmentVariable('TMUX_TMPDIR');
+  SetLength(Env, 4);
+  Env[0] := 'PATH=' + PathV;
+  Env[1] := 'HOME=' + HomeV;
+  Env[2] := 'TERM=' + SafeTerm(Term);
+  Env[3] := 'LANG=C.UTF-8';
+  if TmpV <> '' then
+  begin
+    SetLength(Env, 5);
+    Env[4] := 'TMUX_TMPDIR=' + TmpV;
+  end;
+  if not PtySpawn(Exe, Argv, Env, Cols, Rows, Child, Err) then
+  begin
+    WriteLine(Stream, ReplyErr('attach: ' + Err));
+    Exit;
+  end;
+  try
+    { The hub relays this line verbatim to the viewer, so the viewer reads the
+      same ReplyAttachOk whether the target was local, push or dial. }
+    WriteLine(Stream, ReplyAttachOk(Team, Write, Cols, Rows));
+    Writeln(Format('tiza: attach opened by %s -> %s (%s, %dx%d, tmux pid %d)',
+      [CallerLabel(Caller), Team, Mode, Cols, Rows, Child.Pid]));
+    Flush(Output);
+    FromViewer := 0;
+    FromPty := 0;
+    try
+      { Read-only drops the viewer's bytes here too; -r already ignores them,
+        but dropping at the relay is the belt-and-braces the hub relies on. }
+      PtyPump(Stream.Handle, Child.Master, not Write, @ShutdownRequested,
+        FromViewer, FromPty);
+    except
+      on E: Exception do
+      begin
+        Writeln('tiza: attach relay error for ', Team, ': ', E.Message);
+        Flush(Output);
+      end;
+    end;
+    Writeln(Format('tiza: attach closed by %s -> %s (%s, %d bytes from viewer, ' +
+      '%d bytes from terminal)',
+      [CallerLabel(Caller), Team, Mode, FromViewer, FromPty]));
+    Flush(Output);
+  finally
+    PtyClose(Child, 2000);
+  end;
+end;
+
+procedure TTizaDaemon.ServeShell(Stream: TSocketStream; const Caller, Team, Term: string;
+  Cols, Rows: Integer);
+var
+  Exe, Why, Err, HostLabel: string;
+  Argv, Env: TStringArray;
+  Child: TPtyChild;
+  C, R: Word;
+  FromClient, FromPty: Int64;
+begin
+  Child.Pid := 0;
+  Child.Master := -1;
+  { HOST CONSENT. Off by default, and the hub cannot override it: the bus
+    secret and the hub's address get a request this far, but whether this
+    machine offers a shell at all is the host owner's own decision. }
+  if not FCfg.Shell then
+  begin
+    WriteLine(Stream, ReplyErr('shell: not enabled on this host (set ' +
+      '[daemon] shell = on and [daemon] shell_user = <account> in tiza.conf)'));
+    Exit;
+  end;
+  if FCfg.ShellUser = '' then
+  begin
+    WriteLine(Stream, ReplyErr('shell: [daemon] shell is on but [daemon] ' +
+      'shell_user is not set in tiza.conf; refusing rather than opening a ' +
+      'root shell'));
+    Exit;
+  end;
+  SafeWinSize(Cols, Rows, C, R);
+  { The same plan the hub uses for its own host, so every route spawns the
+    same thing and refuses in the same words. }
+  if not ShellSpawnPlan(FCfg.ShellUser, Term, Exe, Argv, Env, Why) then
+  begin
+    WriteLine(Stream, ReplyErr(Why));
+    Exit;
+  end;
+  if not PtySpawn(Exe, Argv, Env, C, R, Child, Err) then
+  begin
+    WriteLine(Stream, ReplyErr('shell: ' + Err));
+    Exit;
+  end;
+  try
+    HostLabel := FCfg.SelfId;
+    if HostLabel = '' then
+      HostLabel := GetHostName;
+    { The hub relays this line verbatim, so the client reads the same shape
+      whether the target was local, push or dial. }
+    WriteLine(Stream, ReplyShellOk(Team, FCfg.ShellUser, HostLabel, C, R));
+    { The hub logs who and where; this end logs as WHOM, which is the half the
+      hub cannot know. Together they meet the host's own sudo trail. }
+    Writeln(Format('tiza: shell opened by %s -> %s (%s@%s, %dx%d, pid %d)',
+      [CallerLabel(Caller), Team, FCfg.ShellUser, HostLabel, C, R, Child.Pid]));
+    Flush(Output);
+    FromClient := 0;
+    FromPty := 0;
+    try
+      PtyPump(Stream.Handle, Child.Master, False, @ShutdownRequested,
+        FromClient, FromPty);
+    except
+      on E: Exception do
+      begin
+        Writeln('tiza: shell relay error for ', Team, ': ', E.Message);
+        Flush(Output);
+      end;
+    end;
+    Writeln(Format('tiza: shell closed by %s -> %s (%s, %d bytes from client, ' +
+      '%d bytes from shell)',
+      [CallerLabel(Caller), Team, FCfg.ShellUser, FromClient, FromPty]));
+    Flush(Output);
+  finally
+    PtyClose(Child, 3000);
+  end;
+end;
+
 { ---------- dial-in (reverse delivery channel) ---------- }
 
 constructor TDialThread.Create(AOwner: TTizaDaemon);
@@ -1079,6 +1382,28 @@ begin
                       if (HV <> '') and FOwner.FCfg.AutoUpdate and
                          VerNewer(HV, PizarraVersion) then
                         TriggerSelfUpdate(FOwner.FCfg, HV, False, True);
+                    end
+                    else if Cmd = CMD_ATTACH_OPEN then
+                    begin
+                      { A viewer on the hub asked to attach to a session on THIS
+                        dial host. Ack this control line at once (ok=false so the
+                        hub skips its delivered mark) to keep the delivery loop
+                        flowing, then dial the hub back on a dedicated connection
+                        to serve the attach off this thread. }
+                      WriteLine(Sock, BuildDeliverAck('', 0, False));
+                      TAttachDialThread.Create(FOwner, Obj.Get('token', ''),
+                        Obj.Get('from', ''), Obj.Get('team', ''),
+                        Obj.Get('term', ''), Obj.Get('write', False));
+                    end
+                    else if Cmd = CMD_SHELL_OPEN then
+                    begin
+                      { The same, for a login shell on THIS host. This is the
+                        only route to a machine with no inbound path at all. }
+                      WriteLine(Sock, BuildDeliverAck('', 0, False));
+                      TShellDialThread.Create(FOwner, Obj.Get('token', ''),
+                        Obj.Get('from', ''), Obj.Get('team', ''),
+                        Obj.Get('term', ''), Obj.Get('cols', 0),
+                        Obj.Get('rows', 0));
                     end;
                     { anything else: ignore — the traffic holds NAT open }
                   finally
@@ -1112,6 +1437,87 @@ begin
       Sleep(200);
       Inc(i);
     end;
+  end;
+end;
+
+constructor TAttachDialThread.Create(AOwner: TTizaDaemon;
+  const AToken, ACaller, ATeam, ATerm: string; AWrite: Boolean);
+begin
+  FOwner := AOwner;
+  FToken := AToken;
+  FCaller := ACaller;
+  FTeam := ATeam;
+  FTerm := ATerm;
+  FWrite := AWrite;
+  FreeOnTerminate := True;
+  inherited Create(False);
+end;
+
+procedure TAttachDialThread.Execute;
+var
+  Sock: TInetSocket;
+begin
+  Sock := nil;
+  try
+    try
+      Sock := TInetSocket.Create(FOwner.FCfg.HubHost, FOwner.FCfg.HubPort, 5000);
+      WriteLine(Sock, BuildAttachJoin(FOwner.FCfg.HubSecret, FOwner.FCfg.SelfId,
+        FToken));
+      { The hub pairs this connection to the waiting viewer by token; from here
+        ServeAttach owns it. If the pairing has expired the hub closes the
+        connection and the relay ends at once. }
+      FOwner.ServeAttach(Sock, FCaller, FTeam, FTerm, FWrite);
+    except
+      on E: Exception do
+      begin
+        Writeln('tiza daemon: attach dial-back failed for ', FTeam, ': ',
+          E.Message);
+        Flush(Output);
+      end;
+    end;
+  finally
+    FreeAndNil(Sock);
+  end;
+end;
+
+constructor TShellDialThread.Create(AOwner: TTizaDaemon;
+  const AToken, ACaller, ATeam, ATerm: string; ACols, ARows: Integer);
+begin
+  FOwner := AOwner;
+  FToken := AToken;
+  FCaller := ACaller;
+  FTeam := ATeam;
+  FTerm := ATerm;
+  FCols := ACols;
+  FRows := ARows;
+  FreeOnTerminate := True;
+  inherited Create(False);
+end;
+
+procedure TShellDialThread.Execute;
+var
+  Sock: TInetSocket;
+begin
+  Sock := nil;
+  try
+    try
+      Sock := TInetSocket.Create(FOwner.FCfg.HubHost, FOwner.FCfg.HubPort, 5000);
+      WriteLine(Sock, BuildShellJoin(FOwner.FCfg.HubSecret, FOwner.FCfg.SelfId,
+        FToken));
+      { The hub pairs this connection to the waiting client by token; from here
+        ServeShell owns it. If the pairing has expired the hub closes the
+        connection and the relay ends at once. }
+      FOwner.ServeShell(Sock, FCaller, FTeam, FTerm, FCols, FRows);
+    except
+      on E: Exception do
+      begin
+        Writeln('tiza daemon: shell dial-back failed for ', FTeam, ': ',
+          E.Message);
+        Flush(Output);
+      end;
+    end;
+  finally
+    FreeAndNil(Sock);
   end;
 end;
 
@@ -5038,6 +5444,41 @@ begin
             'self= in the config (' + Path + ') --');
       RunChat(Cfg, HasFlag(Positionals, '--plain'));
       Exit;
+    end;
+    { tiza attach <team> [--write]: a raw terminal into that team's tmux
+      session, relayed by the hub. Needs an identity like every command that
+      talks to the hub; the hub decides who may look and who may type. }
+    if SameText(Positionals[0], 'attach') then
+    begin
+      if Path = '' then
+        Fail('no config found (looked for tiza.conf; use --config)');
+      try
+        Cfg := LoadTizaConfig(Path);
+      except
+        on E: Exception do Fail(E.Message);
+      end;
+      Dest := FirstNonFlag(Positionals, 1);
+      if Dest = '' then
+        Fail('usage: tiza attach <team> [--write]   (detach: Ctrl-] then q)');
+      Halt(RunAttach(Cfg, Dest, HasFlag(Positionals, '--write')));
+    end;
+    { tiza shell <team>: a login shell on the HOST where that team runs - the
+      machine, not the team's session. Same identity rule as every command that
+      talks to the hub; the hub and then that host decide who may open one. }
+    if SameText(Positionals[0], 'shell') then
+    begin
+      if Path = '' then
+        Fail('no config found (looked for tiza.conf; use --config)');
+      try
+        Cfg := LoadTizaConfig(Path);
+      except
+        on E: Exception do Fail(E.Message);
+      end;
+      Dest := FirstNonFlag(Positionals, 1);
+      if Dest = '' then
+        Fail('usage: tiza shell <team>   (a shell on the HOST where <team> ' +
+          'runs; leave with exit or Ctrl-D)');
+      Halt(RunShell(Cfg, Dest));
     end;
     { Answer help here without configuration; it is the only operation that
       needs no caller identity. }

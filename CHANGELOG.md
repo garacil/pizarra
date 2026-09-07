@@ -1,5 +1,179 @@
 # Changelog
 
+## 1.1.34 - The audit trail names who opened the shell
+
+- A host could see THAT a shell or attach was opened on it, but not BY WHOM.
+  The daemon logged only the target team and the local account, so on a hub
+  with a permissive trust list every caller looked identical from the machine
+  being entered, and the only usable trail lived on the hub - a different
+  machine, under a different owner. Both endpoints now log the calling team:
+  `shell opened by <team> -> ...` and `attach opened by <team> -> ...`.
+- Two distinct causes, and the second was the worse one. On the push route the
+  hub already sent the caller in the handshake and the daemon simply ignored
+  it. On the dial route the control line carried no caller field at all, so the
+  daemon could not have logged it, AND the hub's own dial line named the daemon
+  that dialled back instead of the team that asked - recording the target as
+  its own caller. `shell_open` and `attach_open` now carry `from`, and the
+  rendezvous record keeps the caller separately from the dialling daemon.
+- Reported independently by two host owners after 1.1.33, from their own logs.
+  Neither could answer "who just opened a root-capable shell on my machine",
+  which is the question the feature has to be able to answer.
+
+## 1.1.33 - The internal shell: administer any host from any team
+
+- New `tiza shell <team>`: an interactive login shell on the MACHINE where a
+  team runs, relayed by the hub over the same three routes as attach. The point
+  is the dial-in endpoints, which have no inbound route at all, so the shell
+  rides the reverse channel they already hold open. A host with no declared tmux session can be reached
+  too: a shell belongs to the machine, not to a session.
+- The verb is `shell`, not `console`, and deliberately so: `tiza console "..."`
+  already means SEND to the operator identity, the documented way a team
+  replies, so a verb of that name would shadow it for every team. `attach` and `shell` were also added to the reserved verb list,
+  which had been missing `attach` since 1.1.28.
+- It opens as an ordinary configured account, never root. `sudo su` inside is
+  how the operator escalates, which keeps that step in the host's own sudo
+  trail. `[daemon] shell = on` with no `[daemon] shell_user`, or one naming
+  `root`, is refused rather than guessed.
+- BOTH ends must opt in, with their own keys, independent of attach: the hub's
+  `[server] shell_local` + `shell_user` + `shell_trust`, and the target host's
+  `[daemon] shell` + `shell_user`. The host's decision is final - the hub can
+  never override a machine that has the shell off. Enabling attach does not
+  grant a shell and vice versa; a harness proves both directions.
+- Unlike attach, the pty is sized to the VIEWER (a shell has one caller and no
+  session to disturb), there is no read-only mode (a shell you cannot type into
+  is useless, not a lesser grant), and Ctrl-b is an ordinary byte so tmux works
+  inside. Leave with `exit`/Ctrl-D; `Ctrl-] q` is the emergency escape.
+- Bounds are its own: 4 per hub, 2 per target HOST, so open attaches can never
+  make the fleet unadministrable. Both ends log every open and close - the hub
+  records who, where and which route, the daemon records as whom. Session
+  CONTENT is deliberately not recorded: a sudo password would land in a
+  replicated, fleet-readable store. The host's sudo and audit trail is where a
+  transcript belongs.
+- Nothing here creates, kills or renames a tmux session; the shell is a private
+  pty child and `scripts/test-no-destructive-tmux.sh` stays green.
+- Deployment: autoupdate ships the binary only, and both new keys default off,
+  so an updated endpoint gets the capability inert until its `tiza.conf` is
+  edited and the unit restarted. No systemd unit change is needed.
+
+## 1.1.32 - Crash-loop guard for a wrong-owner config
+
+- A `/etc/pizarra/tiza.conf` owned by a non-root uid is correctly refused, but on
+  a `Restart=always` unit it looped ~196 times at RestartSec=5 on one host, and a
+  `cp -p` rollback (what tiza's own updater uses for binary backups) restores such
+  a wrong-owner file. Two guards:
+  - `systemd/tiza.service` (and `pizarra.service`, `pzweb.service`) now carry
+    `StartLimitIntervalSec=60` + `StartLimitBurst=5`: a config the process refuses
+    at startup surfaces as a FAILED unit after 5 tries, not an endless loop; a
+    transient failure that recovers in a couple of restarts is unaffected.
+  - the credential-ownership error now prints the exact remedy, e.g.
+    `... is owned by uid 1000 - fix: chown 0:0 /etc/pizarra/tiza.conf`.
+- The unit change reaches a host only through `make install`/a fresh deploy
+  (autoupdate replaces the binary, not the unit); the error-message change ships
+  with the binary. Reported by an endpoint agent from measured host state.
+
+## 1.1.31 - Attach detach with Ctrl-b d; honest version and docs
+
+- `tiza attach` also detaches with **Ctrl-b d** (tmux's own prefix + detach),
+  in read-only and write alike. It is intercepted client-side, so it is not
+  forwarded (no switch-client into other sessions), and it is typeable on every
+  keyboard layout - unlike Ctrl-] (AltGr gymnastics on e.g. a Spanish layout),
+  which still works too. The banner names both.
+- Fixed a misleading error: the client said `this hub does not support attach
+  (needs 1.2.0)` when a hub replied `unknown cmd`. Attach shipped in 1.1.28, not
+  1.2.0; it now reads `needs 1.1.28 or newer`.
+- The daemon's "attach not enabled" refusal now names both keys
+  (`[session:TEAM] attach` and the host-wide `[daemon] attach`), and the tiza
+  app doc documents `tiza attach`, both keys, `attach_local` and `attach_trust`,
+  which were undocumented in the operational manual.
+- Hardened the `/proc/<pid>/environ` read in `scripts/pzpty-test.pas`: it read
+  empty during the fork->execve window, so the whole read retries now, not just
+  the open.
+
+## 1.1.30 - Attach trust: any team may drive any team
+
+- `[server] attach_trust` names the identities that may `tiza attach` AND write
+  ANY team - a comma/space list, or the keyword `all` for every authenticated
+  team. Empty (default) keeps the strict rule: only `console` writes, a
+  delegated team reads. With `all`, each team attaches with its OWN bound
+  credential, so no shared console secret has to live on a remote box, and the
+  hub logs the real identity (`builder -> planner (write)`), not `console`.
+- `[daemon] attach` is a host-wide default for that daemon's sessions: one
+  `attach = on` opts in every `[session:TEAM]` on the host (a session may still
+  set `attach = off`). Previously every session needed its own `attach = on`.
+- The consent model is unchanged and still off by default: a local team needs
+  `[server] attach_local = on`, a remote team needs `attach = on` (now settable
+  once per host). `attach_trust` is the operator's explicit statement of WHO may
+  drive; the per-host `attach` is the host owner's statement of WHICH panes may
+  be reached.
+- New harness `scripts/test-attach-trust.sh`. Also hardened the flaky
+  `/proc/<pid>/environ` read in `scripts/pzpty-test.sh` (it reads empty during
+  the fork->execve window; the whole read now retries, not just the open).
+
+## 1.1.29 - Attach compiles on the macOS endpoint
+
+- `pzattach` declared its saved/raw terminal state as `TTermios`, which the FPC
+  RTL defines only on Linux (`TTermios = Termios`); on Darwin only `Termios`
+  exists, so the type resolved to `<erroneous type>` and `tcsetattr` refused it.
+  `tiza daemon` pulls in `pzattach` for the `tiza attach` CLI, and the macOS
+  endpoint compiles the shipped source during its self-update, so 1.1.28 aborted
+  that build (`pzattach.pas: Incompatible type ... expected "termios"`) and the
+  endpoint correctly rolled back and stayed on its previous release. The state is
+  now typed `Termios`, which the RTL defines on both platforms.
+
+## 1.1.28 - Attach any team from any team
+
+- `tiza attach <team> [--write]` opens a raw terminal into a team's tmux
+  session, relayed by the hub, and now reaches EVERY route: a LOCAL team on the
+  hub host, a PUSH team on a reachable daemon, and a DIAL-in team behind NAT.
+  The client only needs to reach the hub, so it runs from any host, a dial-in
+  one included. Detach with Ctrl-] then q.
+- Read-only by default: the viewer's keystrokes are dropped at the hub, the
+  authoritative gate. Write is console-only; a delegated team is silently
+  downgraded to read-only and the reply says so.
+- Consent is explicit and OFF by default. A local team needs `[server]
+  attach_local = on` on the hub; a remote team needs `[session:TEAM] attach =
+  on` in its host's `tiza.conf`. The host owner decides whether its agent
+  terminals may be viewed or driven, exactly as with activity sampling.
+- The session is never resized to fit a viewer: the relayed tmux client is
+  sized to the session and marked ignore-size.
+- Routes: local (the hub spawns the tmux client under a pty and pumps it), push
+  (the hub connects to the daemon, which spawns the client and relays back),
+  dial (the hub pushes an `attach_open` control line down the reverse channel;
+  the daemon dials the hub back with an `attach_join` connection, paired to the
+  waiting viewer by an unguessable token bound to the target team). Bounded to
+  8 attaches per hub and 2 per team.
+- New harnesses `scripts/test-attach.sh` (local route) and
+  `scripts/test-attach-routes.sh` (push, dial, and the consent gate), on a
+  private tmux socket with no `kill-server`.
+- Portability fix carried in the same work: `pzchat.TermWidth` uses `termio`'s
+  `TIOCGWINSZ`/`TWinSize` instead of a hardcoded Linux request number, so the
+  console reads the real width on the macOS endpoint instead of falling back to
+  80 columns.
+
+## 1.1.27 - No path may end a session
+
+- `scripts/test-watchdog-session.sh` addressed the LIVE tmux server whenever it
+  ran from inside a tmux pane: tmux chooses its socket from `TMUX` before it
+  looks at `TMUX_TMPDIR`, so the private directory the harness set was ignored,
+  and the `kill-server` in its cleanup ended every session on the hub host
+  (2026-09-07). The harness now removes `TMUX`/`TMUX_PANE` from its
+  environment, names its private socket explicitly with `-S` on every call,
+  checks on the hub process that no `TMUX` was inherited, proves that a hub
+  restart leaves an existing session untouched, and contains no `kill-server`:
+  it removes the two sessions it created, by exact name, and the private
+  server exits by itself.
+- `systemd/pizarra-tmux.service` and `systemd/pizarra.service` carry
+  `KillMode=process`, as `tiza.service` already did: no stop or restart of a
+  shipped unit can reach a tmux server or the agent sessions inside it.
+- New static guard `scripts/test-no-destructive-tmux.sh`: no product source
+  issues a tmux verb that ends, replaces or renames a session, every unit that
+  may hold a tmux server carries `KillMode=process`, and no script in the tree
+  contains `kill-server`.
+- The invariant is now documented in `docs/operations.md`: the hub and the
+  daemon never kill, replace, rename or relaunch an existing session, no
+  configuration key enables it, a hub that stops leaves every session open and
+  a hub that starts uses the sessions it finds.
+
 ## 1.1.26 - Trusted ancestor links (macOS endpoint runtime fix)
 
 - `pzlayout.PzResolveTrustedPath` resolves ancestor symbolic links before the

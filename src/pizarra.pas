@@ -20,7 +20,7 @@ uses
   Unix{$IFDEF LINUX}, Linux{$ENDIF}, Types, StrUtils,
   fpjson, base64,
   pzproto, pzconfig, pzlog, pzstore, pztasks, pzworkflow, pztmux, pznet,
-  pzmanual, pzshare, pzver, pzsha256, pzdb, pzansi, pzlayout;
+  pzmanual, pzshare, pzver, pzsha256, pzdb, pzansi, pzlayout, pzpty, pzshell;
 
 { BaseUnix 3.2.2 exposes chmod(path) but no fchmod(fd) wrapper. Linux/glibc
   declares int fchmod(int, mode_t) in sys/stat.h; use it so a pathname swap
@@ -104,6 +104,47 @@ type
     function  Pop(out Line, Team: string; out Seq: Int64): Boolean;
   end;
 
+  { A viewer's attach to a DIAL team, waiting for the daemon to dial the hub
+    back. The viewer thread creates it, registers it by Token, and sends
+    attach_open down the reverse channel; the daemon dials back a fresh
+    connection carrying Token; the CMD_ATTACH_JOIN thread finds this record by
+    Token, claims it (by removing it from the list under the list lock — list
+    membership IS the unclaimed flag), and performs the relay. Two events
+    hand the record safely between the two threads: Arrived (the join claimed
+    it) and Finished (the relay ended). ExpectFrom pins the claim to the one
+    daemon that serves this team. }
+  TAttachWait = class
+  public
+    { Caller asked for the attach; ExpectFrom is the daemon that dials back. }
+    Token, ExpectFrom, Caller, Term: string;
+    Write: Boolean;
+    ClientData, JoinData: TSocketStream;
+    Arrived, Finished: TEvent;
+    constructor Create(const AToken, AExpectFrom, ACaller, ATerm: string;
+      AWrite: Boolean; AClient: TSocketStream);
+    destructor Destroy; override;
+  end;
+
+  { The same rendezvous for a SHELL on a dial host. Separate class rather than
+    a reused one: a shell carries no write flag and does carry the viewer's
+    window size, and the two features must stay independently changeable.
+    Ownership protocol is identical and equally load-bearing - list membership
+    IS the unclaimed flag, the join thread claims by removing under the list
+    lock, and the two auto-reset events hand the record between threads. }
+  TShellWait = class
+  public
+    { Caller is the team that ASKED for the shell. ExpectFrom is the daemon that
+      dials back. They are different, and logging the second one as if it were
+      the first is how the dial route lost its audit trail until 1.1.34. }
+    Token, ExpectFrom, Caller, Term: string;
+    Cols, Rows: Integer;
+    ClientData, JoinData: TSocketStream;
+    Arrived, Finished: TEvent;
+    constructor Create(const AToken, AExpectFrom, ACaller, ATerm: string;
+      ACols, ARows: Integer; AClient: TSocketStream);
+    destructor Destroy; override;
+  end;
+
   { Periodically (re)creates missing tmux team sessions. }
   TWatchdog = class(TThread)
   private
@@ -154,6 +195,22 @@ type
     FServer: TPzServer;
     FWatchers: TThreadList;     { of TWatcher }
     FDialChannels: TThreadList; { of TDialChannel — reverse delivery channels }
+    { tiza attach (1.2.0): live raw-terminal relays. Bounded, because the
+      native bus has no per-connection limit of its own and each attach holds
+      a thread, two descriptors and a tmux client for as long as a human
+      leaves it open. }
+    FAttachLock:  TCriticalSection;
+    FAttachTotal: Integer;
+    FAttachPer:   TStringList;  { team name -> open attach count }
+    FAttachWaits: TThreadList;  { of TAttachWait — dial attaches awaiting a join }
+    { tiza shell (1.1.33): the same, for login shells on team HOSTS. Its own
+      lock and counters throughout: four open attaches must never be able to
+      make the fleet unadministrable, and vice versa. Keyed by HOST, not by
+      team, so two teams on one box share one budget there. }
+    FShellLock:  TCriticalSection;
+    FShellTotal: Integer;
+    FShellPer:   TStringList;   { host key -> open shell count }
+    FShellWaits: TThreadList;   { of TShellWait — dial shells awaiting a join }
     FActLock: TCriticalSection; { guards FActivity }
     FActivity: array of TActState; { team -> live pane-activity (CMD_ACTIVITY) }
     FGrpIdle: array of TGrpIdleState; { per-group quiescence (watchdog-only) }
@@ -167,6 +224,38 @@ type
     procedure DoDial(Data: TSocketStream; const From, BoundTeam, TeamsCsv: string;
       KeepAlive: Integer; const DaemonVer: string);
     procedure HandleFleet(Data: TSocketStream);
+    { tiza attach: authorise, route, spawn or relay, pump, account. }
+    procedure HandleAttach(Obj: TJSONObject; const From, BoundTeam: string;
+      Data: TSocketStream);
+    { Route the authorised attach to a PUSH team: connect to its daemon, hand
+      over the handshake, and pipe the two sockets. The daemon emits the reply. }
+    procedure RelayPushAttach(Data: TSocketStream; const From: string;
+      const T: TTeam; Write: Boolean; const Term: string);
+    { Route to a DIAL team: register a token, push attach_open down the reverse
+      channel, and wait for the daemon's CMD_ATTACH_JOIN to be paired here. }
+    procedure RelayDialAttach(Data: TSocketStream; const From: string;
+      const T: TTeam; Write: Boolean; const Term: string);
+    { The dial daemon's dial-back connection for a pending attach. }
+    procedure HandleAttachJoin(Obj: TJSONObject; const From: string;
+      Data: TSocketStream);
+    { Push a control line to the reverse channel serving Team. False when no
+      channel currently serves it (the dial host is not connected). }
+    function  PushToDial(const Team, Line: string): Boolean;
+    function  AttachAcquire(const Team: string; out Why: string): Boolean;
+    procedure AttachRelease(const Team: string);
+    { tiza shell: authorise, route, spawn or relay, pump, account. Mirrors the
+      attach four, minus every write-mode branch - a shell is always
+      interactive - and keyed by host rather than by team. }
+    procedure HandleShell(Obj: TJSONObject; const From: string;
+      Data: TSocketStream);
+    procedure RelayPushShell(Data: TSocketStream; const From: string;
+      const T: TTeam; const Term: string; Cols, Rows: Integer);
+    procedure RelayDialShell(Data: TSocketStream; const From: string;
+      const T: TTeam; const Term: string; Cols, Rows: Integer);
+    procedure HandleShellJoin(Obj: TJSONObject; const From: string;
+      Data: TSocketStream);
+    function  ShellAcquire(const HostKey: string; out Why: string): Boolean;
+    procedure ShellRelease(const HostKey: string);
     procedure HandleUpget(Obj: TJSONObject; Data: TSocketStream);
     procedure HandleUpdate(Obj: TJSONObject; const From: string;
       Data: TSocketStream);
@@ -1222,6 +1311,14 @@ begin
   FLock := TCriticalSection.Create;
   FWatchers := TThreadList.Create;
   FDialChannels := TThreadList.Create;
+  FAttachLock := TCriticalSection.Create;
+  FAttachTotal := 0;
+  FAttachPer := TStringList.Create;
+  FAttachWaits := TThreadList.Create;
+  FShellLock := TCriticalSection.Create;
+  FShellTotal := 0;
+  FShellPer := TStringList.Create;
+  FShellWaits := TThreadList.Create;
   { broadcast inside the store lock: strict seq order on watch streams }
   FStore.OnAppend := @OnStoreAppend;
   { mark every team a delivery target so compaction protects undelivered
@@ -1247,6 +1344,12 @@ begin
   FreeAndNil(FDb);
   FWatchers.Free;
   FDialChannels.Free;
+  FShellWaits.Free;
+  FShellPer.Free;
+  FShellLock.Free;
+  FAttachWaits.Free;
+  FAttachPer.Free;
+  FAttachLock.Free;
   FCfgLock.Free;
   FPutLock.Free;
   FActLock.Free;
@@ -7702,6 +7805,962 @@ begin
       Result := Msgs[i].Seq;
 end;
 
+{ ---------------------------------------------------------------------------
+  tiza attach (1.2.0): a raw terminal into a team's tmux session.
+
+  The hub is a relay and a gate, never an interpreter: after the JSON
+  handshake it moves bytes between the viewer and a tmux client and looks at
+  none of them. What it does decide: who may look, who may type (console only),
+  which route reaches the team, and how many of these may be open at once.
+
+  This release serves LOCAL teams (the hub host's own sessions). Push and
+  dial-in endpoints answer with a clear refusal until their routes land.
+  --------------------------------------------------------------------------- }
+const
+  ATTACH_MAX_TOTAL    = 8;     { per hub }
+  ATTACH_MAX_PER_TEAM = 2;     { per team }
+  ATTACH_GRACE_MS     = 2000;  { HUP -> KILL grace for the tmux client }
+  ATTACH_DIAL_MS      = 8000;  { a dial daemon must dial back within this }
+  ATTACH_JOIN_TICK_MS = 1000;  { relay-park wait granularity (shutdown-aware) }
+
+{ ---- dial attach rendezvous (TAttachWait) ---- }
+
+constructor TAttachWait.Create(const AToken, AExpectFrom, ACaller, ATerm: string;
+  AWrite: Boolean; AClient: TSocketStream);
+begin
+  inherited Create;
+  Token := AToken;
+  ExpectFrom := AExpectFrom;
+  Caller := ACaller;
+  Term := ATerm;
+  Write := AWrite;
+  ClientData := AClient;
+  JoinData := nil;
+  { manual-reset off (auto): each is waited exactly once }
+  Arrived := TEvent.Create(nil, False, False, '');
+  Finished := TEvent.Create(nil, False, False, '');
+end;
+
+destructor TAttachWait.Destroy;
+begin
+  Arrived.Free;
+  Finished.Free;
+  inherited Destroy;
+end;
+
+function TPizarra.PushToDial(const Team, Line: string): Boolean;
+var
+  L: TList;
+  i: Integer;
+  Ch: TDialChannel;
+begin
+  Result := False;
+  L := FDialChannels.LockList;
+  try
+    for i := 0 to L.Count - 1 do
+    begin
+      Ch := TDialChannel(L[i]);
+      if Ch.Serves(Team) then
+      begin
+        Ch.Push(Line, '', -1);   { control line: empty team, negative seq }
+        Exit(True);
+      end;
+    end;
+  finally
+    FDialChannels.UnlockList;
+  end;
+end;
+
+{ True when From is named in the attach_trust list (comma/space/;-separated,
+  case-insensitive) or the list is the keyword 'all'. An empty From or empty
+  list is never trusted. A trusted identity may attach AND write any team, with
+  its OWN credential - no shared console secret. }
+function AttachTrusted(const TrustList, From: string): Boolean;
+var
+  s, tok, f: string;
+  i: Integer;
+begin
+  Result := False;
+  f := LowerCase(Trim(From));
+  if (f = '') or (Trim(TrustList) = '') then
+    Exit;
+  s := LowerCase(TrustList);
+  for i := 1 to Length(s) do
+    if (s[i] = ',') or (s[i] = ';') or (s[i] = #9) then
+      s[i] := ' ';
+  s := s + ' ';
+  tok := '';
+  for i := 1 to Length(s) do
+    if s[i] = ' ' then
+    begin
+      tok := Trim(tok);
+      if (tok = 'all') or (tok = f) then
+        Exit(True);
+      tok := '';
+    end
+    else
+      tok := tok + s[i];
+end;
+
+function TPizarra.AttachAcquire(const Team: string; out Why: string): Boolean;
+var
+  n: Integer;
+begin
+  Result := False;
+  Why := '';
+  FAttachLock.Enter;
+  try
+    if FAttachTotal >= ATTACH_MAX_TOTAL then
+    begin
+      Why := Format('attach: too many attaches open on this hub (%d)',
+        [ATTACH_MAX_TOTAL]);
+      Exit;
+    end;
+    n := StrToIntDef(FAttachPer.Values[LowerCase(Team)], 0);
+    if n >= ATTACH_MAX_PER_TEAM then
+    begin
+      Why := Format('attach: per-team limit reached for %s (%d)',
+        [Team, ATTACH_MAX_PER_TEAM]);
+      Exit;
+    end;
+    Inc(FAttachTotal);
+    FAttachPer.Values[LowerCase(Team)] := IntToStr(n + 1);
+    Result := True;
+  finally
+    FAttachLock.Leave;
+  end;
+end;
+
+procedure TPizarra.AttachRelease(const Team: string);
+var
+  n: Integer;
+begin
+  FAttachLock.Enter;
+  try
+    if FAttachTotal > 0 then
+      Dec(FAttachTotal);
+    n := StrToIntDef(FAttachPer.Values[LowerCase(Team)], 0) - 1;
+    if n <= 0 then
+      FAttachPer.Values[LowerCase(Team)] := ''   { removes the pair }
+    else
+      FAttachPer.Values[LowerCase(Team)] := IntToStr(n);
+  finally
+    FAttachLock.Leave;
+  end;
+end;
+
+procedure TPizarra.HandleAttach(Obj: TJSONObject; const From, BoundTeam: string;
+  Data: TSocketStream);
+var
+  C: TPizarraConfig;
+  T: TTeam;
+  TeamKey, Term, Mode, Why, Exe, Sess, PathV, HomeV, TmpV: string;
+  WantWrite, Write, Held: Boolean;
+  Cols, Rows: Integer;
+  Child: TPtyChild;
+  Err: string;
+  Argv, Env: array of string;
+  FromClient, FromPty: Int64;
+begin
+  C := Snap;
+  Held := False;
+  Child.Pid := 0;
+  Child.Master := -1;
+
+  { WHO. Console, a team delegated the attach family, or - when the operator
+    trusts the whole fleet with [server] attach_trust - any authenticated team.
+    The binding guard in HandleConnect has already made From trustworthy. }
+  if not (ConsoleFor(From, 'attach') or AttachTrusted(C.AttachTrust, From)) then
+  begin
+    WriteLine(Data, ReplyErr('attach: only the console, a team delegated the ' +
+      'attach family, or a team named in [server] attach_trust may open a ' +
+      'terminal into another team''s session'));
+    Exit;
+  end;
+  TeamKey := Trim(Obj.Get('team', ''));
+  if not FindTeam(C, TeamKey, T) then
+  begin
+    WriteLine(Data, ReplyErr('unknown team: ' + TeamKey));
+    Exit;
+  end;
+  { WRITE is for console and for identities the operator named in attach_trust.
+    A writable tmux client is full control of that host's tmux server - prefix-s,
+    choose-tree and kill-session included - so a merely delegated team is
+    downgraded silently to read-only and the reply says so; attach_trust is the
+    operator's explicit statement that those identities may drive it. }
+  WantWrite := Obj.Get('write', False);
+  Write := WantWrite and (SameText(From, 'console') or
+                          AttachTrusted(C.AttachTrust, From));
+  Term := SafeTerm(Obj.Get('term', ''));
+
+  { WHERE. Same order as TryDeliver: dial, then push, then local. Push and dial
+    targets are relayed to the daemon on that host, which owns the tmux client;
+    only a LOCAL team is served here. Each route accounts and replies itself. }
+  if T.Dial then
+  begin
+    RelayDialAttach(Data, From, T, Write, Term);
+    Exit;
+  end;
+  if T.Host <> '' then
+  begin
+    RelayPushAttach(Data, From, T, Write, Term);
+    Exit;
+  end;
+  if T.TmuxSession = '' then
+  begin
+    WriteLine(Data, ReplyErr(Format('attach: %s has no terminal session ' +
+      '(inbox-only member)', [T.Name])));
+    Exit;
+  end;
+  if not C.AttachLocal then
+  begin
+    WriteLine(Data, ReplyErr('attach not enabled for local teams on this ' +
+      'hub: set [server] attach_local = on in pizarra.conf'));
+    Exit;
+  end;
+  Sess := T.TmuxSession;
+  if (Sess = '-') or (not SessionExists(Sess)) then
+  begin
+    WriteLine(Data, ReplyErr(Format('attach: session %s of %s is not running',
+      [Sess, T.Name])));
+    Exit;
+  end;
+
+  { HOW MANY. }
+  if not AttachAcquire(T.Name, Why) then
+  begin
+    WriteLine(Data, ReplyErr(Why));
+    Exit;
+  end;
+  Held := True;
+  try
+    Exe := TmuxPath;
+    if Exe = '' then
+    begin
+      WriteLine(Data, ReplyErr('attach: tmux binary not found on the hub host'));
+      Exit;
+    end;
+    { The PTY is sized to the SESSION, never to the viewer: with the client
+      the same size as the window, tmux's window-size policy - whatever it is
+      on this host - has nothing to resize. ignore-size on the client is the
+      second guard. }
+    if not SessionSize(Sess, Cols, Rows) then
+    begin
+      Cols := 80;
+      Rows := 24;
+    end;
+    if Write then
+    begin
+      SetLength(Argv, 7);
+      Argv[0] := 'tmux'; Argv[1] := '-u'; Argv[2] := 'attach-session';
+      Argv[3] := '-f'; Argv[4] := 'ignore-size'; Argv[5] := '-t'; Argv[6] := Sess;
+      Mode := 'write';
+    end
+    else
+    begin
+      { -r is read-only,ignore-size: only detach/switch keys have any effect }
+      SetLength(Argv, 6);
+      Argv[0] := 'tmux'; Argv[1] := '-u'; Argv[2] := 'attach-session';
+      Argv[3] := '-r'; Argv[4] := '-t'; Argv[5] := Sess;
+      Mode := 'read-only';
+    end;
+    { The child's environment is built here and contains no TMUX: the hub
+      itself runs inside tmux under --host-session, and a tmux client started
+      with TMUX set does not attach, it switches the hub's own client. }
+    PathV := GetEnvironmentVariable('PATH');
+    if PathV = '' then
+      PathV := '/usr/local/bin:/usr/bin:/bin';
+    HomeV := GetEnvironmentVariable('HOME');
+    if HomeV = '' then
+      HomeV := '/root';
+    TmpV := GetEnvironmentVariable('TMUX_TMPDIR');
+    SetLength(Env, 4);
+    Env[0] := 'PATH=' + PathV;
+    Env[1] := 'HOME=' + HomeV;
+    Env[2] := 'TERM=' + Term;
+    Env[3] := 'LANG=C.UTF-8';
+    if TmpV <> '' then
+    begin
+      SetLength(Env, 5);
+      Env[4] := 'TMUX_TMPDIR=' + TmpV;
+    end;
+    if not PtySpawn(Exe, Argv, Env, Cols, Rows, Child, Err) then
+    begin
+      WriteLine(Data, ReplyErr('attach: ' + Err));
+      Exit;
+    end;
+
+    { UPGRADE. This is the last JSON line on the connection. }
+    WriteLine(Data, ReplyAttachOk(T.Name, Write, Cols, Rows));
+    FLog.Info(Format('attach opened: %s -> %s (%s, %dx%d, tmux pid %d)',
+      [From, T.Name, Mode, Cols, Rows, Child.Pid]));
+    Broadcast(EvSys(Format('attach: %s -> %s (%s) opened',
+      [From, T.Name, Mode])), 0);
+
+    FromClient := 0;
+    FromPty := 0;
+    try
+      { Read-only: the viewer's bytes are dropped HERE, before any of them
+        can reach the tmux client. tmux -r would ignore them too, but with
+        input flowing its switch-client keys let a viewer browse other
+        sessions on the server; the hub is the authoritative gate. }
+      PtyPump(Data.Handle, Child.Master, not Write, @ShutdownRequested,
+        FromClient, FromPty);
+    except
+      { Nothing may be written to the socket as JSON after the upgrade; an
+        exception here is logged and the relay simply ends. }
+      on E: Exception do
+        FLog.Info('attach relay error for ' + T.Name + ': ' + E.Message);
+    end;
+    PtyClose(Child, ATTACH_GRACE_MS);
+    FLog.Info(Format('attach closed: %s -> %s (%s, %d bytes from viewer, ' +
+      '%d bytes from terminal)', [From, T.Name, Mode, FromClient, FromPty]));
+    Broadcast(EvSys(Format('attach: %s -> %s (%s) closed',
+      [From, T.Name, Mode])), 0);
+  finally
+    if Child.Pid > 0 then
+      PtyClose(Child, ATTACH_GRACE_MS);
+    if Held then
+      AttachRelease(T.Name);
+  end;
+end;
+
+procedure TPizarra.RelayPushAttach(Data: TSocketStream; const From: string;
+  const T: TTeam; Write: Boolean; const Term: string);
+var
+  C: TPizarraConfig;
+  Sock: TInetSocket;
+  Why, Mode: string;
+  Held: Boolean;
+  a, b: Int64;
+begin
+  C := Snap;
+  if not AttachAcquire(T.Name, Why) then
+  begin
+    WriteLine(Data, ReplyErr(Why));
+    Exit;
+  end;
+  Held := True;
+  Sock := nil;
+  if Write then Mode := 'write' else Mode := 'read-only';
+  try
+    try
+      Sock := TInetSocket.Create(T.Host, T.Port, 5000);
+    except
+      on E: Exception do
+      begin
+        WriteLine(Data, ReplyErr(Format('attach: cannot reach %s at %s:%d: %s',
+          [T.Name, T.Host, T.Port, E.Message])));
+        Exit;
+      end;
+    end;
+    { The daemon opens the terminal and writes ReplyAttachOk (or ReplyErr) then
+      raw bytes; all of it flows back through here to the viewer unread. The hub
+      is a pipe from this point - it looks at none of it. }
+    WriteLine(Sock, BuildAttach(C.Secret, From, T.Name, Write, Term));
+    FLog.Info(Format('attach opened: %s -> %s (%s, push %s:%d)',
+      [From, T.Name, Mode, T.Host, T.Port]));
+    Broadcast(EvSys(Format('attach: %s -> %s (%s) opened',
+      [From, T.Name, Mode])), 0);
+    a := 0;
+    b := 0;
+    try
+      { Read-only drops the viewer's keystrokes at the hub - the authoritative
+        gate; the daemon also spawns -r, but the hub is the one that decides. }
+      PtyPump(Data.Handle, Sock.Handle, not Write, @ShutdownRequested, a, b);
+    except
+      on E: Exception do
+        FLog.Info('attach relay error for ' + T.Name + ': ' + E.Message);
+    end;
+    FLog.Info(Format('attach closed: %s -> %s (%s, %d bytes from viewer, ' +
+      '%d bytes from terminal)', [From, T.Name, Mode, a, b]));
+    Broadcast(EvSys(Format('attach: %s -> %s (%s) closed',
+      [From, T.Name, Mode])), 0);
+  finally
+    if Sock <> nil then
+      Sock.Free;
+    if Held then
+      AttachRelease(T.Name);
+  end;
+end;
+
+procedure TPizarra.RelayDialAttach(Data: TSocketStream; const From: string;
+  const T: TTeam; Write: Boolean; const Term: string);
+var
+  W: TAttachWait;
+  Why, Mode, Token: string;
+  Held, Claimed: Boolean;
+  L: TList;
+begin
+  if not AttachAcquire(T.Name, Why) then
+  begin
+    WriteLine(Data, ReplyErr(Why));
+    Exit;
+  end;
+  Held := True;
+  if Write then Mode := 'write' else Mode := 'read-only';
+  { Unique, unguessable-enough rendezvous token; the ExpectFrom check on the
+    join is the real authority, so this only needs to be unique. }
+  Token := IntToHex(GetTickCount64, 16) + IntToHex(Random($7FFFFFFF), 8) +
+           IntToHex(Random($7FFFFFFF), 8);
+  W := TAttachWait.Create(Token, T.Name, From, Term, Write, Data);
+  FAttachWaits.Add(W);
+  try
+    if not PushToDial(T.Name, BuildAttachOpen(Token, From, T.Name, Write, Term)) then
+    begin
+      FAttachWaits.Remove(W);
+      WriteLine(Data, ReplyErr(Format('attach: %s is not currently dialed in',
+        [T.Name])));
+      W.Free;
+      Exit;
+    end;
+    { Wait for the daemon to dial the hub back; HandleAttachJoin claims W (sets
+      JoinData and removes it from the list under the list lock) and does the
+      relay. Then it signals Finished and we free W. }
+    if W.Arrived.WaitFor(ATTACH_DIAL_MS) <> wrSignaled then
+    begin
+      Claimed := True;
+      L := FAttachWaits.LockList;
+      try
+        if L.IndexOf(W) >= 0 then
+        begin
+          L.Remove(W);
+          Claimed := False;   { it was never claimed; safe to refuse and free }
+        end;
+      finally
+        FAttachWaits.UnlockList;
+      end;
+      if not Claimed then
+      begin
+        WriteLine(Data, ReplyErr(Format('attach: %s did not dial back in time',
+          [T.Name])));
+        W.Free;
+        Exit;
+      end;
+    end;
+    { Claimed: the join thread is relaying viewer <-> its dial-back connection
+      and holds that connection open until we release it. Park until it finishes
+      (it always signals Finished, including when the pump ends on shutdown). }
+    while (W.Finished.WaitFor(ATTACH_JOIN_TICK_MS) <> wrSignaled) and
+          (not ShutdownRequested) do
+      ;
+    if not ShutdownRequested then
+      W.Free;   { on shutdown leave W to the exiting process; avoids a UAF race }
+  finally
+    if Held then
+      AttachRelease(T.Name);
+  end;
+end;
+
+procedure TPizarra.HandleAttachJoin(Obj: TJSONObject; const From: string;
+  Data: TSocketStream);
+var
+  Token, Mode: string;
+  W: TAttachWait;
+  L: TList;
+  i: Integer;
+  a, b: Int64;
+begin
+  Token := Trim(Obj.Get('token', ''));
+  W := nil;
+  L := FAttachWaits.LockList;
+  try
+    for i := 0 to L.Count - 1 do
+      if TAttachWait(L[i]).Token = Token then
+      begin
+        W := TAttachWait(L[i]);
+        Break;
+      end;
+    { The token must be redeemed by the very team it targeted: a bound dial
+      credential proves From, so a different host cannot hijack the viewer. }
+    if (W <> nil) and (not SameText(From, W.ExpectFrom)) then
+      W := nil
+    else if W <> nil then
+    begin
+      W.JoinData := Data;   { set under the lock, atomically with the claim }
+      L.Remove(W);
+    end;
+  finally
+    FAttachWaits.UnlockList;
+  end;
+  if W = nil then
+  begin
+    WriteLine(Data, ReplyErr('attach_join: no waiting viewer for this token'));
+    Exit;
+  end;
+  W.Arrived.SetEvent;
+  if W.Write then Mode := 'write' else Mode := 'read-only';
+  FLog.Info(Format('attach opened: %s -> %s (%s, dial)',
+    [W.Caller, W.ExpectFrom, Mode]));
+  Broadcast(EvSys(Format('attach: %s -> %s (%s) opened',
+    [W.Caller, W.ExpectFrom, Mode])), 0);
+  a := 0;
+  b := 0;
+  try
+    { Relay viewer <-> this dial-back connection. The daemon's ReplyAttachOk and
+      then raw terminal bytes flow to the viewer unread. }
+    PtyPump(W.ClientData.Handle, Data.Handle, not W.Write, @ShutdownRequested,
+      a, b);
+  except
+    on E: Exception do
+      FLog.Info('attach relay error for ' + W.ExpectFrom + ': ' + E.Message);
+  end;
+  FLog.Info(Format('attach closed: %s -> %s (%s, dial, %d bytes from viewer, ' +
+    '%d bytes from terminal)', [W.Caller, W.ExpectFrom, Mode, a, b]));
+  Broadcast(EvSys(Format('attach: %s -> %s (%s) closed',
+    [W.Caller, W.ExpectFrom, Mode])), 0);
+  { Last touch of W: hand it back to the viewer thread to free. After this the
+    viewer wakes, frees W, and closes its own connection; we return and close
+    this one. }
+  W.Finished.SetEvent;
+end;
+
+{ ---------------------------------------------------------------------------
+  tiza shell (1.1.33) - a login shell on a team's HOST.
+
+  Attach lets a caller watch and drive an agent's tmux pane. This opens a
+  shell on the machine underneath it, which is the only way to administer the
+  dial-in endpoints: they have no inbound route at all, so the shell rides the
+  reverse channel they already hold open to the hub.
+
+  The hub's job is unchanged doctrine: authorise, route, account, relay. It
+  never interprets a byte of the session, and it deliberately does not record
+  one - the operator types a sudo password in there, and the hub's store is
+  replicated and fleet-readable. Who, where, as whom, how big and how many
+  bytes is what gets logged; the content belongs to the host's own sudo and
+  audit trail.
+
+  Every gate and counter here is separate from attach's. Enabling one must
+  never enable the other, and eight open attaches must never be able to make
+  the fleet unadministrable.
+  --------------------------------------------------------------------------- }
+const
+  SHELL_MAX_TOTAL    = 4;     { per hub - a shell is heavier than a viewer }
+  SHELL_MAX_PER_HOST = 2;     { per target HOST, not per team }
+  SHELL_GRACE_MS     = 3000;  { HUP -> KILL; a login shell runs its logout }
+  SHELL_DIAL_MS      = 8000;  { a dial daemon must dial back within this }
+  SHELL_JOIN_TICK_MS = 1000;  { relay-park wait granularity (shutdown-aware) }
+
+{ ---- dial shell rendezvous (TShellWait) ---- }
+
+constructor TShellWait.Create(const AToken, AExpectFrom, ACaller, ATerm: string;
+  ACols, ARows: Integer; AClient: TSocketStream);
+begin
+  inherited Create;
+  Token := AToken;
+  ExpectFrom := AExpectFrom;
+  Caller := ACaller;
+  Term := ATerm;
+  Cols := ACols;
+  Rows := ARows;
+  ClientData := AClient;
+  JoinData := nil;
+  { manual-reset off (auto): each is waited exactly once }
+  Arrived := TEvent.Create(nil, False, False, '');
+  Finished := TEvent.Create(nil, False, False, '');
+end;
+
+destructor TShellWait.Destroy;
+begin
+  Arrived.Free;
+  Finished.Free;
+  inherited Destroy;
+end;
+
+{ Same list grammar as AttachTrusted, but its OWN key. Deliberately a separate
+  function rather than a shared one: two lists that happen to parse alike must
+  not quietly become one key under a later refactor. }
+function ShellTrusted(const TrustList, From: string): Boolean;
+var
+  s, tok, want: string;
+  i: Integer;
+begin
+  Result := False;
+  want := LowerCase(Trim(From));
+  if want = '' then
+    Exit;
+  s := LowerCase(Trim(TrustList));
+  if s = '' then
+    Exit;
+  tok := '';
+  for i := 1 to Length(s) + 1 do
+    if (i > Length(s)) or (s[i] = ',') or (s[i] = ';') or (s[i] = #9) or
+       (s[i] = ' ') then
+    begin
+      tok := Trim(tok);
+      if (tok = 'all') or ((tok <> '') and (tok = want)) then
+        Exit(True);
+      tok := '';
+    end
+    else
+      tok := tok + s[i];
+end;
+
+{ The accounting key. A shell is per HOST: two teams on one push box share one
+  budget there, which is what the operator actually means by "two shells on
+  that machine". }
+function ShellHostKey(const T: TTeam): string;
+begin
+  if T.Dial then
+    Result := 'dial:' + LowerCase(T.Name)
+  else if T.Host <> '' then
+    Result := 'push:' + LowerCase(T.Host) + ':' + IntToStr(T.Port)
+  else
+    Result := 'local';
+end;
+
+function TPizarra.ShellAcquire(const HostKey: string; out Why: string): Boolean;
+var
+  n: Integer;
+begin
+  Result := False;
+  Why := '';
+  FShellLock.Enter;
+  try
+    if FShellTotal >= SHELL_MAX_TOTAL then
+    begin
+      Why := Format('shell: too many shells open on this hub (%d)',
+        [SHELL_MAX_TOTAL]);
+      Exit;
+    end;
+    n := StrToIntDef(FShellPer.Values[HostKey], 0);
+    if n >= SHELL_MAX_PER_HOST then
+    begin
+      Why := Format('shell: shell limit reached for %s (%d)',
+        [HostKey, SHELL_MAX_PER_HOST]);
+      Exit;
+    end;
+    Inc(FShellTotal);
+    FShellPer.Values[HostKey] := IntToStr(n + 1);
+    Result := True;
+  finally
+    FShellLock.Leave;
+  end;
+end;
+
+procedure TPizarra.ShellRelease(const HostKey: string);
+var
+  n: Integer;
+begin
+  FShellLock.Enter;
+  try
+    if FShellTotal > 0 then
+      Dec(FShellTotal);
+    n := StrToIntDef(FShellPer.Values[HostKey], 0) - 1;
+    if n <= 0 then
+      FShellPer.Values[HostKey] := ''   { removes the pair }
+    else
+      FShellPer.Values[HostKey] := IntToStr(n);
+  finally
+    FShellLock.Leave;
+  end;
+end;
+
+procedure TPizarra.HandleShell(Obj: TJSONObject; const From: string;
+  Data: TSocketStream);
+var
+  C: TPizarraConfig;
+  T: TTeam;
+  TeamKey, Term, Why, Exe, Err, HostKey: string;
+  Held: Boolean;
+  Cols, Rows: Word;
+  Child: TPtyChild;
+  Argv, Env: TStringArray;
+  FromClient, FromPty: Int64;
+begin
+  C := Snap;
+  Held := False;
+  Child.Pid := 0;
+  Child.Master := -1;
+
+  { WHO. The console, or an identity the operator named in [server]
+    shell_trust. Deliberately NOT ConsoleFor: the delegate families are
+    administrative command families, and a root-capable shell sits above every
+    one of them - a hand-edited delegate key must never grow into shell
+    access. The binding guard in HandleConnect has already made From
+    trustworthy. }
+  if not (SameText(From, 'console') or ShellTrusted(C.ShellTrust, From)) then
+  begin
+    WriteLine(Data, ReplyErr('shell: only the console or a team named in ' +
+      '[server] shell_trust may open a shell on a host'));
+    Exit;
+  end;
+  TeamKey := Trim(Obj.Get('team', ''));
+  if not FindTeam(C, TeamKey, T) then
+  begin
+    WriteLine(Data, ReplyErr('unknown team: ' + TeamKey));
+    Exit;
+  end;
+  Term := SafeTerm(Obj.Get('term', ''));
+  { Unlike attach, the pty is sized to the VIEWER: a shell has no session to
+    inherit a size from and no other observer to disturb. }
+  SafeWinSize(Obj.Get('cols', 0), Obj.Get('rows', 0), Cols, Rows);
+
+  { WHERE. Same order as TryDeliver: dial, then push, then local. The shell
+    opens on the MACHINE where the team runs, not inside the team's session,
+    so two teams on one host are two names for the same shell. }
+  if T.Dial then
+  begin
+    RelayDialShell(Data, From, T, Term, Cols, Rows);
+    Exit;
+  end;
+  if T.Host <> '' then
+  begin
+    RelayPushShell(Data, From, T, Term, Cols, Rows);
+    Exit;
+  end;
+  { LOCAL: the hub host's own machine. Its opt-in is a hub key because a local
+    team lives in the registry and has no daemon config of its own. }
+  if not C.ShellLocal then
+  begin
+    WriteLine(Data, ReplyErr('shell not enabled on this hub host: set ' +
+      '[server] shell_local = on in pizarra.conf'));
+    Exit;
+  end;
+  if C.ShellUser = '' then
+  begin
+    WriteLine(Data, ReplyErr('shell: no account configured on the hub host ' +
+      '(set [server] shell_user = <account> in pizarra.conf)'));
+    Exit;
+  end;
+
+  { HOW MANY. }
+  HostKey := ShellHostKey(T);
+  if not ShellAcquire(HostKey, Why) then
+  begin
+    WriteLine(Data, ReplyErr(Why));
+    Exit;
+  end;
+  Held := True;
+  try
+    { One shared plan for every route, so the hub's local shell and a daemon's
+      are the same thing spawned the same way and refused in the same words. }
+    if not ShellSpawnPlan(C.ShellUser, Term, Exe, Argv, Env, Why) then
+    begin
+      WriteLine(Data, ReplyErr(Why));
+      Exit;
+    end;
+    if not PtySpawn(Exe, Argv, Env, Cols, Rows, Child, Err) then
+    begin
+      WriteLine(Data, ReplyErr('shell: ' + Err));
+      Exit;
+    end;
+
+    { UPGRADE. This is the last JSON line on the connection. }
+    WriteLine(Data, ReplyShellOk(T.Name, C.ShellUser, GetHostName, Cols, Rows));
+    FLog.Info(Format('shell opened: %s -> %s (local, %s@%s, %dx%d, pid %d)',
+      [From, T.Name, C.ShellUser, GetHostName, Cols, Rows, Child.Pid]));
+    Broadcast(EvSys(Format('shell: %s -> %s (local, %s) opened',
+      [From, T.Name, C.ShellUser])), 0);
+
+    FromClient := 0;
+    FromPty := 0;
+    try
+      { False: never drop. A shell you cannot type into is not a lesser
+        grant, it is a useless one - so there is no read-only mode at all. }
+      PtyPump(Data.Handle, Child.Master, False, @ShutdownRequested,
+        FromClient, FromPty);
+    except
+      { Nothing may be written to the socket as JSON after the upgrade. }
+      on E: Exception do
+        FLog.Info('shell relay error for ' + T.Name + ': ' + E.Message);
+    end;
+    PtyClose(Child, SHELL_GRACE_MS);
+    FLog.Info(Format('shell closed: %s -> %s (local, %d bytes from client, ' +
+      '%d bytes from shell)', [From, T.Name, FromClient, FromPty]));
+    Broadcast(EvSys(Format('shell: %s -> %s (local) closed',
+      [From, T.Name])), 0);
+  finally
+    if Child.Pid > 0 then
+      PtyClose(Child, SHELL_GRACE_MS);
+    if Held then
+      ShellRelease(HostKey);
+  end;
+end;
+
+procedure TPizarra.RelayPushShell(Data: TSocketStream; const From: string;
+  const T: TTeam; const Term: string; Cols, Rows: Integer);
+var
+  C: TPizarraConfig;
+  Sock: TInetSocket;
+  Why, HostKey: string;
+  Held: Boolean;
+  a, b: Int64;
+begin
+  C := Snap;
+  HostKey := ShellHostKey(T);
+  if not ShellAcquire(HostKey, Why) then
+  begin
+    WriteLine(Data, ReplyErr(Why));
+    Exit;
+  end;
+  Held := True;
+  Sock := nil;
+  try
+    try
+      Sock := TInetSocket.Create(T.Host, T.Port, 5000);
+    except
+      on E: Exception do
+      begin
+        WriteLine(Data, ReplyErr(Format('shell: cannot reach %s at %s:%d: %s',
+          [T.Name, T.Host, T.Port, E.Message])));
+        Exit;
+      end;
+    end;
+    { The daemon opens the shell and writes ReplyShellOk (or ReplyErr) then raw
+      bytes; all of it flows back through here unread. The hub does not learn
+      which account that host uses - the daemon logs it at its own end, which
+      is where the host's audit trail already lives. }
+    WriteLine(Sock, BuildShell(C.Secret, From, T.Name, Term, Cols, Rows));
+    FLog.Info(Format('shell opened: %s -> %s (push %s:%d, %dx%d)',
+      [From, T.Name, T.Host, T.Port, Cols, Rows]));
+    Broadcast(EvSys(Format('shell: %s -> %s (push) opened', [From, T.Name])), 0);
+    a := 0;
+    b := 0;
+    try
+      PtyPump(Data.Handle, Sock.Handle, False, @ShutdownRequested, a, b);
+    except
+      on E: Exception do
+        FLog.Info('shell relay error for ' + T.Name + ': ' + E.Message);
+    end;
+    FLog.Info(Format('shell closed: %s -> %s (push, %d bytes from client, ' +
+      '%d bytes from shell)', [From, T.Name, a, b]));
+    Broadcast(EvSys(Format('shell: %s -> %s (push) closed', [From, T.Name])), 0);
+  finally
+    if Sock <> nil then
+      Sock.Free;
+    if Held then
+      ShellRelease(HostKey);
+  end;
+end;
+
+procedure TPizarra.RelayDialShell(Data: TSocketStream; const From: string;
+  const T: TTeam; const Term: string; Cols, Rows: Integer);
+var
+  W: TShellWait;
+  Why, Token, HostKey: string;
+  Held, Claimed: Boolean;
+  L: TList;
+begin
+  HostKey := ShellHostKey(T);
+  if not ShellAcquire(HostKey, Why) then
+  begin
+    WriteLine(Data, ReplyErr(Why));
+    Exit;
+  end;
+  Held := True;
+  { Unique, unguessable-enough rendezvous token; the ExpectFrom check on the
+    join is the real authority, so this only needs to be unique. }
+  Token := IntToHex(GetTickCount64, 16) + IntToHex(Random($7FFFFFFF), 8) +
+           IntToHex(Random($7FFFFFFF), 8);
+  W := TShellWait.Create(Token, T.Name, From, Term, Cols, Rows, Data);
+  FShellWaits.Add(W);
+  try
+    if not PushToDial(T.Name, BuildShellOpen(Token, From, T.Name, Term, Cols, Rows)) then
+    begin
+      FShellWaits.Remove(W);
+      WriteLine(Data, ReplyErr(Format('shell: %s is not currently dialed in',
+        [T.Name])));
+      W.Free;
+      Exit;
+    end;
+    { Wait for the daemon to dial the hub back; HandleShellJoin claims W (sets
+      JoinData and removes it from the list under the list lock) and does the
+      relay. Then it signals Finished and we free W. }
+    if W.Arrived.WaitFor(SHELL_DIAL_MS) <> wrSignaled then
+    begin
+      Claimed := True;
+      L := FShellWaits.LockList;
+      try
+        if L.IndexOf(W) >= 0 then
+        begin
+          L.Remove(W);
+          Claimed := False;   { it was never claimed; safe to refuse and free }
+        end;
+      finally
+        FShellWaits.UnlockList;
+      end;
+      if not Claimed then
+      begin
+        WriteLine(Data, ReplyErr(Format('shell: %s did not dial back in time',
+          [T.Name])));
+        W.Free;
+        Exit;
+      end;
+    end;
+    { Claimed: the join thread is relaying and holds its dial-back connection
+      open until we release it. Park until it finishes (it always signals
+      Finished, including when the pump ends on shutdown). }
+    while (W.Finished.WaitFor(SHELL_JOIN_TICK_MS) <> wrSignaled) and
+          (not ShutdownRequested) do
+      ;
+    if not ShutdownRequested then
+      W.Free;   { on shutdown leave W to the exiting process; avoids a UAF race }
+  finally
+    if Held then
+      ShellRelease(HostKey);
+  end;
+end;
+
+procedure TPizarra.HandleShellJoin(Obj: TJSONObject; const From: string;
+  Data: TSocketStream);
+var
+  Token: string;
+  W: TShellWait;
+  L: TList;
+  i: Integer;
+  a, b: Int64;
+begin
+  Token := Trim(Obj.Get('token', ''));
+  W := nil;
+  L := FShellWaits.LockList;
+  try
+    for i := 0 to L.Count - 1 do
+      if TShellWait(L[i]).Token = Token then
+      begin
+        W := TShellWait(L[i]);
+        Break;
+      end;
+    { The token must be redeemed by the very team it targeted: a bound dial
+      credential proves From, so a different host cannot hijack the client. }
+    if (W <> nil) and (not SameText(From, W.ExpectFrom)) then
+      W := nil
+    else if W <> nil then
+    begin
+      W.JoinData := Data;   { set under the lock, atomically with the claim }
+      L.Remove(W);
+    end;
+  finally
+    FShellWaits.UnlockList;
+  end;
+  if W = nil then
+  begin
+    WriteLine(Data, ReplyErr('shell_join: no waiting client for this token'));
+    Exit;
+  end;
+  W.Arrived.SetEvent;
+  { W.Caller, never From: From is the daemon that dialed back, so logging it
+    would record the target as its own caller and lose the audit trail. }
+  FLog.Info(Format('shell opened: %s -> %s (dial, %dx%d)',
+    [W.Caller, W.ExpectFrom, W.Cols, W.Rows]));
+  Broadcast(EvSys(Format('shell: %s -> %s (dial) opened',
+    [W.Caller, W.ExpectFrom])), 0);
+  a := 0;
+  b := 0;
+  try
+    PtyPump(W.ClientData.Handle, Data.Handle, False, @ShutdownRequested, a, b);
+  except
+    on E: Exception do
+      FLog.Info('shell relay error for ' + W.ExpectFrom + ': ' + E.Message);
+  end;
+  FLog.Info(Format('shell closed: %s -> %s (dial, %d bytes from client, ' +
+    '%d bytes from shell)', [W.Caller, W.ExpectFrom, a, b]));
+  Broadcast(EvSys(Format('shell: %s -> %s (dial) closed',
+    [W.Caller, W.ExpectFrom])), 0);
+  { Last touch of W: hand it back to the client thread to free. }
+  W.Finished.SetEvent;
+end;
+
 procedure TPizarra.HandleConnect(Stream: TSocketStream);
 var
   Data: TSocketStream;
@@ -7958,6 +9017,21 @@ begin
           client-supplied watch fields. }
         DoDial(Data, From, BoundTeam, Obj.Get('teams', ''),
           Obj.Get('keepalive', 60), Obj.Get('ver', ''))
+      else if Cmd = CMD_ATTACH then
+        { The reply line is the last JSON on this connection: after it the
+          stream is raw terminal bytes both ways until either side ends. }
+        HandleAttach(Obj, From, BoundTeam, Data)
+      else if Cmd = CMD_ATTACH_JOIN then
+        { A dial daemon dialing the hub back for a pending attach. Pairs to the
+          waiting viewer by token, then relays raw bytes both ways. }
+        HandleAttachJoin(Obj, From, Data)
+      else if Cmd = CMD_SHELL then
+        { Same upgrade, but the far end is a login shell on the team's HOST.
+          The reply line is the last JSON on this connection. }
+        HandleShell(Obj, From, Data)
+      else if Cmd = CMD_SHELL_JOIN then
+        { A dial daemon dialing back for a pending shell. }
+        HandleShellJoin(Obj, From, Data)
       else if Cmd = CMD_FLEET then
         HandleFleet(Data)
       else if Cmd = CMD_UPGET then

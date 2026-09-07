@@ -58,6 +58,13 @@ scripts/test-install-service.sh
 scripts/test-pzweb-readiness.sh
 scripts/test-session-preservation.sh
 scripts/test-watchdog-session.sh
+scripts/test-no-destructive-tmux.sh
+scripts/test-attach.sh
+scripts/test-attach-routes.sh
+scripts/test-attach-trust.sh
+scripts/test-shell.sh
+scripts/test-shell-routes.sh
+scripts/test-shell-trust.sh
 ```
 
 The trusted-path harness proves the credential rules against a tree shaped like
@@ -103,13 +110,58 @@ payload inside the disposable root. The
 web-readiness harness starts an isolated loopback hub and web console, proves
 that health fails before bind and succeeds after a real TCP connection, then
 proves a second server fails promptly on the occupied port without claiming it
-is listening. The watchdog-session harness uses a private tmux socket and proves
-that a configured launch is created and ownership-tagged while an absent manual
-session with no launch is neither fabricated nor falsely logged as respawning.
-The session-preservation harness is stricter and entirely hermetic: a fake
-`tmux` executable proves that `pizarra --host-session` creates an absent hub
-session exactly once, performs only an existence probe on the second call, and
-has no destructive command path. It never connects to any tmux server.
+is listening. The watchdog-session harness runs a disposable tmux server on a
+private socket that every call names explicitly with `-S`, after removing
+`TMUX` and `TMUX_PANE` from its environment: tmux chooses its socket from
+`TMUX` before it looks at `TMUX_TMPDIR`, so without that step an agent running
+the harness inside a tmux pane addresses the live server. It checks on the hub
+process itself that no `TMUX` was inherited, then proves that a configured
+launch is created and ownership-tagged on the private server, that an absent
+manual session with no launch is neither fabricated nor falsely logged as
+respawning, and that a hub restart finds the existing session and leaves it
+untouched (same pane, no second launch). It never issues `kill-server`: it
+removes the two sessions it created, by exact name, and the private server
+exits by itself. The session-preservation harness is stricter and entirely
+hermetic: a fake `tmux` executable proves that `pizarra --host-session` creates
+an absent hub session exactly once, performs only an existence probe on the
+second call, and has no destructive command path. It never connects to any
+tmux server. The destructive-tmux guard is static: no product source issues a
+tmux verb that ends, replaces or renames a session, every unit that may hold a
+tmux server in its control group carries `KillMode=process`, and no script in
+the tree contains `kill-server`.
+
+The attach harnesses cover the `tiza attach` relay on a private tmux socket
+(same isolation as the session harnesses: `TMUX`/`TMUX_PANE` removed, a private
+`-S` socket named on every call, `status off` + `window-size manual`, no
+`kill-server`). `test-attach.sh` is the LOCAL route: opt-in gating, console-only
+write, read-only input dropped, the pty sized to the session, a clean tmux-client
+environment with no inherited `TMUX`, fd hygiene, terminal-mode restore, and the
+per-team/per-hub bounds. `test-attach-routes.sh` stands up loopback push and
+dial daemons and proves the PUSH route (the hub connects to the daemon), the
+DIAL route (the daemon dials the hub back and is paired by token), write in both
+directions, and that a session without `attach = on` is refused. Only `pztest-*`
+sessions are touched, always by exact name.
+
+The shell harnesses cover `tiza shell` on the same private tmux socket, though
+the feature creates no tmux session of its own - the shell is a private pty
+child. `test-shell.sh` is the LOCAL route: off by default, the refusals for a
+missing, nonexistent or `root` account, an unauthorised caller, the pty created
+at the VIEWER's size (the inverse of attach), an environment carrying no tmux
+variables at all including `TMUX_TMPDIR`, fd hygiene, a real typed command,
+Ctrl-b passing through as an ordinary byte, `exit` and `Ctrl-] q`, the per-host
+bounds, terminal-mode restore, and - in both directions - that attach and shell
+are independent grants. `test-shell-routes.sh` proves PUSH and DIAL, that a
+host with no declared session still gets a shell while attach on it cannot, and
+that a daemon without its own opt-in refuses even when the hub authorised the
+caller. `test-shell-trust.sh` proves `shell_trust` is its own grant: with `all`
+an ordinary team opens a shell with its own credential and is logged as itself,
+while `attach_trust` alone never grants one.
+
+The account is chosen per run: as root the harnesses use a real ordinary
+account and so exercise the production `su - <account>` path; unprivileged they
+use the account running the test, which takes the direct login-shell branch.
+Either way the real spawn path runs and no assertion needs root. Override the
+account with `PIZARRA_TEST_SHELL_USER`.
 
 The chat-group-compose harness starts an isolated loopback hub with inbox-only
 members. It proves that `/msg @group` and a bare `@group` both use the existing

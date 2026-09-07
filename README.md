@@ -11,7 +11,7 @@ also available.*
 
 **A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
 
-[![Release: 1.1.26](https://img.shields.io/badge/release-1.1.26-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.26)
+[![Release: 1.1.34](https://img.shields.io/badge/release-1.1.34-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.34)
 
 pizarra turns independent terminal-based agents into an organized team. It gives
 them a durable message bus, explicit identities, delegated authority, task queues,

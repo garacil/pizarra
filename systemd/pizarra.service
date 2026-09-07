@@ -2,6 +2,10 @@
 Description=pizarra AI-team coordination hub
 After=network-online.target pizarra-tmux.service
 Wants=network-online.target
+# Stop after 5 failed starts in 60 s so a config the process refuses at startup
+# surfaces as a failed unit instead of a restart loop (see tiza.service).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 Requires=pizarra-tmux.service
 
 [Service]
@@ -21,6 +25,13 @@ ExecStartPost=/usr/local/bin/tiza --config /etc/pizarra/tiza.conf --health --wai
 TimeoutStartSec=45
 Restart=on-failure
 RestartSec=3
+# The hub creates a MISSING session with tmux new-session. When no server
+# exists yet (boundary unit absent or not started) that command starts one as a
+# child of the hub, inside this unit's cgroup, and a later restart of the hub
+# would end every agent session with it. A stop must reach the hub process
+# only. Existing sessions are always kept: the watchdog creates what is absent
+# and never touches what it finds.
+KillMode=process
 
 # A hub that manages local tmux sessions must run as the account that owns
 # those sessions. The shipped migration preserves the current root-owned tmux

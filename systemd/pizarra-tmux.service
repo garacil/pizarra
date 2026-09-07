@@ -7,9 +7,14 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/tmux -f /usr/local/share/pizarra/systemd/tmux.conf start-server
 
-# The tmux server and every session it creates remain in this unit's cgroup.
-# Restarting pizarra.service therefore cannot terminate managed agent sessions.
-# Stop this unit only after every managed session has been reviewed and stopped.
+# The tmux server and every session it creates live in this unit's cgroup, so
+# restarting pizarra.service cannot reach them. This unit must not reach them
+# either: with the default KillMode a "systemctl stop" or "restart" of this unit
+# would signal the whole cgroup and end every agent session at once.
+# KillMode=process confines a stop to the start-server client, which has long
+# exited. Nothing in pizarra ends a session: that is a decision a person takes
+# inside tmux, never a unit operation.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

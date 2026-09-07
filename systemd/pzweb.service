@@ -2,6 +2,10 @@
 Description=pzweb operations console for pizarra
 After=network-online.target pizarra.service
 Wants=network-online.target
+# Stop after 5 failed starts in 60 s so a config the process refuses at startup
+# surfaces as a failed unit instead of a restart loop (see tiza.service).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 Requires=pizarra.service
 
 [Service]

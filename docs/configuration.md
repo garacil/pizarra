@@ -97,6 +97,11 @@ ignored. Use one configuration per identity, especially on a multi-team host.
 | `port` | `7010` | Native bus TCP port |
 | `secret` | empty | Master credential; must be set |
 | `master_console_only` | `off` | Restrict the master credential to `from=console` |
+| `attach_local` | `off` | Allow `tiza attach` into the hub host's OWN local team sessions |
+| `attach_trust` | empty | Identities that may attach AND write ANY team: a comma/space list, or `all`. Empty keeps write to `console` only |
+| `shell_local` | `off` | Allow `tiza shell` to open a login shell on the hub host's OWN machine |
+| `shell_user` | empty | Ordinary account that shell opens as on the hub host. Never `root`; empty means no shell here whatever `shell_local` says |
+| `shell_trust` | empty | Identities that may open a shell on ANY host: a comma/space list, or `all`. Empty keeps it to `console` only. Its own key, never `attach_trust` |
 | `header` | `short` | Delivery envelope mode: `short` or `full` |
 | `releases` | empty | Literal directory containing published endpoint update artifacts; empty disables updates |
 | `alarm_max` | `3` | Block alarms per episode, clamped to 1–5 |
@@ -316,6 +321,9 @@ or project is deleted without deleting the surviving object.
 | `keepalive` | `60` | Reverse-channel keepalive seconds, minimum 5 |
 | `state` | `/var/lib/pizarra/tiza.state` | Writable deduplication receipt path |
 | `autoupdate` | `off` | Automatically install a newer published endpoint |
+| `attach` | `off` | Host-wide default for `[session:] attach`; one key opts every session on this host into `tiza attach` |
+| `shell` | `off` | Allow `tiza shell` to open a login shell on THIS host. Host-wide: a shell belongs to the machine, so there is deliberately no `[session:] shell` key |
+| `shell_user` | empty | Ordinary account the shell opens as. Never `root` - the operator escalates with `sudo su` inside. With `shell = on` and this empty the daemon refuses |
 | `update_path` | `/usr/local/bin/tiza` | Installed endpoint binary |
 | `update_sudo` | `off` | Use privilege elevation for installation |
 | `update_fpc` | `fpc` | Compiler used by source-fallback updates |
@@ -342,9 +350,14 @@ must remain only on the control host.
 | `block_match` | Extra `|`-separated blocked markers |
 | `hint` | Optional file whose content overrides heuristic activity state |
 | `auto_enter` | Automatically press Enter on a detected block; off by default |
+| `attach` | Allow `tiza attach` into this pane; off by default |
 
 `auto_enter` accepts the terminal's highlighted default. Enable it only for a
 trusted session where that behavior is explicitly intended.
+
+`attach` opts this pane into `tiza attach`, the operator's own decision per
+session, exactly as `activity` opts into sampling. It is off by default; the hub
+cannot override it. Write access additionally requires the console credential.
 
 Every team whose delivery route is this daemon needs a block here. A team the hub
 knows with a `host` pointing at this machine but with no matching

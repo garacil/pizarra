@@ -32,6 +32,27 @@ function SessionExists(const Session: string): Boolean;
   used by the activity sampler to diff successive frames. }
 function CapturePane(const Session: string): string;
 
+{ Absolute path of the tmux binary, for a caller that execs it directly (the
+  attach child is spawned with execve, which does not search PATH). Falls
+  back to the usual locations, including Homebrew's on macOS. }
+function TmuxPath: string;
+
+{ Run a process capturing stdout+stderr; the exit status is returned and the
+  output lands in Output. Generic on purpose: the shell feature resolves an
+  account with `id -u` through it, which consults the SAME name service su
+  will use - parsing /etc/passwd would silently miss macOS local accounts. }
+function RunCapture(const Exe: string; const Args: array of string;
+  out Output: string): Integer;
+
+{ Absolute path of the su binary, for a caller that execs it directly. The
+  shell feature drops privilege by exec'ing `su - <account>`; execve does not
+  search PATH, so the path must be resolved here. '' when su is absent. }
+function SuPath: string;
+
+{ Current window size of a session. False when the session is absent or the
+  answer is not WxH. Read-only. }
+function SessionSize(const Session: string; out Cols, Rows: Integer): Boolean;
+
 { Classify a QUIET pane by its bottom lines: 'blocked' (a permission prompt),
   'busy' (a recognized working footer), or 'idle' (anything else quiet). Built-in
   markers cover common permission and activity prompts; ExtraIdle/ExtraBlock are
@@ -227,6 +248,60 @@ begin
     scrollback — the current screen is what tells moving from frozen. }
   if RunCapture('tmux', ['capture-pane', '-p', '-t', Session], Out_) = 0 then
     Result := Out_;
+end;
+
+function TmuxPath: string;
+const
+  Fallbacks: array[0..3] of string =
+    ('/usr/bin/tmux', '/usr/local/bin/tmux', '/opt/homebrew/bin/tmux',
+     '/opt/local/bin/tmux');
+var
+  i: Integer;
+begin
+  Result := FileSearch('tmux', GetEnvironmentVariable('PATH'));
+  if (Result <> '') and FileExists(Result) then
+    Exit;
+  for i := Low(Fallbacks) to High(Fallbacks) do
+    if FileExists(Fallbacks[i]) then
+      Exit(Fallbacks[i]);
+  Result := '';
+end;
+
+function SuPath: string;
+const
+  Fallbacks: array[0..1] of string = ('/usr/bin/su', '/bin/su');
+var
+  i: Integer;
+begin
+  Result := FileSearch('su', GetEnvironmentVariable('PATH'));
+  if (Result <> '') and FileExists(Result) then
+    Exit;
+  for i := Low(Fallbacks) to High(Fallbacks) do
+    if FileExists(Fallbacks[i]) then
+      Exit(Fallbacks[i]);
+  Result := '';
+end;
+
+function SessionSize(const Session: string; out Cols, Rows: Integer): Boolean;
+var
+  Out_: string;
+  p: Integer;
+begin
+  Cols := 0;
+  Rows := 0;
+  Result := False;
+  if (Trim(Session) = '') or (Trim(Session) = '-') then
+    Exit;
+  if RunCapture('tmux', ['display-message', '-p', '-t', Session,
+       '#{window_width}x#{window_height}'], Out_) <> 0 then
+    Exit;
+  Out_ := Trim(Out_);
+  p := Pos('x', Out_);
+  if p <= 1 then
+    Exit;
+  Cols := StrToIntDef(Copy(Out_, 1, p - 1), 0);
+  Rows := StrToIntDef(Copy(Out_, p + 1, Length(Out_)), 0);
+  Result := (Cols > 0) and (Rows > 0);
 end;
 
 function ClassifyPane(const Pane, ExtraIdle, ExtraBlock: string): string;

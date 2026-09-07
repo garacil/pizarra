@@ -324,9 +324,14 @@ begin
         end;
         if BeforeOpen.st_uid <> FpGeteuid then
         begin
+          { Name the exact remedy: a rollback with `cp -p` (which tiza's own
+            updater uses for its binary backups) restores a wrong-owner config
+            and, on a Restart=always unit, sends the daemon into a tight crash
+            loop. The fix is one command; print it rather than only diagnose. }
           Why := 'credential configuration must be owned by runtime uid ' +
             IntToStr(FpGeteuid) + ', but ' + Acc + ' is owned by uid ' +
-            IntToStr(BeforeOpen.st_uid);
+            IntToStr(BeforeOpen.st_uid) + ' - fix: chown ' +
+            IntToStr(FpGeteuid) + ':' + IntToStr(FpGeteuid) + ' ' + Acc;
           Exit;
         end;
       end;

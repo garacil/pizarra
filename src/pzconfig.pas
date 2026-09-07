@@ -147,6 +147,33 @@ type
     SharedDir:    string;   { NFS exchange root; '' = feature off }
     Releases:     string;   { release-artifact dir served to self-updating
                               daemons (cmd=upget); '' = feature off }
+    AttachLocal:  Boolean;  { [server] attach_local: allow tiza attach into
+                              the hub host's OWN local team sessions. Off by
+                              default. Remote teams are governed by the
+                              [session:] attach key of their host daemon;
+                              local teams live in the registry, so their
+                              opt-in is this one bootstrap knob. }
+    AttachTrust:  string;   { [server] attach_trust: identities that may attach
+                              AND write ANY team - a comma/space list, or the
+                              keyword 'all' for every authenticated team. Empty
+                              (default) keeps the strict rule: only console
+                              writes, a delegated team reads. Use 'all' on a
+                              fleet where every team is trusted to drive any
+                              other, so each team attaches with its OWN
+                              credential (no shared console secret). }
+    { INTERNAL SHELL (1.1.33). Deliberately its OWN keys, never reusing the
+      attach ones: watching a terminal and holding a login shell on the machine
+      are not the same grant, and enabling one must never enable the other. }
+    ShellLocal:   Boolean;  { [server] shell_local: allow tiza shell to open a
+                              login shell on the HUB'S OWN host. Off by
+                              default, and independent of attach_local. }
+    ShellUser:    string;   { [server] shell_user: the ordinary account that
+                              shell runs as on the hub host. Never root - the
+                              operator escalates with sudo su inside it. Empty
+                              means no shell here, whatever shell_local says. }
+    ShellTrust:   string;   { [server] shell_trust: identities that may open a
+                              shell on ANY host - a comma/space list, or the
+                              keyword 'all'. Empty (default) = console only. }
     GlobalPrompt: string;
     GlobalRule:   string;   { [header] note: a standing instruction shown in the
                               delivery header of EVERY message to EVERY team,
@@ -195,6 +222,11 @@ type
     Workdir:     string;   { session start directory (tmux -c); '' = default }
     User:        string;   { OS user to run the session as; '' = the daemon user }
     Activity:    Boolean;  { opt-in: sample this pane and report moving/idle/blocked }
+    Attach:      Boolean;  { opt-in: let the hub open a raw terminal into this
+                             pane (tiza attach). Off by default: the host owner
+                             decides whether its agent terminals may be viewed
+                             or driven remotely, as with sampling and
+                             auto_enter. The hub cannot override it. }
     IdleMatch:   string;   { extra '|'-separated substrings that mark the idle prompt }
     BlockMatch:  string;   { extra '|'-separated substrings that mark a permission prompt }
     AutoEnter:   Boolean;  { opt-in: when this pane is DETECTED blocked on a
@@ -228,6 +260,12 @@ type
     UpdatePath: string;            { installed binary to replace }
     UpdateSudo: Boolean;           { prefix install with sudo (mac: daemon != root) }
     UpdateFpc:  string;            { compiler for the build-from-source recipe }
+    { INTERNAL SHELL (1.1.33). A shell belongs to the HOST, not to a session:
+      there is deliberately NO [session:X] shell key and so no nested default
+      like S.Attach. One host, one decision, one account. Off by default; the
+      hub can never override this - it is the host owner's own consent. }
+    Shell:      Boolean;           { [daemon] shell }
+    ShellUser:  string;            { [daemon] shell_user - ordinary account }
   end;
 
 { Strict resolution: an explicit --config or environment path that does not
@@ -1093,7 +1131,7 @@ end;
   and the test suite keeps it aligned with the actual verbs. }
 function IsCommandWord(const N: string): Boolean;
 const
-  W: array[0..48] of string = (
+  W: array[0..50] of string = (
     'all', 'console', 'pizarra', 'inbox', 'buzon', 'tree', 'arbol',
     'task', 'tarea', 'tareas', 'team', 'teams', 'equipo', 'equipos',
     'group', 'groups', 'grupo', 'grupos', 'project', 'projects',
@@ -1101,7 +1139,7 @@ const
     'workflow', 'workflows', 'wf', 'flujo', 'flujos', 'daemon', 'chat',
     'share', 'compartir', 'files', 'ficheros', 'manual', 'put', 'get',
     'cat', 'leer', 'ver', 'version', 'fleet', 'flota', 'update', 'actualizar',
-    'hold');
+    'hold', 'attach', 'shell');
 var
   i: Integer;
 begin
@@ -1217,6 +1255,17 @@ begin
     Result.Port    := IniInt(Ini, 'server', 'port', 7010, 1, High(Word));
     Result.Secret  := Ini.ReadString('server', 'secret', '');
     Result.Releases := Trim(Ini.ReadString('server', 'releases', ''));
+    Result.AttachLocal := IniFlag(Ini, 'server', 'attach_local', False);
+    Result.AttachTrust := Trim(StripInlineComment(Ini.ReadString('server', 'attach_trust', '')));
+    Result.ShellLocal := IniFlag(Ini, 'server', 'shell_local', False);
+    Result.ShellUser  := Trim(StripInlineComment(Ini.ReadString('server', 'shell_user', '')));
+    if (Result.ShellUser <> '') and (not LooksSafeName(Result.ShellUser)) then
+    begin
+      CfgWarn('[server] shell_user "' + Result.ShellUser + '" is not a valid ' +
+        'account name; IGNORED - no shell will open on the hub host');
+      Result.ShellUser := '';
+    end;
+    Result.ShellTrust := Trim(StripInlineComment(Ini.ReadString('server', 'shell_trust', '')));
     Result.LogPath := Ini.ReadString('log', 'path',
       PZ_LOG_DIR + '/pizarra.log');
     Result.RegistryAuthority := IniToken(Ini, 'registry', 'authority', 'sqlite');
@@ -1472,6 +1521,14 @@ begin
       PZ_TIZA_BIN_PATH);
     Result.UpdateSudo := IniFlag(Ini, 'daemon', 'update_sudo', False);
     Result.UpdateFpc  := Ini.ReadString('daemon', 'update_fpc', 'fpc');
+    Result.Shell      := IniFlag(Ini, 'daemon', 'shell', False);
+    Result.ShellUser  := Trim(StripInlineComment(Ini.ReadString('daemon', 'shell_user', '')));
+    if (Result.ShellUser <> '') and (not LooksSafeName(Result.ShellUser)) then
+    begin
+      CfgWarn('[daemon] shell_user "' + Result.ShellUser + '" is not a valid ' +
+        'account name; IGNORED - no shell will open on this host');
+      Result.ShellUser := '';
+    end;
 
     Ini.ReadSections(Sections);
     n := 0;
@@ -1514,6 +1571,10 @@ begin
         S.IdleMatch   := Trim(Ini.ReadString(Sec, 'idle_match', ''));
         S.BlockMatch  := Trim(Ini.ReadString(Sec, 'block_match', ''));
         S.Hint        := Trim(Ini.ReadString(Sec, 'hint', ''));
+        { default from the daemon-wide [daemon] attach, so one key opts in
+          every session on a host; a session may still set attach = off. }
+        S.Attach      := IniFlag(Ini, Sec, 'attach',
+          IniFlag(Ini, 'daemon', 'attach', False));
         if S.Team <> '' then
         begin
           SetLength(Result.Sessions, n + 1);

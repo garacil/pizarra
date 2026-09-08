@@ -112,7 +112,17 @@ its own tool access, not a bare prompt. Writing into it is not only executing as
 root, it is injecting into the instruction stream of something that will then act
 on its own, so a caller need not type a command at all. Keystrokes arriving that
 way are indistinguishable from the operator's own input, and the bus record does
-not separate them: it says a team attached, not what it said. Check what your panes run
+not separate them: it says a team attached, not what it said.
+
+The one signal a host owner can act on is the byte count on the close line. Zero
+bytes from the viewer means the caller only watched; non-zero means they typed.
+Nothing records what was typed, so presence and volume is the whole tripwire.
+
+To check what your panes run as, list the whole server: `tmux list-panes -a -F
+'#{session_name} #{pane_pid}'` and then `ps -o user= -p PID`. The `-a` matters,
+because without it tmux reports a single window and still exits successfully, so
+on a host with more than one session the answer omits the pane you were looking
+for. Check what your panes run
 as before deciding read-only by default is enough, and remember `attach_trust =
 all` grants write to every authenticated team.
 

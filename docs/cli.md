@@ -99,10 +99,21 @@ reached, which is the point: the dial-in endpoints have no inbound route, so
 the shell rides the reverse channel they already hold open to the hub.
 
 The shell always opens as an ordinary configured account, never root. Become
-root inside it with `sudo su`, which leaves the escalation in that host's own
-sudo trail. Leave with `exit` or Ctrl-D; `Ctrl-]` then `q` is an emergency
+root inside it with `sudo su`. Note what that does and does not give you: "never
+root" describes which uid is spawned, not a safety barrier, because where the
+configured account is a passwordless sudoer the escalation is one command with
+no password at all. Run `sudo -l` for that account before enabling the feature;
+the hub cannot see a host's sudoers and neither can whoever asks you to switch
+it on. Leave with `exit` or Ctrl-D; `Ctrl-]` then `q` is an emergency
 escape for a wedged shell, and Ctrl-b is an ordinary keystroke here, so tmux
 works normally inside.
+
+Session content is never recorded, and the two trails that do exist reconcile
+only for privileged work: the bus records who connected, the host's sudo log
+records what was run as root, and a caller who stays as the configured account
+without escalating leaves no record of commands. That window is narrow where
+the account is a passwordless sudoer and wide on a locked-down host. Do not
+treat the sudo log as a complete record of a session.
 
 It is off everywhere by default and needs BOTH ends to opt in, independently of
 attach: the hub needs `[server] shell_local = on` plus `[server] shell_user` for

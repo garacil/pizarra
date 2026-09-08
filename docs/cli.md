@@ -118,6 +118,19 @@ The one signal a host owner can act on is the byte count on the close line. Zero
 bytes from the viewer means the caller only watched; non-zero means they typed.
 Nothing records what was typed, so presence and volume is the whole tripwire.
 
+Compare only same-end numbers. The hub and the host count different things and
+never agree: on the push and dial routes the daemon writes its JSON reply on the
+same connection it then relays, so the hub's relay counts that line and the
+daemon's counter does not. The difference is exactly that line plus its newline,
+deterministic rather than drift. Viewer bytes do agree, because nothing is
+prepended in that direction, so the tripwire itself is unaffected.
+
+The size in an attach log is not the caller's terminal either. Attach sizes the
+pty to the target session on purpose, so a viewer cannot resize an agent's
+window, which means the number describes the host rather than the person
+connecting. A shell has no session to inherit from, so there the size is the
+caller's terminal. Neither is an identity signal; the caller is named outright.
+
 To check what your panes run as, list the whole server: `tmux list-panes -a -F
 '#{session_name} #{pane_pid}'` and then `ps -o user= -p PID`. The `-a` matters,
 because without it tmux reports a single window and still exits successfully, so

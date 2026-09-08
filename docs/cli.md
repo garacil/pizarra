@@ -86,6 +86,15 @@ named teams attach and write with their OWN credential, so you drive any team
 from any team without a shared console secret. At most 8 attaches may be open on a
 hub and 2 per team.
 
+Attach is usually the more direct grant of the two, and the shell warnings do not
+cover it. `tiza shell` opens as a configured ordinary account; attach drops the
+caller into an existing pane, and where the daemon runs as root with no
+`[session:] user` that pane is already running as root, with no account, no sudo
+and no password in the path. Hardening `shell_user` therefore does not contain
+attach. Check what the panes actually run as before deciding that read-only by
+default is enough, and remember that `attach_trust = all` grants write to every
+authenticated team.
+
 ## Shell: a login shell on a host
 
 ```sh

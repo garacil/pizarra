@@ -88,12 +88,33 @@ hub and 2 per team.
 
 Attach is usually the more direct grant of the two, and the shell warnings do not
 cover it. `tiza shell` opens as a configured ordinary account; attach drops the
-caller into an existing pane, and where the daemon runs as root with no
-`[session:] user` that pane is already running as root, with no account, no sudo
-and no password in the path. Hardening `shell_user` therefore does not contain
-attach. Check what the panes actually run as before deciding that read-only by
-default is enough, and remember that `attach_trust = all` grants write to every
-authenticated team.
+caller into an existing pane, and that pane runs as whoever created it. That is
+root when a root daemon created it with no `[session:] user`, and equally root
+when a person started tmux as root by hand. Hardening `shell_user` does not
+contain attach, and neither does moving the session out of the unit's control
+group, which changes only whether a daemon restart can tear it down.
+
+A non-root pane does not contain it either. Where the daemon runs as an ordinary
+user, a per-user launch agent for instance, no pane is root and the case above
+does not arise. That changes the path, not the destination: if the account owning
+the pane is a passwordless sudoer, attach lands one `sudo su` from root with no
+prompt, exactly where the shell lands. Check `sudo -l` for the account that owns
+the pane, not only for the configured shell account.
+
+The audit story does not carry over either. Pairing the bus record of who
+connected with the host's sudo log depends on an escalation event existing to be
+logged, and attach into a root pane has none, because it starts at root. For
+attach the only record is the bus line saying a team attached; what was typed is
+not recorded and there is no second trail to reconcile it against.
+
+And where the daemon launches the agent, the pane is a running agent session with
+its own tool access, not a bare prompt. Writing into it is not only executing as
+root, it is injecting into the instruction stream of something that will then act
+on its own, so a caller need not type a command at all. Keystrokes arriving that
+way are indistinguishable from the operator's own input, and the bus record does
+not separate them: it says a team attached, not what it said. Check what your panes run
+as before deciding read-only by default is enough, and remember `attach_trust =
+all` grants write to every authenticated team.
 
 ## Shell: a login shell on a host
 

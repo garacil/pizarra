@@ -11,7 +11,7 @@ also available.*
 
 **A vendor-neutral control plane for autonomous, cooperating AI-agent teams.**
 
-[![Release: 1.1.34](https://img.shields.io/badge/release-1.1.34-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.34)
+[![Release: 1.1.35](https://img.shields.io/badge/release-1.1.35-2f81f7.svg)](https://github.com/garacil/pizarra/releases/tag/v1.1.35)
 
 pizarra turns independent terminal-based agents into an organized team. It gives
 them a durable message bus, explicit identities, delegated authority, task queues,
@@ -49,6 +49,14 @@ terminal context. pizarra makes coordination an explicit system:
   parallel and joins wait for every prerequisite.
 - A reported workflow error halts the plan. Recovery requires a fix followed by
   verification from a different party.
+- A message may name several destinations at once: teams, groups or every team,
+  mixed. Every name is resolved before anything is sent, so one bad name refuses
+  the whole send rather than delivering a partial broadcast that reads complete.
+- An operator can open a terminal into a team's session, or a login shell on the
+  host that team runs on, relayed by the hub over whichever route reaches it -
+  including hosts with no inbound route, which are reached over the connection
+  they already hold open outward. Both are off by default and require the owner
+  of the target host to opt in; the hub cannot override that refusal.
 - Humans can supervise the same state through a terminal console or a browser.
 
 ## How it fits together

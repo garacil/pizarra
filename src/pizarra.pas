@@ -220,6 +220,12 @@ type
       global credential supplied a team identity. }
     procedure DoSend(const From, Dest, Text: string; Data: TSocketStream;
       const Ident: string = '');
+    { A comma-separated destination list. Resolves every element to teams,
+      refuses the WHOLE send if any element is unknown, then fans out exactly
+      as a group does. Reached only from DoSend, and only when the destination
+      really holds more than one name. }
+    procedure SendMulti(const C: TPizarraConfig; const From, Dest, Text: string;
+      Data: TSocketStream; const Ident: string);
     procedure DoWatch(Data: TSocketStream; Since: Int64; const Scope: string);
     procedure DoDial(Data: TSocketStream; const From, BoundTeam, TeamsCsv: string;
       KeepAlive: Integer; const DaemonVer: string);
@@ -6860,6 +6866,146 @@ begin
     FLog.Info(Format('queued seq=%d for %s', [M.Seq, Team.Name]));
 end;
 
+{ MULTI-DESTINATION SEND (1.1.35).
+
+  `tiza a,b "text"` used to resolve as ONE destination literally named "a,b".
+  Because a non-team destination is legitimate - it is how the operator console
+  receives mail - that string was accepted, stored against a phantom name and
+  delivered to nobody, while the sender was told "sent". Reported from the
+  Telegram bridge, where /msg inherits the same command surface.
+
+  Every element is resolved first and the whole send is refused if any one of
+  them is unknown, so a typo cannot deliver a partial broadcast that looks
+  complete. Resolution accepts the same spellings a single destination does:
+  a team, a group, @group, and all. Group expansion honours that group's
+  excluded members; a team named EXPLICITLY is not subject to any group's mute,
+  which matches the documented rule that a muted member stays a member
+  everywhere else. }
+procedure TPizarra.SendMulti(const C: TPizarraConfig; const From, Dest, Text: string;
+  Data: TSocketStream; const Ident: string);
+var
+  Parts: TStringArray;
+  Names: array of string;
+  Unknown: string;
+  Grp: TGroup;
+  Team: TTeam;
+  One: string;
+  i, j, k, nSent, nQueued, nFailed: Integer;
+  Dup: Boolean;
+  FanStored, FanQueued: Boolean;
+  FanWhy, FanErr: string;
+
+  { Add a team name once. The sender is skipped, as in a group fan-out, so
+    naming yourself in a list cannot echo the message back at you. }
+  procedure AddTeam(const N: string);
+  var
+    m: Integer;
+  begin
+    if SameText(N, From) then
+      Exit;
+    Dup := False;
+    for m := 0 to High(Names) do
+      if SameText(Names[m], N) then
+      begin
+        Dup := True;
+        Break;
+      end;
+    if Dup then
+      Exit;
+    SetLength(Names, Length(Names) + 1);
+    Names[High(Names)] := N;
+  end;
+
+begin
+  Parts := SplitList(Dest);
+  SetLength(Names, 0);
+  Unknown := '';
+  nSent := 0;
+  nQueued := 0;
+  nFailed := 0;
+  FanErr := '';
+
+  for i := 0 to High(Parts) do
+  begin
+    One := Trim(Parts[i]);
+    if One = '' then
+      Continue;
+    if SameText(One, 'all') then
+    begin
+      for j := 0 to High(C.Teams) do
+        AddTeam(C.Teams[j].Name);
+      Continue;
+    end;
+    if One[1] = '@' then
+    begin
+      One := Trim(Copy(One, 2, Length(One)));
+      if (One = '') or (not FindGroup(C, One, Grp)) then
+      begin
+        if Unknown <> '' then
+          Unknown := Unknown + ', ';
+        Unknown := Unknown + Parts[i];
+        Continue;
+      end;
+    end
+    else if FindTeam(C, One, Team) then
+    begin
+      { a team wins a name clash, exactly as for a single destination }
+      AddTeam(Team.Name);
+      Continue;
+    end
+    else if not FindGroup(C, One, Grp) then
+    begin
+      if Unknown <> '' then
+        Unknown := Unknown + ', ';
+      Unknown := Unknown + Parts[i];
+      Continue;
+    end;
+    { a group: expand to its members, honouring its own mute list }
+    for j := 0 to High(C.Teams) do
+      if TeamInList(Grp.Members, C.Teams[j].Name)
+         and (not TeamInList(Grp.Excluded, C.Teams[j].Name)) then
+        AddTeam(C.Teams[j].Name);
+  end;
+
+  if Unknown <> '' then
+  begin
+    WriteLine(Data, ReplyErr('unknown destination(s): ' + Unknown +
+      ' - nothing was sent'));
+    Exit;
+  end;
+  if Length(Names) = 0 then
+  begin
+    WriteLine(Data, ReplyErr('no destination left after resolving "' + Dest +
+      '" - nothing was sent'));
+    Exit;
+  end;
+
+  for k := 0 to High(Names) do
+  begin
+    if not FindTeam(C, Names[k], Team) then
+      Continue;
+    if FanOne(C, Team, From, Text, FanStored, FanQueued, FanWhy, Ident) then
+    begin
+      Inc(nSent);
+      if FanQueued then
+        Inc(nQueued);
+    end
+    else
+    begin
+      Inc(nFailed);
+      if FanErr = '' then
+        FanErr := FanWhy;
+    end;
+  end;
+
+  if nFailed > 0 then
+    WriteLine(Data, ReplyErr(Format(
+      'partial fan-out: %d stored, %d NOT stored (first: %s)',
+      [nSent, nFailed, FanErr])))
+  else
+    WriteLine(Data, ReplyBroadcast(nSent, nQueued));
+end;
+
 procedure TPizarra.DoSend(const From, Dest, Text: string; Data: TSocketStream;
   const Ident: string);
 var
@@ -6886,6 +7032,15 @@ begin
         wins a name clash, so 'alpha' still reaches team alpha even if a group
         is also called alpha; write '@alpha' to force the group in that rare
         case. }
+  { A comma-separated list is the only case handled elsewhere. The guard is
+    deliberately narrow - a comma AND more than one non-empty element - so every
+    existing spelling, including a trailing comma, resolves exactly as before. }
+  if (Pos(',', Dest) > 0) and (Length(SplitList(Dest)) > 1) then
+  begin
+    SendMulti(C, From, Dest, Text, Data, Ident);
+    Exit;
+  end;
+
   IsGroupDest := False;
   GName := '';
   if SameText(Trim(Dest), 'all') then

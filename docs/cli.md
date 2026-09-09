@@ -61,6 +61,12 @@ tiza --config PATH --health [--wait SECONDS]
 | `tiza inbox --keep` | Peek without advancing the cursor |
 | `tiza inbox --all` | Show history rather than only unread entries |
 
+A destination may name several teams at once, separated by commas:
+`tiza alpha,beta "text"`. Each element is a team, a group, an `@group` or
+`all`, and they may be mixed. Every element is resolved before anything is
+sent, so an unknown name refuses the whole send rather than delivering part of
+it; duplicates collapse, and naming yourself does not echo the message back.
+
 Message files are capped at 256 KiB. The native line frame is capped at 1 MiB.
 When a destination is temporarily unavailable, a successful send reports
 `queued`; retry is automatic.

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.35 - A comma-separated destination reaches every team named
+
+- `tiza a,b "text"` now sends to both, and so does `/msg a,b text` from the
+  chat bridge and `tiza chat`, because all three go through the same hub send
+  path. Elements may be teams, groups, `@group` or `all`, in any mix.
+- Before this it resolved as ONE destination literally named "a,b". A non-team
+  destination is legitimate - it is how the operator console receives mail - so
+  the string was accepted, stored against a phantom name, delivered to nobody,
+  and the sender was told "sent". A silent no-op that looked like success.
+- A typo now refuses the WHOLE send, naming the element it could not resolve,
+  so a partial broadcast can never masquerade as a complete one. Duplicates
+  collapse, and naming yourself does not echo the message back, matching how a
+  group fan-out already behaved.
+- The guard is deliberately narrow - a comma AND more than one non-empty
+  element - so every existing spelling resolves through exactly the code it did
+  before, including a trailing comma and the non-team console path. A harness
+  asserts each of those separately rather than assuming it.
+
 ## 1.1.34 - The audit trail names who opened the shell
 
 - A host could see THAT a shell or attach was opened on it, but not BY WHOM.

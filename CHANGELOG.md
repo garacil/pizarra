@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.36 - The daemon creates the directory its delivery receipt needs
+
+- The endpoint daemon never created the directory holding `tiza.state`. It
+  relied entirely on the shipped systemd unit's `StateDirectory`, so a stock
+  install never noticed - but a hand-written unit, a launch agent, or a `state`
+  path pointed elsewhere all leave nobody responsible for it.
+- When it was missing the daemon logged `cannot save the delivery receipt`
+  every few seconds and ran with NO persisted delivery position. That is the
+  case the receipt exists to prevent: a restart forgets what was delivered and
+  can inject an already-delivered message a second time.
+- It is now created at startup, mode 0700 because the receipt records who has
+  been delivered what, and a failure to create it is reported once at startup -
+  naming the consequence - instead of once per save attempt.
+- Found in production by a host owner whose unit carries no `StateDirectory`,
+  from their own journal. A harness now covers it.
+
 ## 1.1.35 - A comma-separated destination reaches every team named
 
 - `tiza a,b "text"` now sends to both, and so does `/msg a,b text` from the

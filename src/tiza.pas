@@ -832,6 +832,8 @@ begin
 end;
 
 constructor TTizaDaemon.Create(const ACfg: TTizaDaemonConfig; const StatePath: string);
+var
+  StateDir: string;
 begin
   inherited Create;
   FCfg := ACfg;
@@ -839,6 +841,31 @@ begin
   FLastSeq := TStringList.Create;
   FHold := TStringList.Create;
   FStatePath := StatePath;
+  { The receipt's directory has to exist before the first save. The shipped
+    systemd unit creates it through StateDirectory, so a stock install never
+    noticed - but a hand-written unit, a launch agent, or a `state` path the
+    operator points somewhere else all leave nobody responsible for it. When it
+    was missing the daemon logged "cannot save the delivery receipt" every few
+    seconds and ran with NO persisted position, which is the case where a
+    restart can inject an already-delivered message a second time. Found on a
+    host whose unit carries no StateDirectory. Create it here, once, and report
+    a failure once at startup rather than on every save attempt. }
+  StateDir := ExtractFileDir(FStatePath);
+  if (FStatePath <> '') and (StateDir <> '') and (not DirectoryExists(StateDir)) then
+  begin
+    if ForceDirectories(StateDir) then
+      { ForceDirectories uses 0777 masked by umask in FPC 3.2.2; the receipt
+        records who has been delivered what, so keep it to the daemon's user. }
+      FpChmod(StateDir, &700)
+    else
+    begin
+      Writeln(StdErr, 'tiza: cannot create the delivery-receipt directory ',
+        StateDir, ': ', SysErrorMessage(fpgeterrno));
+      Writeln(StdErr, 'tiza: delivery positions will NOT survive a restart, ',
+        'so an already-delivered message may be injected again');
+      Flush(StdErr);
+    end;
+  end;
   { Survive a restart: a message already injected whose acknowledgement was
     lost should not be pasted again. This is not a guarantee: if the
     acknowledgement did NOT reach disk (which is now reported clearly), this

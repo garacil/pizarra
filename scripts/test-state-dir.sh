@@ -66,4 +66,17 @@ sleep 2
   || fail 'the daemon still cannot save its receipt'
 ok 'no receipt-save failure is reported'
 
+# The startup writability check must run AFTER the directory is created, not
+# before. In 1.1.36 it ran first, failed on a fresh host, and printed a warning
+# saying a completed delivery may be repeated - which was already false by the
+# time it was read, because the daemon created the directory moments later. A
+# host owner reported it from a first start.
+[[ $(grep -c 'cannot write the delivery receipt' "$TEST_ROOT/out" || true) == 0 ]] \
+  || fail 'the startup check still warns about a directory the daemon then creates'
+ok 'no false first-start warning about an unwritable receipt'
+
+[[ $(grep -c 'cannot create the delivery-receipt directory' "$TEST_ROOT/out" || true) == 0 ]] \
+  || fail 'the daemon reported it could not create the directory'
+ok 'no creation failure is reported'
+
 printf '\nall receipt-directory checks passed\n'

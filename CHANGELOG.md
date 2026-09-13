@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.37 - The receipt directory is created before anything checks it
+
+- 1.1.36 fixed the wrong half. It made the daemon create the directory holding
+  its delivery receipt, but the startup writability check runs ELEVEN LINES
+  EARLIER, so on a first start that check still failed and printed
+  `cannot write the delivery receipt to <path>: a completed delivery may be
+  repeated after a restart`.
+- By the time anyone read that warning it was already false: the daemon created
+  the directory moments later and saved the receipt normally. A false alarm
+  carrying that consequence is its own defect, and it invites exactly the wrong
+  response from an operator who believes it.
+- The creation now runs before the check, so the warning means what it says
+  again. Reported by a host owner who saw it once on a fresh endpoint, verified
+  it had not repeated, and checked the receipt had been written before raising
+  it rather than acting on the text.
+- The harness now asserts the absence of that warning on a fresh host, not only
+  that the directory appears.
+
 ## 1.1.36 - The daemon creates the directory its delivery receipt needs
 
 - The endpoint daemon never created the directory holding `tiza.state`. It

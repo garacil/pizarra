@@ -832,8 +832,6 @@ begin
 end;
 
 constructor TTizaDaemon.Create(const ACfg: TTizaDaemonConfig; const StatePath: string);
-var
-  StateDir: string;
 begin
   inherited Create;
   FCfg := ACfg;
@@ -841,31 +839,6 @@ begin
   FLastSeq := TStringList.Create;
   FHold := TStringList.Create;
   FStatePath := StatePath;
-  { The receipt's directory has to exist before the first save. The shipped
-    systemd unit creates it through StateDirectory, so a stock install never
-    noticed - but a hand-written unit, a launch agent, or a `state` path the
-    operator points somewhere else all leave nobody responsible for it. When it
-    was missing the daemon logged "cannot save the delivery receipt" every few
-    seconds and ran with NO persisted position, which is the case where a
-    restart can inject an already-delivered message a second time. Found on a
-    host whose unit carries no StateDirectory. Create it here, once, and report
-    a failure once at startup rather than on every save attempt. }
-  StateDir := ExtractFileDir(FStatePath);
-  if (FStatePath <> '') and (StateDir <> '') and (not DirectoryExists(StateDir)) then
-  begin
-    if ForceDirectories(StateDir) then
-      { ForceDirectories uses 0777 masked by umask in FPC 3.2.2; the receipt
-        records who has been delivered what, so keep it to the daemon's user. }
-      FpChmod(StateDir, &700)
-    else
-    begin
-      Writeln(StdErr, 'tiza: cannot create the delivery-receipt directory ',
-        StateDir, ': ', SysErrorMessage(fpgeterrno));
-      Writeln(StdErr, 'tiza: delivery positions will NOT survive a restart, ',
-        'so an already-delivered message may be injected again');
-      Flush(StdErr);
-    end;
-  end;
   { Survive a restart: a message already injected whose acknowledgement was
     lost should not be pasted again. This is not a guarantee: if the
     acknowledgement did NOT reach disk (which is now reported clearly), this
@@ -1644,6 +1617,37 @@ end;
   temporary-file-plus-rename, so the daemon must be able to create a file in
   THAT directory. Permission bits can appear to allow this and still fail in
   practice (different owner, ACL, or a read-only mount). }
+{ The receipt's directory has to exist before anything asks whether the receipt
+  is writable. The shipped systemd unit creates it through StateDirectory, so a
+  stock install never noticed - but a hand-written unit, a launch agent, or a
+  `state` path pointed elsewhere leave nobody responsible for it, and the daemon
+  then ran with no persisted position at all.
+
+  It must run BEFORE CanWritePath, not after the daemon is constructed. Creating
+  it later was 1.1.36's mistake: the writability check ran first, failed, and
+  printed a warning saying a completed delivery may be repeated - which was no
+  longer true, because the daemon created the directory moments later and saved
+  the receipt fine. A false alarm of that severity is its own defect. Reported
+  by a host owner who read it on a first start and checked rather than acted. }
+procedure EnsureReceiptDir(const ReceiptPath: string);
+var
+  Dir: string;
+begin
+  Dir := ExtractFileDir(ReceiptPath);
+  if (ReceiptPath = '') or (Dir = '') or DirectoryExists(Dir) then
+    Exit;
+  if ForceDirectories(Dir) then
+    { ForceDirectories uses 0777 masked by umask in FPC 3.2.2; the receipt
+      records who has been delivered what, so keep it to the daemon's user. }
+    FpChmod(Dir, &700)
+  else
+  begin
+    Writeln(StdErr, 'tiza: cannot create the delivery-receipt directory ',
+      Dir, ': ', SysErrorMessage(fpgeterrno));
+    Flush(StdErr);
+  end;
+end;
+
 function CanWritePath(const TargetPath: string): Boolean;
 var
   F: TextFile;
@@ -1702,6 +1706,7 @@ begin
     repeat the same warning and arrive too late, after injection. Report it once
     with the remedy. Do not abort: delivery still works, but receipt memory is
     lost across restarts and the operator must know. }
+  EnsureReceiptDir(ReceiptPath);
   if not CanWritePath(ReceiptPath) then
   begin
     Writeln(StdErr, 'tiza: WARNING: cannot write the delivery receipt to ',

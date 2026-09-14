@@ -5300,6 +5300,7 @@ end;
 
 var
   ConfigArg, FromArg, FileArg, Dest, Msg, Path, Reply, ConfigReason: string;
+  DestArgs: Integer;   { positionals the destination consumed (comma list) }
   Positionals: TStringList;
   Cfg: TTizaConfig;
   Obj, FO: TJSONObject;
@@ -5554,6 +5555,20 @@ begin
         'contains it)');
 
     Dest := Positionals[0];
+    { A comma-separated destination survives `tiza a,b msg` but NOT `tiza a, b
+      msg`: the shell hands us "a," and "b" as separate words, so the list was
+      truncated and the rest of it became part of the message. Re-join the
+      pieces. The guard is narrow - a trailing comma on what we have, or a
+      leading comma on what comes next - so a destination with no comma in it
+      consumes exactly one word, as always, and no subcommand is affected. }
+    DestArgs := 1;
+    while (DestArgs < Positionals.Count) and
+          ((Copy(Trim(Dest), Length(Trim(Dest)), 1) = ',') or
+           (Copy(Trim(Positionals[DestArgs]), 1, 1) = ',')) do
+    begin
+      Dest := Trim(Dest) + Trim(Positionals[DestArgs]);
+      Inc(DestArgs);
+    end;
     { Restore is LOCAL while the hub is stopped; it does not use the bus. }
     if SameText(Dest, 'restore') or SameText(Dest, 'restaurar') then
     begin
@@ -5751,16 +5766,17 @@ begin
 
     { send: '--file PATH' only right after the dest (documented form) }
     FileArg := '';
-    if (Positionals.Count = 3) and (Positionals[1] = '--file') then
-      FileArg := Positionals[2];
+    if (Positionals.Count = DestArgs + 2) and
+       (Positionals[DestArgs] = '--file') then
+      FileArg := Positionals[DestArgs + 1];
     if FileArg <> '' then
       Msg := ReadMsgFile(FileArg)
     else
     begin
-      if Positionals.Count < 2 then
+      if Positionals.Count < DestArgs + 1 then
         Fail('nothing to send (usage: tiza <dest> <message>)');
       Msg := '';
-      for i := 1 to Positionals.Count - 1 do
+      for i := DestArgs to Positionals.Count - 1 do
       begin
         if Msg <> '' then Msg := Msg + ' ';
         Msg := Msg + Positionals[i];

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.38 - A comma list works from the console, and survives the spaces
+
+- 1.1.35 taught the HUB to accept several destinations. It did not reach the two
+  places people actually type them, so the feature shipped working over the wire
+  and unusable where it matters.
+- The interactive console validated the destination itself, one name only, and
+  refused `a,b` with "unknown team" before the hub ever saw it. It now validates
+  each element of a list, keeping the immediate feedback it gives.
+- The command line lost the list to the shell. `tiza a,b msg` worked, but
+  `tiza a, b msg` became destination "a," with the rest of the list swallowed
+  into the message text - and that spacing is the natural way to type it, so it
+  is what the chat bridge passes through too. The destination now absorbs the
+  words the shell split off, guarded narrowly by a trailing or leading comma, so
+  a destination without one still consumes exactly one word.
+- Both reported from the console by the operator. The harness now covers
+  `a, b`, `a , b`, the single-word case and `--file` after a list.
+
 ## 1.1.37 - The receipt directory is created before anything checks it
 
 - 1.1.36 fixed the wrong half. It made the daemon create the directory holding

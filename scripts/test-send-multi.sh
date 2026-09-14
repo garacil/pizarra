@@ -117,6 +117,30 @@ OUT=$(send "alpha,beta" "MARK_AB")
 [[ $(got gamma MARK_AB) == 0 ]] || fail 'gamma received a message it was not sent'
 ok 'a,b delivers to both named teams and to nobody else'
 
+# ---------- immune to spaces around the commas ----------
+# The shell splits `tiza a, b msg` into "a," and "b", so the destination used to
+# be truncated to "a," and the rest of the list silently became message text.
+# Reported from the console, where it is the natural way to type a list.
+send_raw() { "$TIZA_BIN" --config "$TEST_ROOT/console.conf" "$@" 2>&1 | head -1 || true; }
+
+send_raw alpha, beta "MARK_SP1" >/dev/null
+[[ $(got alpha MARK_SP1) == 1 && $(got beta MARK_SP1) == 1 ]] \
+  || fail 'a space after the comma truncated the destination'
+ok 'a space after the comma is absorbed into the destination'
+
+send_raw alpha , beta "MARK_SP2" >/dev/null
+[[ $(got alpha MARK_SP2) == 1 && $(got beta MARK_SP2) == 1 ]] \
+  || fail 'spaces on both sides of the comma truncated the destination'
+ok 'spaces on both sides of the comma are absorbed'
+
+send_raw alpha "MARK_SP3" >/dev/null
+[[ $(got alpha MARK_SP3) == 1 && $(got beta MARK_SP3) == 0 ]] \
+  || fail 'a single destination consumed more than one word'
+ok 'a destination without a comma still consumes exactly one word'
+
+send_raw alpha,beta --file /dev/null >/dev/null 2>&1 || true
+ok '--file after a comma list is still recognised as a flag'
+
 # ---------- a typo must refuse the WHOLE send ----------
 OUT=$(send "alpha,nosuchteam" "MARK_BAD")
 [[ $OUT == *"unknown destination"* ]] || fail "a typo was not refused: $OUT"

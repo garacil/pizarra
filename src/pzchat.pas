@@ -86,6 +86,7 @@ type
     procedure StartCompose(const Dest: string);
     procedure RefreshTeams(Quiet: Boolean);
     function  KnownTeam(const Key: string): Boolean;
+    function  KnownOneDest(const Key: string): Boolean;
     function  KnownDest(const Key: string): Boolean;
     procedure CmdHelp(const Arg: string);
     procedure CmdInbox;
@@ -769,10 +770,10 @@ begin
   Result := False;
 end;
 
-{ Valid send destination: a team, a group (bare name — the hub gives a team
+{ ONE valid send destination: a team, a group (bare name — the hub gives a team
   the win on a clash), an explicit group (@name always means the group), or
   the reserved broadcast name 'all'. }
-function TChat.KnownDest(const Key: string): Boolean;
+function TChat.KnownOneDest(const Key: string): Boolean;
 var
   i: Integer;
   GroupName: string;
@@ -788,6 +789,33 @@ begin
   for i := 0 to High(FGroupNames) do
     if SameText(FGroupNames[i], GroupName) then
       Exit(True);
+end;
+
+{ A destination may name several recipients separated by commas (1.1.35). The
+  console validated only ONE name and refused the whole line before the hub ever
+  saw it, so that feature shipped working over the wire and unreachable from the
+  console, which is its most natural user. Every element must be valid; refusing
+  here preserves the immediate feedback this console gives, and the hub refuses
+  the same way for anything that reaches it by another path. }
+function TChat.KnownDest(const Key: string): Boolean;
+var
+  Parts: TStringArray;
+  i, n: Integer;
+begin
+  if Pos(',', Key) = 0 then
+    Exit(KnownOneDest(Key));
+  Result := False;
+  Parts := SplitList(Key);
+  n := 0;
+  for i := 0 to High(Parts) do
+  begin
+    if Trim(Parts[i]) = '' then
+      Continue;
+    if not KnownOneDest(Trim(Parts[i])) then
+      Exit(False);
+    Inc(n);
+  end;
+  Result := n > 0;
 end;
 
 procedure TChat.DoSendTo(const Dest, Text: string);

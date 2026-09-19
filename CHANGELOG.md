@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.1.40 - Say that undo does not restore a project link
+
+- `app undo` restores application FIELDS. A project link is a separate record,
+  so undo cannot bring one back - and nothing said so, in the help, the
+  reference or the manual.
+- That silence costs most in the one situation where someone reaches for undo:
+  after an assignment goes wrong, when the obvious repair is the thing that does
+  not apply. Asked for by an application owner who had just been in that state.
+- The help now carries it under `app undo`, the usage error names the command
+  that does re-attach a link, and the reference and the in-product manual say it
+  too.
+
+## 1.1.39 - Assigning an application to a project works again
+
+- Every `app project <app> <project>` was refused with `project was removed;
+  nothing assigned`, while the project was listed and intact. It was not
+  intermittent: no assignment could succeed.
+- The re-check under the configuration lock read
+  `FindProject(FCfg, Prj_.Name, Prj_)` - passing a field of the very record the
+  function fills. An `out` record parameter is FINALIZED ON ENTRY in FPC, so the
+  key string was already empty when the callee read it and the lookup always
+  missed. Confirmed with a minimal program: the callee sees "".
+- The key is now taken into its own variable first. A genuinely unknown project
+  is still refused by name, which is the message that stayed correct throughout.
+- Reported by an application owner who had already tried unassign and reassign
+  and left the application unlinked, which is the state this refusal traps you
+  in. A harness now covers assign, the role text, unassign, reassignment, and
+  the unknown-project refusal.
+
 ## 1.1.38 - A comma list works from the console, and survives the spaces
 
 - 1.1.35 taught the HUB to accept several destinations. It did not reach the two

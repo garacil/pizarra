@@ -2844,6 +2844,7 @@ procedure TPizarra.HandleApp(Obj: TJSONObject; const From: string;
 var
   C, NewCfg: TPizarraConfig;
   Op, Name, Field, Value, Txt, DbErr, OldRow, ChOld, Prj: string;
+  PrjName: string;   { the lookup key, kept out of the record being filled }
   Prj_: TProject;
   R, Fl, Prjs: TStringList;
   Und: TJSONObject;
@@ -3185,7 +3186,15 @@ begin
           WriteLine(Data, ReplyErr('application ownership changed; nothing assigned'));
           Exit;
         end;
-        if not FindProject(FCfg, Prj_.Name, Prj_) then
+        { PrjName, never Prj_.Name: an `out` record parameter is finalized on
+          entry, so passing a field of the very record being filled hands the
+          function a key that is already empty by the time it reads it. This
+          re-check under the lock therefore failed for EVERY assignment and
+          reported a live project as removed. Proven with a minimal program:
+          the callee sees "". Reported by an app owner whose project was intact
+          in `project list` while every assignment was refused. }
+        PrjName := Prj_.Name;
+        if not FindProject(FCfg, PrjName, Prj_) then
         begin
           WriteLine(Data, ReplyErr('project was removed; nothing assigned'));
           Exit;

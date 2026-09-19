@@ -127,6 +127,8 @@ begin
   Writeln('  tiza app doc <name> --at <snap>    read an earlier version');
   Writeln('  tiza app history <name>            every change: who, when, what');
   Writeln('  tiza app undo <name> <snap>        roll it back to that point');
+  Writeln('                                     (FIELDS only: project links are');
+  Writeln('                                      separate records and are NOT restored)');
 { The app<->project relationship from BOTH ends: the app shows which projects
   it belongs to, and the project shows which apps build it. }
   Writeln('  tiza app project <name> <project> [--role "what it does there"]');
@@ -4060,7 +4062,9 @@ begin
     if P.Count > 3 then
       SnapN := StrToIntDef(P[3], 0);
     if SnapN <= 0 then
-      Fail('usage: tiza app undo <name> <snap>   (see: tiza app history <name>)');
+      Fail('usage: tiza app undo <name> <snap>   (see: tiza app history <name>)' +
+        #10'note: undo restores application FIELDS. A project link is a separate' +
+        #10'record, so re-attach it with: tiza app project <name> <project> --role ...');
   end;
   if (Sub = 'doc') and (Flag('--at') <> '') then
   begin

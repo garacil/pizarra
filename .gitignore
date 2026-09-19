@@ -8,6 +8,13 @@
 !/.github/
 !/.github/**
 
+# Retired in-tree runtime layout. Runtime state moved out of the repository, so
+# anything reappearing here is a stray hub lock or store from a run started
+# without an explicit --config. It must never become a commit, and it must never
+# block a release: `make publish` refuses a dirty tree, and an empty lock file
+# in a path the project deliberately retired is not a reason to hold a release.
+/conf/
+
 # Compiler and build artifacts
 /build/
 /config.mk

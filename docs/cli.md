@@ -397,6 +397,11 @@ tiza app unproject <name> <project>
 Each application has one responsible team but may participate in several
 projects, with a different role in each. Manuals and changes are historized.
 
+`app undo` restores application FIELDS. A project link is a separate record, so
+it is not part of what a field snapshot can roll back: re-attach it with
+`tiza app project <name> <project> --role ...`. Worth knowing before relying on
+undo to repair an assignment.
+
 ## Delivery-header configuration
 
 ```text

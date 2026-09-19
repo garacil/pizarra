@@ -67,6 +67,7 @@ scripts/test-shell-routes.sh
 scripts/test-shell-trust.sh
 scripts/test-send-multi.sh
 scripts/test-state-dir.sh
+scripts/test-app-project.sh
 ```
 
 The trusted-path harness proves the credential rules against a tree shaped like

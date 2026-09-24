@@ -820,7 +820,7 @@ end;
 
 procedure TChat.DoSendTo(const Dest, Text: string);
 var
-  Reply: string;
+  Reply, QNote: string;
   Obj: TJSONObject;
 begin
   if not OneShot(BuildSend(FCfg.Secret, FCfg.SelfId, Dest, Text), Reply) then
@@ -835,7 +835,21 @@ begin
       FeedLine(Format('sent to %s (%d teams, %d queued)',
         [Dest, Obj.Get('broadcast', 0), Obj.Get('queued_count', 0)]))
     else if Obj.Get('queued', False) then
-      FeedLine(Format('queued for %s (host down, will be delivered)', [Dest]))
+    begin
+      { NEVER say "host down" here. `queued` covers four different things: an
+        older message still pending for that team, the team being held, a real
+        delivery failure - and, for every dial team, the normal path, because
+        its ack arrives later on the reverse channel. Claiming the host was down
+        was false on all but the last, and operators watched messages arrive
+        instantly while being told the host was unreachable. The hub explains
+        which case it is in `note`; the command line already showed it and this
+        console threw it away. }
+      QNote := Trim(Obj.Get('note', ''));
+      if QNote <> '' then
+        FeedLine(Format('queued for %s: %s', [Dest, QNote]))
+      else
+        FeedLine(Format('queued for %s (pending delivery)', [Dest]));
+    end
     else
       FeedLine(Format('sent to %s', [Dest]));
   finally

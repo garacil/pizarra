@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.41 - Stop telling operators a live host is down
+
+- Sending from the console to a dial-in team answered `queued for X (host down,
+  will be delivered)` while the host was up and the message arrived instantly.
+  The claim was invented by the console from a single boolean.
+- `queued` covers four different things: an older message still pending for that
+  team, the team being held, a genuine delivery failure - and, for EVERY dial
+  team, the ordinary path, because the acknowledgement that marks a dial
+  delivery arrives later on the reverse channel. So the console asserted an
+  unreachable host on every message to every dial host on the fleet.
+- The hub now says which case it is, because only the hub can tell: it knows
+  whether a reverse channel is currently serving that team. A queued dial send
+  reports either `handed to X, which is dialed in; delivery is in flight` or
+  `X is not dialed in right now; it delivers when the host returns`.
+- The console stopped inventing a reason and renders the hub's, as the command
+  line already did. It had been discarding that field.
+- Reported by the operator, who could see the message arriving while being told
+  the host was down.
+
 ## 1.1.40 - Say that undo does not restore a project link
 
 - `app undo` restores application FIELDS. A project link is a separate record,

@@ -247,6 +247,11 @@ type
     { Push a control line to the reverse channel serving Team. False when no
       channel currently serves it (the dial host is not connected). }
     function  PushToDial(const Team, Line: string): Boolean;
+    { Is a reverse channel currently serving Team? Delivery to a dial team is
+      ALWAYS reported as queued - the ack that marks it delivered arrives later
+      on that channel - so this is the only way to tell "handed to a connected
+      host" from "the host is away" when answering the sender. }
+    function  DialServes(const Team: string): Boolean;
     function  AttachAcquire(const Team: string; out Why: string): Boolean;
     procedure AttachRelease(const Team: string);
     { tiza shell: authorise, route, spawn or relay, pump, account. Mirrors the
@@ -1413,6 +1418,22 @@ end;
   connected. No-op (message stays pending) when the daemon is offline — it is
   replayed on reconnect. Access to the channel stays under the list lock so a
   concurrent DoDial teardown cannot free it mid-Push. }
+function TPizarra.DialServes(const Team: string): Boolean;
+var
+  L: TList;
+  i: Integer;
+begin
+  Result := False;
+  L := FDialChannels.LockList;
+  try
+    for i := 0 to L.Count - 1 do
+      if TDialChannel(L[i]).Serves(Team) then
+        Exit(True);
+  finally
+    FDialChannels.UnlockList;
+  end;
+end;
+
 procedure TPizarra.DialEnqueue(const Team, Envelope: string; Seq: Int64);
 var
   L: TList;
@@ -7158,9 +7179,20 @@ begin
       FLog.Info(Format('queued seq=%d for %s', [M.Seq, Team.Name]));
     { tell the SENDER why it queued when the target is held - so they know it is
       not lost and will land when the team unblocks }
+    { A dial team is ALWAYS reported queued, connected or not: the ack that
+      marks it delivered comes back later on the reverse channel. Saying only
+      "queued" therefore reads as a failure on every single message to every
+      dial host, which is how the console came to tell operators the host was
+      down while the message was arriving instantly. Say which it is. }
     if Queued and HeldNow then
       WriteLine(Data, ReplySent(M.Seq, True, Format('%s %s; your message is ' +
         'queued and delivers when it clears', [Team.Name, HoldWhy])))
+    else if Queued and Team.Dial and DialServes(Team.Name) then
+      WriteLine(Data, ReplySent(M.Seq, True,
+        'handed to ' + Team.Name + ', which is dialed in; delivery is in flight'))
+    else if Queued and Team.Dial then
+      WriteLine(Data, ReplySent(M.Seq, True,
+        Team.Name + ' is not dialed in right now; it delivers when the host returns'))
     else
       WriteLine(Data, ReplySent(M.Seq, Queued));
   end
